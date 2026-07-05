@@ -1,0 +1,30 @@
+# AlertLoop demo profile: single all-in-one container backed by SQLite.
+# Quick start:  docker compose up -d
+# Then open http://localhost:8080/admin (admin console — sign in with the admin
+# token), http://localhost:8080/swagger, and http://localhost:8080/events.
+#
+# This demo stores events and serves the API/UI without any delivery channels.
+# To actually send notifications, mount a config file with a `channels:` section
+# (see alertloop.example.yaml) and add:  command: ["--config", "/etc/alertloop/alertloop.yaml", "all"]
+# plus a volume  ./alertloop.yaml:/etc/alertloop/alertloop.yaml:ro
+services:
+  alertloop:
+    build:
+      context: .
+      args:
+        VERSION: demo
+    image: alertloop:demo
+    ports:
+      - "8080:8080"
+    environment:
+      ALERTLOOP_DB_DSN: /data/alertloop.db
+      # The admin token signs in to /admin AND grants full API access.
+      # Change it before exposing the demo anywhere real. Scoped service API keys
+      # (if you need them) go in a mounted YAML config — see alertloop.example.yaml.
+      ALERTLOOP_ADMIN_TOKEN: change-me-admin
+    volumes:
+      - alertloop-data:/data
+    restart: unless-stopped
+
+volumes:
+  alertloop-data:

@@ -1,0 +1,61 @@
+# AlertLoop configuration for the PostgreSQL Compose profile.
+#
+# Copy this file to `alertloop.yaml` in the same directory and edit it. Both the
+# api and worker containers mount THIS FILE, so it is the single source of truth
+# for the whole deployment — channels are defined once and shared by both.
+#
+#   cp alertloop.yaml.example alertloop.yaml
+
+addr: ":8080"
+
+# Protects the admin console at /admin and grants full API access. CHANGE THIS.
+admin_token: "change-me-admin-token"
+
+# Scoped API keys for services (ingest | read | full). Optional — the admin
+# token already has full access. CHANGE THESE if you use them.
+api_keys:
+  - key: "change-me-ingest-key"
+    scope: ingest
+
+retention_days: 30
+
+database:
+  driver: postgres
+  # `postgres` is the compose service name; the password must match
+  # POSTGRES_PASSWORD in the compose file (default: alertloop).
+  dsn: "postgres://alertloop:alertloop@postgres:5432/alertloop?sslmode=disable"
+
+log:
+  level: "info"
+  format: "json"   # json is convenient for container log collectors
+
+# The admin console is served by this API at /admin (same origin — no CORS
+# needed). Only set cors_origins if you build your OWN browser app on a
+# different origin that calls this API:
+# cors_origins:
+#   - "https://my-dashboard.example.com"
+
+# Channel configuration — OPTIONAL, defined ONCE here and used by both api (to
+# know which delivery jobs to create) and worker (to actually send them). With
+# none configured, events are just stored. Uncomment and fill in to send. Every
+# event is delivered to EVERY configured channel (no per-event routing).
+channels: {}
+  # webhook:
+  #   - name: siem
+  #     url: "https://example.com/alertloop-hook"
+  #     secret: "change-me-webhook-secret"
+
+  # email:
+  #   - name: ops
+  #     host: "smtp.example.com"
+  #     port: 587
+  #     username: "alerts@example.com"
+  #     password: "app-password"
+  #     from: "alerts@example.com"
+  #     to: ["ops@example.com"]
+  #     starttls: true
+
+  # telegram:
+  #   - name: alerts
+  #     bot_token: "123456:ABC-DEF"
+  #     chat_id: "-1001234567890"

@@ -1,0 +1,30 @@
+[Unit]
+Description=AlertLoop event and notification center
+Documentation=https://github.com/golovanov-dev/alertloop
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=alertloop
+Group=alertloop
+# Configuration is read from the YAML file; environment secrets can be added
+# via an EnvironmentFile (uncomment below) instead of committing them here.
+#EnvironmentFile=/etc/alertloop/alertloop.env
+ExecStart=/usr/local/bin/alertloop --config /etc/alertloop/alertloop.yaml all
+Restart=on-failure
+RestartSec=5s
+
+# Data directory (SQLite database lives here by default).
+StateDirectory=alertloop
+WorkingDirectory=/var/lib/alertloop
+
+# Hardening.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/alertloop
+
+[Install]
+WantedBy=multi-user.target

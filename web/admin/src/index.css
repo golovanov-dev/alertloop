@@ -1,0 +1,43 @@
+@keyframes live-pulse { 0%,100% { opacity:1; } 50% { opacity:.35; } }
+@keyframes escalate-pulse {
+  0%,100% { box-shadow:0 0 0 0 rgba(252,165,165,0.35); }
+  50% { box-shadow:0 0 0 4px rgba(252,165,165,0.06); }
+}
+@keyframes skeleton-pulse { 0%,100% { opacity:.55; } 50% { opacity:1; } }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+html, body, #root { margin:0; padding:0; height:100%; }
+* { box-sizing: border-box; }
+body {
+  background:#0f1115;
+  color:#e6e6e6;
+  font-family: system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;
+}
+::selection { background:#a78bfa; color:#0f1115; }
+
+a { color:#a78bfa; text-decoration:none; }
+a:hover { text-decoration:underline; }
+
+/* Native controls styled to match the dark theme. */
+input, select {
+  background:#161a22; color:#e6e6e6; border:1px solid #242832;
+  border-radius:7px; padding:8px 10px; font-size:13px; outline:none;
+}
+input:focus, select:focus { border-color:#a78bfa; }
+input::placeholder { color:#565c68; }
+
+table { border-collapse: collapse; }
+
+/* Responsive helpers for the admin console (paired with inline styles). */
+.al-cards { display: flex; gap: 16px; }
+.al-table-scroll { overflow-x: auto; }
+@media (max-width: 820px) {
+  .al-cards { flex-direction: column; }
+}
+@media (max-width: 600px) {
+  /* Override the inline grid on small screens. */
+  .al-meta { grid-template-columns: 104px 1fr !important; }
+}
+::-webkit-scrollbar { width:10px; height:10px; }
+::-webkit-scrollbar-thumb { background:#242832; border-radius:6px; }
+::-webkit-scrollbar-track { background:transparent; }

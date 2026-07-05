@@ -1,0 +1,90 @@
+# AlertLoop example configuration.
+# Precedence (highest wins): command flags > environment variables > this file >
+# built-in defaults. Core/infrastructure scalars (addr, admin_token, database,
+# log, retention) also accept ALERTLOOP_* env vars; structured lists (API keys,
+# delivery channels) and detailed worker/rate_limit tuning are YAML only.
+
+# HTTP listen address for the API and web UI.
+addr: ":8080"
+
+# Admin token protects the events web page and the admin console at /admin, and
+# grants FULL API access (it is the admin console credential). CHANGE THIS.
+admin_token: "change-me-admin-token"
+
+# API keys for services calling the JSON API. Each key has a scope:
+#   ingest - may only create events (POST /v1/events)   → for event sources
+#   read   - may only read events/deliveries/stats       → for dashboards
+#   full   - full access incl. state actions and replay  → for trusted tools
+# Omitted scope defaults to full. The admin token already has full access, so
+# keys are optional (e.g. only needed for least-privilege service credentials).
+api_keys:
+  - key: "change-me-ingest-key"
+    scope: ingest
+  # - key: "change-me-read-key"
+  #   scope: read
+
+# Fixed Community retention window in days (events older than this are pruned).
+retention_days: 30
+
+# Logging. Output goes to stdout by default; set `file` to also persist logs to
+# disk so external tools (tail, Loki, Vector, journald) can read them.
+log:
+  level: "info"     # debug | info | warn | error
+  format: "text"    # text (human-readable) | json (for log processors)
+  file: ""          # empty = stdout; e.g. "/var/log/alertloop/alertloop.log"
+
+# In-process rate limiting. If you run behind a reverse proxy that already rate
+# limits, you may set enabled: false and limit there instead.
+rate_limit:
+  enabled: true
+  per_ip_per_second: 20    # requests per second per client IP
+  per_ip_burst: 40
+  ingest_per_second: 100   # overall event ingestion cap for the process
+  ingest_burst: 200
+
+database:
+  # "sqlite" (local/demo) or "postgres" (production). Inferred from dsn if empty.
+  driver: "sqlite"
+  # SQLite: a file path or ":memory:".
+  # PostgreSQL: e.g. "postgres://user:pass@host:5432/alertloop?sslmode=disable".
+  dsn: "alertloop.db"
+
+worker:
+  concurrency: 2
+  poll_interval: 2s
+  max_attempts: 5      # tries before a delivery is dead-lettered
+  base_backoff: 30s    # first retry delay; doubles each attempt
+  max_backoff: 30m     # cap on the retry delay
+
+# Delivery channels are OPTIONAL. With none configured (as below), AlertLoop
+# simply stores events (visible in the API and at /admin) and delivers nothing —
+# this is a perfectly valid way to run. To send notifications, uncomment one or
+# more channels and fill in their fields.
+#
+# Each type is a LIST, so you can configure several channels of the same type
+# (e.g. two Telegram chats). Every event is delivered to EVERY configured channel
+# — Community has no per-event routing (that is a paid capability). Each channel
+# needs a unique `name`. If you enable a channel you must fill ALL its required
+# fields, or startup will fail with a clear message.
+channels: {}
+  # email:
+  #   - name: ops
+  #     host: "smtp.example.com"
+  #     port: 587
+  #     username: "alerts@example.com"
+  #     password: "app-password"
+  #     from: "alerts@example.com"
+  #     to: ["ops@example.com"]
+  #     starttls: true   # require STARTTLS on a plaintext port (e.g. 587)
+  #     tls: false       # set true for implicit TLS / SMTPS (e.g. port 465)
+  #
+  # telegram:
+  #   - name: alerts-ru
+  #     bot_token: "123456:ABC-DEF"    # from @BotFather
+  #     chat_id: "-1001234567890"
+  #
+  # webhook:
+  #   - name: siem
+  #     url: "https://example.com/alertloop-hook"
+  #     # Requests are HMAC-SHA256 signed; receivers verify X-AlertLoop-Signature.
+  #     secret: "shared-webhook-secret"

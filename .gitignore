@@ -1,0 +1,37 @@
+﻿_private/
+.env
+.env.*
+!.env.example
+.DS_Store
+*.log
+bin/
+/dist/
+coverage/
+
+# Frontend dependencies (the BUILT admin UI in internal/adminui/dist is tracked
+# on purpose so `go build` can embed it without a Node toolchain).
+web/admin/node_modules/
+npm-debug.log*
+
+# Local SQLite databases
+*.db
+*.db-wal
+*.db-shm
+
+# Real config files with secrets (keep the *.example templates)
+/alertloop.yaml
+deploy/docker/alertloop.yaml
+
+# AI-инструкции и конфиги ассистентов (не публикуются)
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+.claude/
+.cursor/
+.cursorrules
+.github/copilot-instructions.md
+
+# Внутренняя документация и роадмап (чувствительные данные; не публикуются).
+# Публичная документация будет на отдельном сайте.
+ROADMAP.md
+docs/

@@ -1,0 +1,43 @@
+name: Release
+
+# Builds cross-platform binaries and publishes them to a GitHub Release whenever
+# a version tag (e.g. v0.1.0) is pushed. AlertLoop is CGO-free, so one Linux
+# runner cross-compiles every OS/arch — no per-OS build machine needed.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # required to create the release and upload assets
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build the React admin console so a fresh copy is embedded in the binary.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Build admin UI
+        run: |
+          cd web/admin
+          npm ci --no-audit --no-fund
+          npm run build
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Cross-compile release binaries
+        run: VERSION="${GITHUB_REF_NAME}" bash scripts/build-release.sh
+
+      - name: Publish to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/alertloop_* dist/checksums_*.txt \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes

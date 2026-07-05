@@ -1,0 +1,356 @@
+openapi: 3.0.3
+info:
+  title: AlertLoop API
+  version: "1.0.0"
+  description: >
+    AlertLoop Community Edition API for ingesting operational events, business
+    events, incidents, and audit entries, tracking their lifecycle, and
+    inspecting delivery attempts across Email, Telegram, and Webhook channels.
+  license:
+    name: AGPL-3.0-only
+servers:
+  - url: http://localhost:8080
+    description: Local instance
+tags:
+  - name: events
+    description: Event ingestion, listing, and lifecycle actions.
+  - name: delivery
+    description: Delivery attempt inspection and dead-letter replay.
+  - name: system
+    description: Health and readiness probes.
+paths:
+  /v1/events:
+    post:
+      tags: [events]
+      summary: Ingest an event
+      description: >
+        Creates an event and enqueues one delivery attempt per configured
+        channel. When `dedupe_key` matches an existing event, the existing event
+        is returned with HTTP 200 and no new deliveries are created (idempotency).
+      security:
+        - ApiKeyAuth: []
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EventInput'
+            examples:
+              incident:
+                value:
+                  type: incident
+                  severity: critical
+                  source: feeds_worker
+                  category: feeds
+                  message: Feed processing failed
+                  entity_type: developer
+                  entity_id: "15"
+                  trace_id: 9f2c-abc
+                  dedupe_key: feeds:developer:15:flats
+                  payload:
+                    developer_id: 15
+                    feed_type: flats
+      responses:
+        "201":
+          description: Event created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Event'
+        "200":
+          description: Existing event returned (dedupe_key already seen).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Event'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+    get:
+      tags: [events]
+      summary: List events
+      security:
+        - ApiKeyAuth: []
+        - BearerAuth: []
+      parameters:
+        - { name: type, in: query, schema: { $ref: '#/components/schemas/EventType' } }
+        - { name: severity, in: query, schema: { $ref: '#/components/schemas/Severity' } }
+        - { name: state, in: query, schema: { $ref: '#/components/schemas/EventState' } }
+        - { name: source, in: query, schema: { type: string } }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        "200":
+          description: A page of events.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventList'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+  /v1/events/{id}:
+    get:
+      tags: [events]
+      summary: Get an event
+      security:
+        - ApiKeyAuth: []
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        "200":
+          description: The event.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Event'
+        "404":
+          $ref: '#/components/responses/NotFound'
+  /v1/events/{id}/ack:
+    post: { $ref: '#/components/x-actions/ack' }
+  /v1/events/{id}/resolve:
+    post: { $ref: '#/components/x-actions/resolve' }
+  /v1/events/{id}/mute:
+    post: { $ref: '#/components/x-actions/mute' }
+  /v1/events/{id}/unmute:
+    post: { $ref: '#/components/x-actions/unmute' }
+  /v1/events/{id}/escalate:
+    post: { $ref: '#/components/x-actions/escalate' }
+  /v1/delivery-attempts:
+    get:
+      tags: [delivery]
+      summary: List delivery attempts
+      security:
+        - ApiKeyAuth: []
+        - BearerAuth: []
+      parameters:
+        - { name: state, in: query, schema: { $ref: '#/components/schemas/DeliveryState' } }
+        - { name: channel, in: query, schema: { $ref: '#/components/schemas/ChannelType' } }
+        - { name: channel_name, in: query, schema: { type: string }, description: Filter by a specific configured channel name. }
+        - { name: event_id, in: query, schema: { type: string } }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        "200":
+          description: A page of delivery attempts.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeliveryAttemptList'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+  /v1/delivery-attempts/{id}/replay:
+    post:
+      tags: [delivery]
+      summary: Replay a dead-lettered delivery attempt
+      description: Re-queues a `dead_letter` attempt as `pending` for another try.
+      security:
+        - ApiKeyAuth: []
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        "200":
+          description: The re-queued attempt.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeliveryAttempt'
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "409":
+          description: Attempt is not in the dead_letter state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /health:
+    get:
+      tags: [system]
+      summary: Liveness probe
+      responses:
+        "200":
+          description: Process is alive.
+  /ready:
+    get:
+      tags: [system]
+      summary: Readiness probe
+      responses:
+        "200":
+          description: Ready (database reachable).
+        "503":
+          description: Not ready.
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: >
+        A scoped API key or the admin token. Scopes: `ingest` (create events
+        only), `read` (read events/deliveries/stats), `full` (all operations
+        incl. state actions and replay). The admin token has full access. A
+        request whose credential lacks the required scope returns HTTP 403.
+    BearerAuth:
+      type: http
+      scheme: bearer
+      description: >
+        Same credential as ApiKeyAuth, sent as an `Authorization: Bearer <key>`
+        header.
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+    Limit:
+      name: limit
+      in: query
+      description: Page size (default 50, max 200).
+      schema: { type: integer, minimum: 1, maximum: 200 }
+    Cursor:
+      name: cursor
+      in: query
+      description: Opaque pagination cursor from a previous response.
+      schema: { type: string }
+  responses:
+    BadRequest:
+      description: Validation failed.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: Missing or invalid API key.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Resource not found.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+  x-actions:
+    ack: &action
+      tags: [events]
+      summary: Acknowledge an event
+      security:
+        - ApiKeyAuth: []
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        "200":
+          description: Updated event.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Event' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "409":
+          description: Transition not allowed from the current state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    resolve:
+      <<: *action
+      summary: Resolve an event
+    mute:
+      <<: *action
+      summary: Mute an event
+    unmute:
+      <<: *action
+      summary: Unmute an event
+    escalate:
+      <<: *action
+      summary: Manually escalate an event
+  schemas:
+    EventType:
+      type: string
+      enum: [incident, business_event, audit]
+    Severity:
+      type: string
+      enum: [info, success, warning, error, critical]
+    EventState:
+      type: string
+      enum: [new, acknowledged, resolved, muted, escalated]
+    ChannelType:
+      type: string
+      enum: [email, telegram, webhook]
+    DeliveryState:
+      type: string
+      enum: [pending, sending, sent, failed, dead_letter]
+    EventInput:
+      type: object
+      required: [type, source, message]
+      properties:
+        type: { $ref: '#/components/schemas/EventType' }
+        severity: { $ref: '#/components/schemas/Severity' }
+        source: { type: string }
+        category: { type: string }
+        message: { type: string }
+        entity_type: { type: string }
+        entity_id: { type: string }
+        trace_id: { type: string }
+        dedupe_key:
+          type: string
+          description: Idempotency key. Repeated values return the existing event.
+        payload:
+          type: object
+          additionalProperties: true
+          description: Free-form JSON payload (max 256 KB).
+    Event:
+      type: object
+      properties:
+        id: { type: string }
+        type: { $ref: '#/components/schemas/EventType' }
+        severity: { $ref: '#/components/schemas/Severity' }
+        state: { $ref: '#/components/schemas/EventState' }
+        source: { type: string }
+        category: { type: string }
+        message: { type: string }
+        entity_type: { type: string }
+        entity_id: { type: string }
+        trace_id: { type: string }
+        dedupe_key: { type: string }
+        payload: { type: object, additionalProperties: true }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    DeliveryAttempt:
+      type: object
+      properties:
+        id: { type: string }
+        event_id: { type: string }
+        channel: { $ref: '#/components/schemas/ChannelType' }
+        channel_name:
+          type: string
+          description: The specific configured channel instance this attempt targets.
+        state: { $ref: '#/components/schemas/DeliveryState' }
+        attempts: { type: integer }
+        max_attempts: { type: integer }
+        next_retry_at: { type: string, format: date-time, nullable: true }
+        last_error: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    EventList:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Event' }
+        next_cursor: { type: string }
+    DeliveryAttemptList:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/DeliveryAttempt' }
+        next_cursor: { type: string }
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string }
+            message: { type: string }

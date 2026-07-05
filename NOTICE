@@ -1,0 +1,17 @@
+AlertLoop
+Copyright (C) 2026 AlertLoop authors
+
+This product is dual-licensed:
+
+  * AlertLoop Community Edition (this repository) is licensed under the GNU
+    Affero General Public License, version 3.0 only (AGPL-3.0-only). The full
+    license text is in the LICENSE file.
+
+  * AlertLoop Pro and Enterprise editions, and their additional features, are
+    offered separately under a commercial license and are NOT covered by the
+    AGPL. Contact the authors for commercial licensing.
+
+SPDX-License-Identifier: AGPL-3.0-only
+
+This software includes third-party open-source components; their licenses are
+retained in the module dependency graph (see go.mod / go.sum).
