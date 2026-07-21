@@ -35,3 +35,7 @@ GEMINI.md
 # Публичная документация будет на отдельном сайте.
 ROADMAP.md
 docs/
+
+# Слой AI-правил и Publication Package (внутренние каталоги, не публикуются)
+/.ai/
+/publication/

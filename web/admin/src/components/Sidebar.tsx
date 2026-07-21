@@ -142,13 +142,13 @@ export function Sidebar({
 
       <div style={sectionLabel}>Pro</div>
       <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-        <div style={proRow} title="Available in Pro edition">
+        <div style={proRow} title="Planned for the Pro edition">
           <span>Projects</span>
         </div>
-        <div style={proRow} title="Available in Pro edition">
+        <div style={proRow} title="Planned for the Pro edition">
           <span>Routing</span>
         </div>
-        <div style={proRow} title="Available in Pro edition">
+        <div style={proRow} title="Planned for the Pro edition">
           <span>Team</span>
         </div>
       </div>

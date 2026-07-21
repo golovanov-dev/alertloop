@@ -5,7 +5,8 @@ software teams and operations-heavy businesses.
 
 It helps applications send important technical incidents and business events into
 one reliable place, track their status, and deliver them through channels such as
-email, Telegram, and webhooks. Paid editions add channels such as WhatsApp.
+email, Telegram, and webhooks. Planned paid editions will add channels such as
+WhatsApp.
 
 ## Product Direction
 
@@ -17,9 +18,10 @@ until the core product and market positioning are validated.
 - **Community** (this repository): free, self-hosted, backend API, Swagger/OpenAPI,
   basic events list page, Email/Telegram/Webhook delivery, delivery retries and
   dead-letter replay, SQLite and PostgreSQL.
-- **Pro Self-hosted** (paid): multi-project, routing rules, SDKs, WhatsApp,
-  Telegram fallback/proxy, RBAC, longer retention, escalation policies.
-- **Enterprise** (paid): on-prem license, SSO, HA, audit, custom adapters, support.
+- **Pro Self-hosted** (planned, paid): multi-project, routing rules, SDKs,
+  WhatsApp, Telegram fallback/proxy, RBAC, longer retention, escalation policies.
+- **Enterprise** (planned, paid): on-prem license, SSO, HA, audit, custom
+  adapters, support.
 
 ## Features (Community)
 
@@ -333,5 +335,5 @@ For a single local binary for your own machine, just `make build` (Go only).
 ## License
 
 Community Edition is licensed under **AGPL-3.0-only** (see `LICENSE` and
-`NOTICE`). Pro and Enterprise editions are offered under a separate commercial
-license.
+`NOTICE`). Planned Pro and Enterprise editions will be offered under a separate
+commercial license.
