@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Security
+
+- Docker: publish the API port on `127.0.0.1` instead of all interfaces, so a
+  container port cannot slip past a host firewall (a published Docker port is not
+  filtered by ufw). Use the bundled reverse proxy in `deploy/proxy/` for external
+  access.
+- Docker: harden the `alertloop` containers — drop all Linux capabilities, set
+  `no-new-privileges`, and run with a read-only root filesystem; the image now
+  makes the `/data` directory owned by the non-root runtime user so SQLite works
+  under a read-only rootfs on native-Linux hosts.
+
 ### Changed
 
 - Clarified that Pro and Enterprise editions are planned, not yet available:

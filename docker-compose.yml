@@ -15,7 +15,11 @@ services:
         VERSION: demo
     image: alertloop:demo
     ports:
-      - "8080:8080"
+      # Loopback-only: the demo is reachable at http://localhost:8080, not from
+      # other hosts. A published Docker port bypasses host firewalls like ufw, so
+      # do NOT bind 0.0.0.0 here. For remote access, front it with the reverse
+      # proxy in deploy/proxy/ (or override this mapping deliberately).
+      - "127.0.0.1:8080:8080"
     environment:
       ALERTLOOP_DB_DSN: /data/alertloop.db
       # The admin token signs in to /admin AND grants full API access.
@@ -24,6 +28,16 @@ services:
       ALERTLOOP_ADMIN_TOKEN: change-me-admin
     volumes:
       - alertloop-data:/data
+    # Hardening: no privilege escalation, drop all Linux capabilities (the app
+    # needs none — it binds 8080 and writes only to the /data volume), and run on
+    # a read-only root filesystem with a writable tmpfs for scratch files.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
     restart: unless-stopped
 
 volumes:

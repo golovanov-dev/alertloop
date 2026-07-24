@@ -11,6 +11,10 @@ coverage
 .env
 .env.*
 !.env.example
+# Real config with secrets must never enter the build context (only the binary
+# is copied to the final image, but keep it out of the build stage regardless).
+alertloop.yaml
+deploy/docker/alertloop.yaml
 docs
 web/admin/node_modules
 web/admin/out

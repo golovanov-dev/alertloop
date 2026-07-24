@@ -13,6 +13,8 @@
 services:
   postgres:
     image: postgres:16-alpine
+    # Note: no `ports:` — Postgres stays on the internal Docker network only and
+    # is never published to the host. Keep it that way.
     environment:
       POSTGRES_USER: alertloop
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-alertloop}
@@ -24,6 +26,10 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    # The Postgres image needs a writable data dir and some caps to drop from
+    # root to the postgres user, so only no-new-privileges is applied here.
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
 
   api:
@@ -37,9 +43,18 @@ services:
       postgres:
         condition: service_healthy
     ports:
-      - "8080:8080"
+      # Loopback-only: a published Docker port bypasses host firewalls like ufw.
+      # Put the HTTPS reverse proxy from deploy/proxy/ in front for public access.
+      - "127.0.0.1:8080:8080"
     volumes:
       - ./alertloop.yaml:/etc/alertloop/alertloop.yaml:ro
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
     restart: unless-stopped
 
   worker:
@@ -52,6 +67,13 @@ services:
         condition: service_started
     volumes:
       - ./alertloop.yaml:/etc/alertloop/alertloop.yaml:ro
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
     restart: unless-stopped
 
   # The admin console is served by the `api` container at /admin (same origin) —

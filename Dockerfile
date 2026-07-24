@@ -28,7 +28,8 @@ RUN CGO_ENABLED=0 go build -trimpath \
 # Runtime stage: minimal image with CA certs for outbound TLS (SMTP/Telegram).
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates tzdata && \
-    adduser -D -u 10001 alertloop
+    adduser -D -u 10001 alertloop && \
+    mkdir -p /data && chown alertloop:alertloop /data
 WORKDIR /data
 COPY --from=build /out/alertloop /usr/local/bin/alertloop
 
