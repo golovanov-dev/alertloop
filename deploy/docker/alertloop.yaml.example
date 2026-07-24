@@ -8,7 +8,9 @@
 
 addr: ":8080"
 
-# Protects the admin console at /admin and grants full API access. CHANGE THIS.
+# Protects the admin console at /admin and grants full API access. CHANGE THIS
+# to a strong random value (e.g. `openssl rand -hex 32`). It is sent on every
+# request, so only reach the service through the HTTPS reverse proxy.
 admin_token: "change-me-admin-token"
 
 # Scoped API keys for services (ingest | read | full). Optional — the admin

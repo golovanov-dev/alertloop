@@ -23,9 +23,11 @@ services:
     environment:
       ALERTLOOP_DB_DSN: /data/alertloop.db
       # The admin token signs in to /admin AND grants full API access.
+      # Overridable via .env (copy .env.example → .env and set a real value);
+      # falls back to this placeholder so the demo still runs with zero config.
       # Change it before exposing the demo anywhere real. Scoped service API keys
       # (if you need them) go in a mounted YAML config — see alertloop.example.yaml.
-      ALERTLOOP_ADMIN_TOKEN: change-me-admin
+      ALERTLOOP_ADMIN_TOKEN: ${ALERTLOOP_ADMIN_TOKEN:-change-me-admin}
     volumes:
       - alertloop-data:/data
     # Hardening: no privilege escalation, drop all Linux capabilities (the app

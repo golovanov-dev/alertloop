@@ -12,6 +12,9 @@
   `no-new-privileges`, and run with a read-only root filesystem; the image now
   makes the `/data` directory owned by the non-root runtime user so SQLite works
   under a read-only rootfs on native-Linux hosts.
+- Documented setting strong secrets (admin token, DB password) via `.env`; the
+  demo admin token is now overridable through the environment instead of a fixed
+  inline default.
 
 ### Changed
 
