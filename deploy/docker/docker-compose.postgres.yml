@@ -39,6 +39,11 @@ services:
         VERSION: compose-pg
     image: alertloop:latest
     command: ["--config", "/etc/alertloop/alertloop.yaml", "server"]
+    environment:
+      # The runtime image bakes ALERTLOOP_DB_DSN=/data/alertloop.db (the sqlite default), and env
+      # overrides YAML. Blank it so the postgres dsn in alertloop.yaml stays authoritative for this
+      # profile; still overridable by setting a real ALERTLOOP_DB_DSN in the environment/.env.
+      ALERTLOOP_DB_DSN: ${ALERTLOOP_DB_DSN:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -60,6 +65,10 @@ services:
   worker:
     image: alertloop:latest
     command: ["--config", "/etc/alertloop/alertloop.yaml", "worker"]
+    environment:
+      # Same reason as the api service: neutralise the image's baked-in sqlite ALERTLOOP_DB_DSN so
+      # the postgres dsn from alertloop.yaml wins (both containers must agree on the database).
+      ALERTLOOP_DB_DSN: ${ALERTLOOP_DB_DSN:-}
     depends_on:
       postgres:
         condition: service_healthy
