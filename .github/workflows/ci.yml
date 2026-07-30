@@ -1,0 +1,73 @@
+name: CI
+
+# Static analysis, tests, and formatting on every push and pull request. Go and
+# Node versions match go.mod (1.25) and the Dockerfile / release workflow (22).
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: Go (vet, test, gofmt)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      # gofmt first: it is the cheapest check and the most annoying to discover
+      # after a long test run. `gofmt -l` prints offending files and exits 0, so
+      # a non-empty output has to be turned into a failure explicitly.
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::These files are not gofmt-formatted (run 'make fmt'):"
+            echo "$unformatted"
+            exit 1
+          fi
+          echo "gofmt: clean"
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./...
+
+  admin-ui:
+    name: Admin console (typecheck, build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/admin/package-lock.json
+
+      - name: Install dependencies
+        working-directory: web/admin
+        run: npm ci --no-audit --no-fund
+
+      - name: Typecheck
+        working-directory: web/admin
+        run: npm run typecheck
+
+      # `npm run build` runs tsc --noEmit and then Vite; it catches breakage that
+      # typecheck alone misses (bad imports, asset resolution) before a release
+      # tag depends on it.
+      - name: Build
+        working-directory: web/admin
+        run: npm run build

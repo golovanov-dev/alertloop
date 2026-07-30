@@ -82,6 +82,15 @@ func TestTelegramSend(t *testing.T) {
 	if req.ChatID != "-100999" || req.Text == "" {
 		t.Fatalf("unexpected request %+v", req)
 	}
+	// A Telegram message has no separate subject: the header line carries the
+	// event message, so the body must not repeat it. Regression guard for the
+	// text being printed twice in a row.
+	if n := countOccurrences(req.Text, "Feed processing failed"); n != 1 {
+		t.Fatalf("event message appears %d times in telegram text, want 1:\n%s", n, req.Text)
+	}
+	if !contains(req.Text, "[CRITICAL/incident] Feed processing failed\n\nType:     incident") {
+		t.Fatalf("unexpected telegram text layout:\n%s", req.Text)
+	}
 }
 
 func TestTelegramAPIErrorIsError(t *testing.T) {
@@ -119,9 +128,39 @@ func TestEmailBuildsMessage(t *testing.T) {
 	if fm.from != "alerts@example.com" || len(fm.to) != 1 {
 		t.Fatalf("unexpected envelope from=%q to=%v", fm.from, fm.to)
 	}
-	for _, want := range []string{"Subject: [CRITICAL/incident] Feed processing failed", "Feed processing failed", "Source:   feeds_worker"} {
+	for _, want := range []string{"Subject: [CRITICAL/incident] Feed processing failed", "Source:   feeds_worker", "Event ID: e1"} {
 		if !contains(msg, want) {
 			t.Fatalf("message missing %q:\n%s", want, msg)
+		}
+	}
+	// The subject already carries the event message; the body must not repeat
+	// it. Regression guard for subject and first body line being identical.
+	body := msg
+	if i := indexOf(msg, "\r\n\r\n"); i >= 0 {
+		body = msg[i+4:]
+	}
+	if contains(body, "Feed processing failed") {
+		t.Fatalf("event message repeated in the email body:\n%s", body)
+	}
+	if !hasPrefix(body, "Type:     incident\r\n") {
+		t.Fatalf("email body should start with the field block, got:\n%s", body)
+	}
+}
+
+func TestPlainBodyOmitsMessage(t *testing.T) {
+	e := sampleEvent()
+	body := plainBody(e)
+	if contains(body, e.Message) {
+		t.Fatalf("plainBody must not repeat the event message (it is in subjectLine):\n%s", body)
+	}
+	if !hasPrefix(body, "Type:     incident\n") {
+		t.Fatalf("plainBody should start with the field block, got:\n%s", body)
+	}
+	// The body stays self-contained without the message: it still identifies the
+	// event so it can be opened in the console.
+	for _, want := range []string{"Severity: critical", "State:    new", "Event ID: e1", "Payload:"} {
+		if !contains(body, want) {
+			t.Fatalf("plainBody missing %q:\n%s", want, body)
 		}
 	}
 }
@@ -136,8 +175,7 @@ func TestEmailHeaderInjectionSanitized(t *testing.T) {
 		t.Fatalf("send: %v", err)
 	}
 	msg := string(fm.msg)
-	// Inspect only the header section (everything before the blank line). The
-	// body may legitimately contain "Bcc:" as message text.
+	// Inspect only the header section (everything before the blank line).
 	headerPart := msg
 	if i := indexOf(msg, "\r\n\r\n"); i >= 0 {
 		headerPart = msg[:i]
@@ -166,6 +204,26 @@ func TestTelegramRedactsTokenOnNetworkError(t *testing.T) {
 
 func contains(haystack, needle string) bool {
 	return len(haystack) >= len(needle) && (indexOf(haystack, needle) >= 0)
+}
+
+func hasPrefix(s, prefix string) bool {
+	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
+}
+
+func countOccurrences(s, sub string) int {
+	if sub == "" {
+		return 0
+	}
+	n := 0
+	for i := 0; i+len(sub) <= len(s); {
+		if s[i:i+len(sub)] == sub {
+			n++
+			i += len(sub)
+			continue
+		}
+		i++
+	}
+	return n
 }
 
 func indexOf(s, sub string) int {

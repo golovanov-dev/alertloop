@@ -6,6 +6,10 @@ info:
     AlertLoop Community Edition API for ingesting operational events, business
     events, incidents, and audit entries, tracking their lifecycle, and
     inspecting delivery attempts across Email, Telegram, and Webhook channels.
+
+    Note: `info.version` above is the version of this `/v1` API contract, which
+    is stable; it is deliberately independent of the AlertLoop product version
+    (see the repository CHANGELOG), which is still 0.x and ALPHA.
   license:
     name: AGPL-3.0-only
 servers:
@@ -17,7 +21,7 @@ tags:
   - name: delivery
     description: Delivery attempt inspection and dead-letter replay.
   - name: system
-    description: Health and readiness probes.
+    description: Health and readiness probes, aggregate counts, and build metadata.
 paths:
   /v1/events:
     post:
@@ -166,6 +170,60 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+  /v1/stats:
+    get:
+      tags: [system]
+      summary: Aggregate event and delivery counts
+      description: >
+        Returns event counts grouped by event state and delivery-attempt counts
+        grouped by delivery state. Used by the admin console Overview page.
+        Requires the `read` scope.
+      security:
+        - ApiKeyAuth: []
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Counts by state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Stats'
+              examples:
+                counts:
+                  value:
+                    events: { new: 12, acknowledged: 3, resolved: 41 }
+                    deliveries: { pending: 2, sent: 55, dead_letter: 1 }
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+  /v1/info:
+    get:
+      tags: [system]
+      summary: Build and edition metadata
+      description: >
+        Returns the running build's version plus edition and license identifiers.
+        Used by the admin console About page. Requires the `read` scope.
+      security:
+        - ApiKeyAuth: []
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Build and edition metadata.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Info'
+              examples:
+                release:
+                  value:
+                    version: v0.1.1
+                    edition: community
+                    license: AGPL-3.0-only
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
   /health:
     get:
       tags: [system]
@@ -228,6 +286,11 @@ components:
           schema: { $ref: '#/components/schemas/Error' }
     NotFound:
       description: Resource not found.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: The credential is valid but lacks the required scope.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
@@ -346,6 +409,33 @@ components:
           type: array
           items: { $ref: '#/components/schemas/DeliveryAttempt' }
         next_cursor: { type: string }
+    Stats:
+      type: object
+      description: >
+        Counts by state. Each map contains only the states currently present in
+        the database, so a state with zero rows is absent rather than 0.
+      properties:
+        events:
+          type: object
+          description: Event counts keyed by event state.
+          additionalProperties: { type: integer, format: int64 }
+        deliveries:
+          type: object
+          description: Delivery-attempt counts keyed by delivery state.
+          additionalProperties: { type: integer, format: int64 }
+    Info:
+      type: object
+      properties:
+        version:
+          type: string
+          description: Build version baked in at compile time; `dev` for an untagged local build.
+        edition:
+          type: string
+          description: Always `community` in this repository.
+          example: community
+        license:
+          type: string
+          example: AGPL-3.0-only
     Error:
       type: object
       properties:

@@ -30,7 +30,11 @@ type Config struct {
 	Log       Logging   `yaml:"log"`
 	RateLimit RateLimit `yaml:"rate_limit"`
 
-	// RetentionDays is the fixed Community event retention window.
+	// RetentionDays is the event retention window in days: events older than
+	// this are pruned by the worker. Defaults to 30 and is configurable here or
+	// via ALERTLOOP_RETENTION_DAYS; there is no upper bound. (Retention
+	// *policies* — per-project/per-event-type rules with UI management — are a
+	// planned paid capability; the plain number is not.)
 	RetentionDays int `yaml:"retention_days"`
 
 	// CORSOrigins are allowed browser origins for the JSON API. Needed only when

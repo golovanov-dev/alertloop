@@ -16,6 +16,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The release body is the CHANGELOG section for the tagged version - not
+      # auto-generated commit titles. Extracted first so a missing or still
+      # "Unreleased" section fails the run in seconds, before any build work.
+      - name: Extract release notes from CHANGELOG
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v ver="$version" '
+            /^## / { if (found) exit; if ($2 == ver) { found = 1; next } }
+            found  { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "::error::CHANGELOG.md has no '## $version - <date>' section."
+            echo "::error::Add the section (and its release date) before tagging v$version."
+            exit 1
+          fi
+          echo "--- release body ---"
+          cat release-notes.md
+
       # Build the React admin console so a fresh copy is embedded in the binary.
       - uses: actions/setup-node@v4
         with:
@@ -40,4 +58,4 @@ jobs:
           gh release create "${GITHUB_REF_NAME}" \
             dist/alertloop_* dist/checksums_*.txt \
             --title "${GITHUB_REF_NAME}" \
-            --generate-notes
+            --notes-file release-notes.md

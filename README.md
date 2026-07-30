@@ -19,7 +19,8 @@ until the core product and market positioning are validated.
   basic events list page, Email/Telegram/Webhook delivery, delivery retries and
   dead-letter replay, SQLite and PostgreSQL.
 - **Pro Self-hosted** (planned, paid): multi-project, routing rules, SDKs,
-  WhatsApp, Telegram fallback/proxy, RBAC, longer retention, escalation policies.
+  WhatsApp, Telegram fallback/proxy, RBAC, retention policies (per-project and
+  per-event-type rules managed from the UI), escalation policies.
 - **Enterprise** (planned, paid): on-prem license, SSO, HA, audit, custom
   adapters, support.
 
@@ -33,10 +34,13 @@ until the core product and market positioning are validated.
 - Delivery channels: Email (SMTP), Telegram, Webhook (HMAC-signed).
 - Delivery worker with retries, exponential backoff, dead-letter, and replay.
 - Delivery attempt history, separate from event state.
-- Simple events web page protected by an admin token.
+- Three simple built-in web pages protected by an admin token: events list
+  (`/events`), event detail (`/events/{id}`), and deliveries (`/deliveries`) —
+  next to the richer React admin console at `/admin`.
 - Cursor-paginated list endpoints.
 - Structured logs (text or JSON), to stdout or a file.
-- 30-day event retention.
+- Event retention with automatic cleanup (30 days by default, configurable via
+  `retention_days`).
 
 ## Requirements
 
@@ -114,11 +118,22 @@ The single `alertloop` binary runs in three modes:
 AlertLoop ships a React admin console (Overview, Events, Event detail,
 Deliveries with dead-letter replay, About). **It is embedded in the binary** and
 served at `/admin` on the same origin as the API — nothing extra to install or
-run. Whether you use the prebuilt binary or Docker Compose, just open `/admin`:
+run. With either deployment path you simply open `/admin` — but *where* it is
+reachable from differs, because the two paths bind the port differently:
 
-- Local: <http://localhost:8080/admin>
-- Remote server: `http://<server-ip>:8080/admin`, or your domain behind a proxy
-  (see [Access over a domain](#access-over-a-domain-https)).
+- **Local (either path)**: <http://localhost:8080/admin>.
+- **Binary / systemd on a server**: AlertLoop listens on `:8080` on all
+  interfaces, so it is also reachable at `http://<server-ip>:8080/admin`.
+- **Docker Compose on a server**: both bundled Compose files publish the port on
+  `127.0.0.1` only, so `http://<server-ip>:8080/admin` is refused **by design** —
+  a published Docker port is not filtered by a host firewall such as ufw, so
+  binding `0.0.0.0` would silently expose the console. Reach it through the
+  reverse proxy in `deploy/proxy/`, through an SSH tunnel
+  (`ssh -L 8080:127.0.0.1:8080 user@server`, then use the Local URL above), or by
+  deliberately changing the mapping to `"8080:8080"` if you accept the exposure.
+
+For a real domain with HTTPS (the recommended setup for either path), see
+[Access over a domain](#access-over-a-domain-https).
 
 Sign in with the **admin token** from your config (there are no user accounts in
 Community). The token is kept in the browser's session storage and sent to the
@@ -144,11 +159,20 @@ already inside.
 
 ## Access over a domain (HTTPS)
 
-AlertLoop listens on `:8080` (all interfaces), so on a server it is reachable at
-`http://<server-ip>:8080`. For a real domain, put an HTTPS reverse proxy in
-front — AlertLoop itself speaks plain HTTP and does not terminate TLS. Since the
-API, admin console, and Swagger are all one origin, a single proxy rule covers
-everything:
+Where AlertLoop is reachable before you add a proxy depends on how you run it:
+
+- **Binary / systemd**: the process listens on `:8080` on all interfaces, so on a
+  server it is reachable at `http://<server-ip>:8080` (restrict it with your host
+  firewall, or bind it to loopback with `addr: "127.0.0.1:8080"`).
+- **Docker Compose**: both bundled Compose files publish the port as
+  `127.0.0.1:8080:8080`, so the container is reachable from the host only. That is
+  deliberate: a published Docker port is not filtered by ufw/firewalld, so
+  binding `0.0.0.0` would put the admin console on the public internet without
+  the host firewall noticing.
+
+Either way, for a real domain put an HTTPS reverse proxy in front — AlertLoop
+itself speaks plain HTTP and does not terminate TLS. Since the API, admin
+console, and Swagger are all one origin, a single proxy rule covers everything:
 
 ```text
 [browser] --HTTPS--> [nginx/Apache :443] --HTTP--> [alertloop 127.0.0.1:8080]
@@ -165,9 +189,11 @@ Ready-to-adapt configs are in `deploy/proxy/`:
 - **nginx** — `deploy/proxy/nginx.conf`
 - **Apache** — `deploy/proxy/apache.conf`
 
-Both redirect HTTP→HTTPS and forward to `127.0.0.1:8080`. Get a certificate with
-Let's Encrypt (`certbot`). HTTPS is required in production — the admin token
-travels with each request and must not go over plaintext HTTP.
+Both redirect HTTP→HTTPS and forward to `127.0.0.1:8080` — which is exactly what
+the Compose port mapping publishes, so the proxy path needs no Compose changes.
+Get a certificate with Let's Encrypt (`certbot`). HTTPS is required in
+production — the admin token travels with each request and must not go over
+plaintext HTTP.
 
 ## Database
 
@@ -289,8 +315,12 @@ no special handling.
 ## API
 
 The OpenAPI contract lives at `api/openapi.yaml` and is served live at
-`/openapi.yaml`, with Swagger UI at `/swagger`. Full product documentation will
-be published on a dedicated documentation site.
+`/openapi.yaml`, with Swagger UI at `/swagger`.
+
+Documentation lives in two places today: this README (installation, deployment,
+configuration, operations) and the interactive Swagger UI at `/swagger` on a
+running instance (the full endpoint reference, request/response schemas, and
+examples).
 
 ## Releases and building
 
@@ -318,6 +348,10 @@ For a single local binary for your own machine, just `make build` (Go only).
 
 ## Production notes
 
+- **Always set `admin_token`**: if neither `admin_token` nor `api_keys` are set,
+  the API accepts unauthenticated requests with **full** scope (a local-demo
+  convenience; the process logs a warning at startup). Always set `admin_token`
+  on anything reachable by others.
 - **TLS**: AlertLoop serves plain HTTP and is designed to run **behind an
   HTTPS reverse proxy** (nginx, Caddy, Traefik). Terminate TLS there and forward
   to the container/port.

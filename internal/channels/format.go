@@ -17,9 +17,12 @@ func subjectLine(e *domain.Event) string {
 
 // plainBody renders a human-readable multi-line description of an event for
 // email and Telegram delivery.
+//
+// The event message is deliberately NOT repeated here: it is already carried by
+// subjectLine, which becomes the email Subject header and the first line of a
+// Telegram message. Including it again duplicated the text in both channels.
 func plainBody(e *domain.Event) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s\n\n", e.Message)
 	fmt.Fprintf(&b, "Type:     %s\n", e.Type)
 	fmt.Fprintf(&b, "Severity: %s\n", e.Severity)
 	fmt.Fprintf(&b, "State:    %s\n", e.State)

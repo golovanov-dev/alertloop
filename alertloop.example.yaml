@@ -1,8 +1,15 @@
 # AlertLoop example configuration.
 # Precedence (highest wins): command flags > environment variables > this file >
-# built-in defaults. Core/infrastructure scalars (addr, admin_token, database,
-# log, retention) also accept ALERTLOOP_* env vars; structured lists (API keys,
-# delivery channels) and detailed worker/rate_limit tuning are YAML only.
+# built-in defaults.
+#
+# What accepts an ALERTLOOP_* env var: addr, admin_token, database driver/dsn,
+# log level/format/file, retention_days, cors_origins, plus two worker knobs
+# (ALERTLOOP_WORKER_CONCURRENCY, ALERTLOOP_WORKER_MAX_ATTEMPTS) and the
+# rate-limit on/off switch (ALERTLOOP_RATELIMIT_ENABLED). See .env.example.
+#
+# YAML only: structured lists (api_keys, channels) and the remaining
+# worker/rate_limit tuning (poll_interval, base_backoff, max_backoff,
+# per_ip_*, ingest_*).
 
 # HTTP listen address for the API and web UI.
 addr: ":8080"
@@ -23,7 +30,8 @@ api_keys:
   # - key: "change-me-read-key"
   #   scope: read
 
-# Fixed Community retention window in days (events older than this are pruned).
+# Event retention window in days: events older than this are pruned automatically
+# by the worker. Configurable here or via ALERTLOOP_RETENTION_DAYS; no upper bound.
 retention_days: 30
 
 # Logging. Output goes to stdout by default; set `file` to also persist logs to
@@ -41,6 +49,13 @@ rate_limit:
   per_ip_burst: 40
   ingest_per_second: 100   # overall event ingestion cap for the process
   ingest_burst: 200
+
+# The admin console is served by this API at /admin (same origin — no CORS
+# needed). Only set cors_origins if you build your OWN browser app on a
+# different origin that calls this API. Use "*" to allow any origin; empty (the
+# default) disables CORS and allows same-origin only.
+# cors_origins:
+#   - "https://my-dashboard.example.com"
 
 database:
   # "sqlite" (local/demo) or "postgres" (production). Inferred from dsn if empty.
