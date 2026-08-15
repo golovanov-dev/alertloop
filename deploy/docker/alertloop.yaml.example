@@ -39,8 +39,8 @@ log:
 
 # Channel configuration — OPTIONAL, defined ONCE here and used by both api (to
 # know which delivery jobs to create) and worker (to actually send them). With
-# none configured, events are just stored. Uncomment and fill in to send. Every
-# event is delivered to EVERY configured channel (no per-event routing).
+# none configured, events are just stored. Uncomment and fill in to send.
+# Without a `routing` section (below) every event goes to EVERY channel.
 channels: {}
   # webhook:
   #   - name: siem
@@ -48,7 +48,7 @@ channels: {}
   #     secret: "change-me-webhook-secret"
 
   # email:
-  #   - name: ops
+  #   - name: dev-email
   #     host: "smtp.example.com"
   #     port: 587
   #     username: "alerts@example.com"
@@ -58,6 +58,29 @@ channels: {}
   #     starttls: true
 
   # telegram:
-  #   - name: alerts
+  #   - name: dev-telegram
   #     bot_token: "123456:ABC-DEF"
   #     chat_id: "-1001234567890"
+  #     # For hosts that cannot reach api.telegram.org directly (http, https,
+  #     # socks5, socks5h; MTProto proxies do NOT work for the Bot API):
+  #     # proxy: "socks5://user:pass@127.0.0.1:1080"
+  #   - name: customer-telegram
+  #     bot_token: "123456:ABC-DEF"
+  #     chat_id: "-1009876543210"
+
+# Routing — OPTIONAL and also shared by both containers. Without it every event
+# goes to every channel (the behaviour of 0.1.x). With it, each event goes to
+# the channels of the FIRST rule it matches.
+#
+# routing:
+#   rules:
+#     - name: incidents-to-dev
+#       match:
+#         type: [incident]
+#       channels: [dev-telegram, dev-email]
+#     - name: orders-to-customer
+#       match:
+#         type: [business_event]
+#         category: ["order.*"]
+#       channels: [customer-telegram]
+#   default: [dev-telegram]

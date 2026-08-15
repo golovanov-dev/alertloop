@@ -7,10 +7,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
 	"github.com/golovanov-dev/alertloop/internal/domain"
+	"github.com/golovanov-dev/alertloop/internal/routing"
 	"github.com/golovanov-dev/alertloop/internal/storage"
 	"github.com/google/uuid"
 )
@@ -18,26 +20,34 @@ import (
 // Clock returns the current time. Tests may substitute a fixed clock.
 type Clock func() time.Time
 
-// IngestService validates incoming events, stores them idempotently, and fans
-// out one delivery attempt per configured channel (the Community single global
-// channel configuration).
+// IngestService validates incoming events, stores them idempotently, and
+// enqueues one delivery attempt per channel the router selects. With no routing
+// section configured the router selects every configured channel, which is the
+// historical fan-out behavior.
 type IngestService struct {
 	store       storage.Store
-	targets     []domain.ChannelTarget
+	router      *routing.Router
 	maxAttempts int
 	now         Clock
+	log         *slog.Logger
 }
 
-// NewIngestService builds an IngestService. targets is the set of configured
-// channel instances every event is delivered to (Community fan-out).
-func NewIngestService(store storage.Store, targets []domain.ChannelTarget, maxAttempts int, now Clock) *IngestService {
+// NewIngestService builds an IngestService. router decides which channels each
+// event is delivered to; a nil logger falls back to slog.Default().
+func NewIngestService(store storage.Store, router *routing.Router, maxAttempts int, now Clock, log *slog.Logger) *IngestService {
 	if maxAttempts <= 0 {
 		maxAttempts = domain.DefaultMaxAttempts
 	}
 	if now == nil {
 		now = time.Now
 	}
-	return &IngestService{store: store, targets: targets, maxAttempts: maxAttempts, now: now}
+	if router == nil {
+		router = routing.NewAllChannels(nil)
+	}
+	if log == nil {
+		log = slog.Default()
+	}
+	return &IngestService{store: store, router: router, maxAttempts: maxAttempts, now: now, log: log}
 }
 
 // EventInput is the validated, transport-neutral shape of an ingestion request.
@@ -80,19 +90,40 @@ func (s *IngestService) Ingest(ctx context.Context, in EventInput) (event *domai
 		UpdatedAt:  now,
 	}
 
+	// Routing runs once, here at ingestion: a repeated dedupe_key returns the
+	// stored event and creates no deliveries, so it is never routed twice.
+	decision := s.router.Route(e)
+
 	// Build the event and its delivery jobs, then persist them atomically so an
 	// event is never stored without its deliveries.
-	deliveries := s.buildDeliveries(e.ID, now)
+	deliveries := s.buildDeliveries(e.ID, decision.Channels, now)
 	stored, created, err := s.store.CreateEventWithDeliveries(ctx, e, deliveries)
 	if err != nil {
 		return nil, false, err
 	}
+	if created {
+		s.logRouting(e, decision)
+	}
 	return stored, created, nil
 }
 
-func (s *IngestService) buildDeliveries(eventID string, now time.Time) []*domain.DeliveryAttempt {
-	deliveries := make([]*domain.DeliveryAttempt, 0, len(s.targets))
-	for _, t := range s.targets {
+// logRouting records where a newly stored event went. An event that matched
+// nothing and has no routing default is delivered nowhere, which is the one
+// failure mode of routing that is otherwise invisible — it is logged at warn
+// level with everything needed to write the missing rule.
+func (s *IngestService) logRouting(e *domain.Event, d routing.Decision) {
+	if s.router.Configured() && !d.Matched && len(d.Channels) == 0 {
+		s.log.Warn("event matched no routing rule and no routing default is configured; it is stored but will not be delivered",
+			"event_id", e.ID, "type", e.Type, "severity", e.Severity,
+			"source", e.Source, "category", e.Category)
+		return
+	}
+	s.log.Debug("event routed", "event_id", e.ID, "rule", d.Rule, "channels", len(d.Channels))
+}
+
+func (s *IngestService) buildDeliveries(eventID string, targets []domain.ChannelTarget, now time.Time) []*domain.DeliveryAttempt {
+	deliveries := make([]*domain.DeliveryAttempt, 0, len(targets))
+	for _, t := range targets {
 		deliveries = append(deliveries, &domain.DeliveryAttempt{
 			ID:          uuid.NewString(),
 			EventID:     eventID,

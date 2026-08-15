@@ -1,11 +1,17 @@
 package service
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/golovanov-dev/alertloop/internal/config"
 	"github.com/golovanov-dev/alertloop/internal/domain"
+	"github.com/golovanov-dev/alertloop/internal/routing"
 	"github.com/golovanov-dev/alertloop/internal/storage"
 )
 
@@ -28,7 +34,7 @@ func TestIngestCreatesEventAndFansOut(t *testing.T) {
 		{Type: domain.ChannelWebhook, Name: "siem"},
 		{Type: domain.ChannelEmail, Name: "ops"},
 	}
-	svc := NewIngestService(s, targets, 5, time.Now)
+	svc := NewIngestService(s, routing.NewAllChannels(targets), 5, time.Now, nil)
 	ctx := context.Background()
 
 	ev, created, err := svc.Ingest(ctx, EventInput{
@@ -57,7 +63,7 @@ func TestIngestFansOutToMultipleChannelsOfSameType(t *testing.T) {
 		{Type: domain.ChannelTelegram, Name: "tg-en"},
 		{Type: domain.ChannelWebhook, Name: "siem"},
 	}
-	svc := NewIngestService(s, targets, 5, time.Now)
+	svc := NewIngestService(s, routing.NewAllChannels(targets), 5, time.Now, nil)
 	ctx := context.Background()
 
 	ev, _, err := svc.Ingest(ctx, EventInput{Type: domain.EventIncident, Source: "s", Message: "m"})
@@ -84,9 +90,191 @@ func TestIngestFansOutToMultipleChannelsOfSameType(t *testing.T) {
 	}
 }
 
+// routingTargets is the customer/developer split the routing tests below use.
+func routingTargets() []domain.ChannelTarget {
+	return []domain.ChannelTarget{
+		{Type: domain.ChannelTelegram, Name: "customer-telegram"},
+		{Type: domain.ChannelTelegram, Name: "dev-telegram"},
+		{Type: domain.ChannelWebhook, Name: "siem"},
+	}
+}
+
+// deliveredTo lists the channel names an event actually produced attempts for.
+func deliveredTo(t *testing.T, s storage.Store, eventID string) []string {
+	t.Helper()
+	page, err := s.ListDeliveryAttempts(context.Background(), storage.DeliveryFilter{EventID: eventID}, 50, "")
+	if err != nil {
+		t.Fatalf("list deliveries: %v", err)
+	}
+	names := make([]string, 0, len(page.Items))
+	for _, d := range page.Items {
+		names = append(names, d.ChannelName)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// TestIngestRoutesEventsToDifferentAudiences is the acceptance scenario: on one
+// instance, business events reach the customer and incidents reach the
+// developer, and neither side sees the other's events.
+func TestIngestRoutesEventsToDifferentAudiences(t *testing.T) {
+	s := newStore(t)
+	router, err := routing.New(config.Routing{
+		Rules: []config.RoutingRule{
+			// Suppression comes first: the first matching rule wins, so a rule
+			// that silences a source has to sit above the rules it overrides.
+			{Name: "silence-healthchecks", Match: config.RoutingMatch{Source: []string{"healthcheck"}}},
+			{Name: "incidents-to-dev", Match: config.RoutingMatch{Type: []string{"incident"}},
+				Channels: []string{"dev-telegram", "siem"}},
+			{Name: "orders-to-customer", Match: config.RoutingMatch{
+				Type: []string{"business_event"}, Category: []string{"order.*"},
+			}, Channels: []string{"customer-telegram"}},
+		},
+		Default: []string{"dev-telegram"},
+	}, routingTargets())
+	if err != nil {
+		t.Fatalf("build router: %v", err)
+	}
+	svc := NewIngestService(s, router, 5, time.Now, nil)
+	ctx := context.Background()
+
+	cases := []struct {
+		name  string
+		in    EventInput
+		wants []string
+	}{
+		{"incident goes to the developer", EventInput{
+			Type: domain.EventIncident, Source: "feeds_worker", Message: "boom",
+		}, []string{"dev-telegram", "siem"}},
+		{"order goes to the customer", EventInput{
+			Type: domain.EventBusiness, Source: "shop", Category: "order.created", Message: "new order",
+		}, []string{"customer-telegram"}},
+		{"suppressed source is delivered nowhere", EventInput{
+			Type: domain.EventIncident, Source: "healthcheck", Message: "probe failed",
+		}, []string{}},
+		{"unmatched event falls back to the default", EventInput{
+			Type: domain.EventAudit, Source: "admin", Message: "login",
+		}, []string{"dev-telegram"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ev, created, err := svc.Ingest(ctx, c.in)
+			if err != nil || !created {
+				t.Fatalf("ingest: created=%v err=%v", created, err)
+			}
+			// The event itself is always stored, including when it is suppressed.
+			if _, err := s.GetEvent(ctx, ev.ID); err != nil {
+				t.Fatalf("event was not stored: %v", err)
+			}
+			got := deliveredTo(t, s, ev.ID)
+			if strings.Join(got, ",") != strings.Join(c.wants, ",") {
+				t.Fatalf("delivered to %v, want %v", got, c.wants)
+			}
+		})
+	}
+}
+
+// TestIngestWithoutRoutingDeliversToAllChannels is the 0.1.1 compatibility
+// guard: with no routing section configured, every event still fans out to
+// every configured channel.
+func TestIngestWithoutRoutingDeliversToAllChannels(t *testing.T) {
+	s := newStore(t)
+	svc := NewIngestService(s, routing.NewAllChannels(routingTargets()), 5, time.Now, nil)
+
+	ev, _, err := svc.Ingest(context.Background(), EventInput{
+		Type: domain.EventBusiness, Source: "shop", Category: "order.created", Message: "m",
+	})
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if got := deliveredTo(t, s, ev.ID); strings.Join(got, ",") != "customer-telegram,dev-telegram,siem" {
+		t.Fatalf("delivered to %v, want every configured channel", got)
+	}
+}
+
+// An event that matches nothing with no default configured is delivered
+// nowhere. That is the one failure mode of routing that is otherwise invisible,
+// so it must be loud — and it must not fire for events that were routed, or for
+// duplicates, which create no deliveries by design.
+func TestIngestWarnsWhenNothingMatchesAndNoDefault(t *testing.T) {
+	s := newStore(t)
+	router, err := routing.New(config.Routing{Rules: []config.RoutingRule{
+		{Name: "incidents-to-dev", Match: config.RoutingMatch{Type: []string{"incident"}},
+			Channels: []string{"dev-telegram"}},
+	}}, routingTargets())
+	if err != nil {
+		t.Fatalf("build router: %v", err)
+	}
+	var logged bytes.Buffer
+	svc := NewIngestService(s, router, 5, time.Now,
+		slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	ctx := context.Background()
+
+	// A routed event is not warned about.
+	if _, _, err := svc.Ingest(ctx, EventInput{Type: domain.EventIncident, Source: "s", Message: "m"}); err != nil {
+		t.Fatalf("ingest incident: %v", err)
+	}
+	if strings.Contains(logged.String(), "level=WARN") {
+		t.Fatalf("a routed event produced a warning:\n%s", logged.String())
+	}
+
+	ev, _, err := svc.Ingest(ctx, EventInput{
+		Type: domain.EventAudit, Severity: domain.SeverityWarning,
+		Source: "admin", Category: "login", Message: "m", DedupeKey: "dup",
+	})
+	if err != nil {
+		t.Fatalf("ingest audit: %v", err)
+	}
+	out := logged.String()
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "event_id="+ev.ID) {
+		t.Fatalf("expected a warning naming the event:\n%s", out)
+	}
+	for _, want := range []string{"type=audit", "severity=warning", "source=admin", "category=login"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("warning is missing %q:\n%s", want, out)
+		}
+	}
+
+	// A dedupe hit is not a new undelivered event and must not warn again.
+	before := strings.Count(out, "level=WARN")
+	if _, created, err := svc.Ingest(ctx, EventInput{
+		Type: domain.EventAudit, Source: "admin", Message: "m2", DedupeKey: "dup",
+	}); err != nil || created {
+		t.Fatalf("second ingest: created=%v err=%v", created, err)
+	}
+	if after := strings.Count(logged.String(), "level=WARN"); after != before {
+		t.Fatalf("a dedupe hit produced another warning (%d -> %d)", before, after)
+	}
+}
+
+// A rule with no channels suppresses delivery but must not suppress the event.
+func TestIngestSuppressedEventIsStillStoredAndListed(t *testing.T) {
+	s := newStore(t)
+	router, err := routing.New(config.Routing{
+		Rules: []config.RoutingRule{{Name: "silence-all"}}, // catch-all, no channels
+	}, routingTargets())
+	if err != nil {
+		t.Fatalf("build router: %v", err)
+	}
+	svc := NewIngestService(s, router, 5, time.Now, nil)
+	ctx := context.Background()
+
+	ev, created, err := svc.Ingest(ctx, EventInput{Type: domain.EventIncident, Source: "s", Message: "m"})
+	if err != nil || !created {
+		t.Fatalf("ingest: created=%v err=%v", created, err)
+	}
+	page, _ := s.ListEvents(ctx, storage.EventFilter{}, 50, "")
+	if len(page.Items) != 1 || page.Items[0].ID != ev.ID {
+		t.Fatalf("suppressed event is missing from the event list: %+v", page.Items)
+	}
+	if got := deliveredTo(t, s, ev.ID); len(got) != 0 {
+		t.Fatalf("suppression created deliveries: %v", got)
+	}
+}
+
 func TestIngestDedupeCreatesNoNewDeliveries(t *testing.T) {
 	s := newStore(t)
-	svc := NewIngestService(s, []domain.ChannelTarget{{Type: domain.ChannelWebhook, Name: "wh"}}, 5, time.Now)
+	svc := NewIngestService(s, routing.NewAllChannels([]domain.ChannelTarget{{Type: domain.ChannelWebhook, Name: "wh"}}), 5, time.Now, nil)
 	ctx := context.Background()
 
 	first, _, _ := svc.Ingest(ctx, EventInput{Type: domain.EventIncident, Source: "s", Message: "m", DedupeKey: "dup"})
@@ -108,7 +296,7 @@ func TestIngestDedupeCreatesNoNewDeliveries(t *testing.T) {
 
 func TestIngestValidation(t *testing.T) {
 	s := newStore(t)
-	svc := NewIngestService(s, nil, 5, time.Now)
+	svc := NewIngestService(s, nil, 5, time.Now, nil)
 	ctx := context.Background()
 
 	cases := []EventInput{
@@ -126,7 +314,7 @@ func TestIngestValidation(t *testing.T) {
 
 func TestIngestDefaultsSeverity(t *testing.T) {
 	s := newStore(t)
-	svc := NewIngestService(s, nil, 5, time.Now)
+	svc := NewIngestService(s, nil, 5, time.Now, nil)
 	ev, _, err := svc.Ingest(context.Background(), EventInput{
 		Type: domain.EventBusiness, Source: "s", Message: "m",
 	})

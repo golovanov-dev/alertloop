@@ -12,6 +12,7 @@ import (
 
 	"github.com/golovanov-dev/alertloop/internal/config"
 	"github.com/golovanov-dev/alertloop/internal/domain"
+	"github.com/golovanov-dev/alertloop/internal/routing"
 	"github.com/golovanov-dev/alertloop/internal/service"
 	"github.com/golovanov-dev/alertloop/internal/storage"
 )
@@ -30,7 +31,8 @@ func newTestServer(t *testing.T, apiKeys map[string]string) (*httptest.Server, s
 	targets := []domain.ChannelTarget{{Type: domain.ChannelWebhook, Name: "webhook"}}
 	srv := NewServer(Config{
 		Store:      store,
-		Ingest:     service.NewIngestService(store, targets, 5, time.Now),
+		Ingest:     service.NewIngestService(store, routing.NewAllChannels(targets), 5, time.Now, nil),
+		Routing:    routing.NewAllChannels(targets),
 		Events:     service.NewEventService(store, time.Now),
 		Deliveries: service.NewDeliveryService(store, time.Now),
 		APIKeys:    apiKeys,
@@ -252,7 +254,7 @@ func TestRateLimitPerIP(t *testing.T) {
 
 	srv := NewServer(Config{
 		Store:      store,
-		Ingest:     service.NewIngestService(store, nil, 5, time.Now),
+		Ingest:     service.NewIngestService(store, nil, 5, time.Now, nil),
 		Events:     service.NewEventService(store, time.Now),
 		Deliveries: service.NewDeliveryService(store, time.Now),
 		// Tiny per-IP allowance to trip the limiter quickly.

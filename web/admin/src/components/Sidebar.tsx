@@ -146,7 +146,7 @@ export function Sidebar({
           <span>Projects</span>
         </div>
         <div style={proRow} title="Planned for the Pro edition">
-          <span>Routing</span>
+          <span>Escalation</span>
         </div>
         <div style={proRow} title="Planned for the Pro edition">
           <span>Team</span>

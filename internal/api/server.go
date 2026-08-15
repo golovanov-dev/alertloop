@@ -6,6 +6,7 @@ import (
 
 	"github.com/golovanov-dev/alertloop/internal/adminui"
 	"github.com/golovanov-dev/alertloop/internal/config"
+	"github.com/golovanov-dev/alertloop/internal/routing"
 	"github.com/golovanov-dev/alertloop/internal/service"
 	"github.com/golovanov-dev/alertloop/internal/storage"
 	"github.com/swaggest/swgui/v5emb"
@@ -17,6 +18,7 @@ type Server struct {
 	ingest      *service.IngestService
 	events      *service.EventService
 	deliveries  *service.DeliveryService
+	routing     *routing.Router
 	apiKeys     map[string]string // key -> scope
 	adminToken  string
 	version     string
@@ -30,10 +32,13 @@ type Server struct {
 
 // Config wires a Server.
 type Config struct {
-	Store       storage.Store
-	Ingest      *service.IngestService
-	Events      *service.EventService
-	Deliveries  *service.DeliveryService
+	Store      storage.Store
+	Ingest     *service.IngestService
+	Events     *service.EventService
+	Deliveries *service.DeliveryService
+	// Routing backs the routing preview endpoints. Nil is treated as "routing
+	// not configured".
+	Routing     *routing.Router
 	APIKeys     map[string]string // key -> scope (ingest|read|full)
 	AdminToken  string
 	Version     string
@@ -48,11 +53,16 @@ func NewServer(c Config) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
+	router := c.Routing
+	if router == nil {
+		router = routing.NewAllChannels(nil)
+	}
 	s := &Server{
 		store:       c.Store,
 		ingest:      c.Ingest,
 		events:      c.Events,
 		deliveries:  c.Deliveries,
+		routing:     router,
 		apiKeys:     c.APIKeys,
 		adminToken:  c.AdminToken,
 		version:     c.Version,
@@ -81,6 +91,10 @@ func (s *Server) Handler() http.Handler {
 	api.HandleFunc("POST /v1/events/{id}/{action}", requireScope(config.ScopeFull, s.handleEventAction))
 	api.HandleFunc("GET /v1/delivery-attempts", requireScope(config.ScopeRead, s.handleListDeliveries))
 	api.HandleFunc("POST /v1/delivery-attempts/{id}/replay", requireScope(config.ScopeFull, s.handleReplay))
+	// Routing inspection requires full scope: the table names every channel and
+	// the preview is an operator tool, not a dashboard read.
+	api.HandleFunc("GET /v1/routing", requireScope(config.ScopeFull, s.handleRoutingTable))
+	api.HandleFunc("POST /v1/routing/preview", requireScope(config.ScopeFull, s.handleRoutingPreview))
 	api.HandleFunc("GET /v1/stats", requireScope(config.ScopeRead, s.handleStats))
 	api.HandleFunc("GET /v1/info", requireScope(config.ScopeRead, s.handleInfo))
 	mux.Handle("/v1/", apiKeyAuth(s.apiKeys, s.adminToken, api))

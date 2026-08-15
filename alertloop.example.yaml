@@ -77,13 +77,13 @@ worker:
 # more channels and fill in their fields.
 #
 # Each type is a LIST, so you can configure several channels of the same type
-# (e.g. two Telegram chats). Every event is delivered to EVERY configured channel
-# — Community has no per-event routing (that is a paid capability). Each channel
-# needs a unique `name`. If you enable a channel you must fill ALL its required
-# fields, or startup will fail with a clear message.
+# (e.g. two Telegram chats). Without a `routing` section (see below) every event
+# is delivered to EVERY configured channel. Each channel needs a unique `name`.
+# If you enable a channel you must fill ALL its required fields, or startup will
+# fail with a clear message.
 channels: {}
   # email:
-  #   - name: ops
+  #   - name: dev-email
   #     host: "smtp.example.com"
   #     port: 587
   #     username: "alerts@example.com"
@@ -94,12 +94,58 @@ channels: {}
   #     tls: false       # set true for implicit TLS / SMTPS (e.g. port 465)
   #
   # telegram:
-  #   - name: alerts-ru
+  #   - name: dev-telegram
   #     bot_token: "123456:ABC-DEF"    # from @BotFather
   #     chat_id: "-1001234567890"
+  #     # If this host cannot reach api.telegram.org directly, send this
+  #     # channel's requests through a proxy. Schemes: http, https, socks5,
+  #     # socks5h (socks5h is a synonym: the proxy resolves DNS either way).
+  #     # MTProto proxies do NOT work for the Bot API. Any other scheme stops
+  #     # startup. Leave it out to keep using HTTP_PROXY/HTTPS_PROXY, if set.
+  #     # proxy: "socks5://user:pass@127.0.0.1:1080"
+  #     #
+  #     # Alternative to a proxy: a trusted Bot API mirror or reverse proxy.
+  #     # api_base: "https://tg-mirror.example.com"
+  #
+  #   - name: customer-telegram
+  #     bot_token: "123456:ABC-DEF"
+  #     chat_id: "-1009876543210"
   #
   # webhook:
   #   - name: siem
   #     url: "https://example.com/alertloop-hook"
   #     # Requests are HMAC-SHA256 signed; receivers verify X-AlertLoop-Signature.
   #     secret: "shared-webhook-secret"
+
+# Routing is OPTIONAL. Without this section every event goes to every configured
+# channel (the behaviour of 0.1.x). With it, each event goes to the channels of
+# the FIRST rule it matches — rules are checked top to bottom and channel lists
+# are never merged.
+#
+# The example below is the common split: the customer gets the orders, the
+# developer gets the failures, and neither gets the other's events.
+#
+# routing:
+#   rules:
+#     # Suppression first: a rule that silences a source must sit above the
+#     # rules it overrides, because the first match wins.
+#     - name: silence-healthchecks
+#       match:
+#         source: [healthcheck]
+#       channels: []            # explicit "nowhere": stored, never delivered
+#
+#     - name: incidents-to-dev
+#       match:
+#         type: [incident]      # values in one field are OR-ed...
+#         min_severity: warning # ...and different fields are AND-ed
+#       channels: [dev-telegram, dev-email]
+#
+#     - name: orders-to-customer
+#       match:
+#         type: [business_event]
+#         category: ["order.*"] # only a TRAILING "*" is supported
+#       channels: [customer-telegram]
+#
+#   # Events matching no rule. Omit it and they are delivered nowhere — each one
+#   # is then logged at warn level so the loss is never silent.
+#   default: [dev-telegram]

@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.2.0 - 2026-08-15
+
+Routing rules and Telegram delivery through a proxy — both in Community.
+**Upgrading from 0.1.1 requires no configuration changes**: with no `routing`
+section, every event is still delivered to every configured channel.
+
+### Added
+
+- Routing rules (`routing` section): send each event to the channels that should
+  receive it, matched on `type`, `severity`, `min_severity`, `source`, and
+  `category`. Values inside one field are OR-ed, fields are AND-ed, `source` and
+  `category` accept a trailing `*`, and the first matching rule wins. `channels: []`
+  suppresses delivery while still storing the event; `default` catches events that
+  match no rule.
+- Routing diagnostics at startup: the resolved routing table is logged, along
+  with warnings for rules made unreachable by an earlier catch-all and for
+  configured channels nothing routes to. A rule naming a channel that does not
+  exist stops the process, and an event that matches no rule with no `default`
+  configured is logged at `warn` level.
+- `GET /v1/routing` and `POST /v1/routing/preview` (scope `full`): inspect the
+  routing table and check where an event would be delivered, without creating or
+  delivering anything.
+- Telegram channels accept a `proxy` (`http`, `https`, `socks5`, `socks5h`) for
+  hosts that cannot reach `api.telegram.org` directly. It is per channel, so a
+  webhook into an internal network stays direct. An unsupported scheme or an
+  unusable URL stops the process at startup. With `proxy` unset, `HTTP_PROXY` /
+  `HTTPS_PROXY` / `NO_PROXY` keep working as before.
+
+### Changed
+
+- Routing rules and the Telegram proxy are Community capabilities, not planned
+  Pro ones as previously documented. Pro keeps multi-project, RBAC, escalation
+  policies, UI-managed retention policies, WhatsApp, and SDKs.
+
+### Security
+
+- The password in a proxy URL is redacted from delivery errors, logs, the API,
+  and the admin console, as the bot token already was. Startup messages and the
+  channel list show a proxy as `scheme://host:port` only.
+
 ## 0.1.1 - 2026-07-30
 
 Hardening and documentation release. No API or configuration changes are

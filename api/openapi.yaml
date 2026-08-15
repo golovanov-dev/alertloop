@@ -20,6 +20,10 @@ tags:
     description: Event ingestion, listing, and lifecycle actions.
   - name: delivery
     description: Delivery attempt inspection and dead-letter replay.
+  - name: routing
+    description: >
+      Inspection of the delivery routing table and a dry-run preview of where an
+      event would be delivered. Both require the `full` scope.
   - name: system
     description: Health and readiness probes, aggregate counts, and build metadata.
 paths:
@@ -170,6 +174,88 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+  /v1/routing:
+    get:
+      tags: [routing]
+      summary: Show the routing table in effect
+      description: >
+        Returns the resolved routing rules, in evaluation order, and the default
+        channels for events that match no rule. When `configured` is false there
+        is no `routing` section in the configuration and every event is
+        delivered to every configured channel — which `default` then lists.
+        Requires the `full` scope.
+      security:
+        - ApiKeyAuth: []
+        - BearerAuth: []
+      responses:
+        "200":
+          description: The routing table.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoutingTable'
+              examples:
+                configured:
+                  value:
+                    configured: true
+                    rules:
+                      - name: incidents-to-dev
+                        match: { type: [incident] }
+                        channels: [dev-telegram, dev-email]
+                        catch_all: false
+                      - name: orders-to-customer
+                        match: { type: [business_event], category: ["order.*"] }
+                        channels: [customer-telegram]
+                        catch_all: false
+                    default: [dev-telegram]
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+  /v1/routing/preview:
+    post:
+      tags: [routing]
+      summary: Preview where an event would be delivered
+      description: >
+        Matches the given event fields against the routing rules and returns the
+        rule that would fire and the channels it selects. Nothing is created and
+        nothing is delivered, so rules can be checked on a live instance without
+        raising false incidents. An empty `matched_rule` means no rule matched
+        and `channels` holds the routing default. Requires the `full` scope.
+      security:
+        - ApiKeyAuth: []
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RoutingPreviewInput'
+            examples:
+              incident:
+                value:
+                  type: incident
+                  severity: critical
+                  source: feeds_worker
+                  category: feeds
+      responses:
+        "200":
+          description: The rule that would fire and the channels it selects.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoutingPreview'
+              examples:
+                matched:
+                  value:
+                    matched_rule: incidents-to-dev
+                    channels: [dev-telegram, dev-email]
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
   /v1/stats:
     get:
       tags: [system]
@@ -409,6 +495,84 @@ components:
           type: array
           items: { $ref: '#/components/schemas/DeliveryAttempt' }
         next_cursor: { type: string }
+    RoutingMatch:
+      type: object
+      description: >
+        Rule conditions. Values inside one field are OR-ed, fields are AND-ed,
+        and an absent field constrains nothing. Comparison ignores case and
+        surrounding whitespace. An empty match makes the rule a catch-all.
+      properties:
+        type:
+          type: array
+          items: { $ref: '#/components/schemas/EventType' }
+        severity:
+          type: array
+          items: { $ref: '#/components/schemas/Severity' }
+        min_severity:
+          allOf:
+            - $ref: '#/components/schemas/Severity'
+          description: >
+            Matches events at or above this alarm level. Ranks are info=10,
+            success=10, warning=20, error=30, critical=40 — `success` shares
+            `info`'s rank because this is an order of alarm, not of importance.
+        source:
+          type: array
+          items: { type: string }
+          description: Literal values, or a prefix with a trailing `*` (e.g. `feeds_*`).
+        category:
+          type: array
+          items: { type: string }
+          description: Literal values, or a prefix with a trailing `*` (e.g. `order.*`).
+    RoutingRule:
+      type: object
+      properties:
+        name: { type: string }
+        match: { $ref: '#/components/schemas/RoutingMatch' }
+        channels:
+          type: array
+          items: { type: string }
+          description: >
+            Channel names the event is delivered to. An empty list is deliberate
+            suppression: the event is stored and nothing is delivered.
+        catch_all:
+          type: boolean
+          description: True when the rule has no conditions and matches every event.
+    RoutingTable:
+      type: object
+      properties:
+        configured:
+          type: boolean
+          description: >
+            False when no `routing` section is configured; every event is then
+            delivered to every configured channel.
+        rules:
+          type: array
+          items: { $ref: '#/components/schemas/RoutingRule' }
+          description: Rules in evaluation order. The first match wins.
+        default:
+          type: array
+          items: { type: string }
+          description: Channels for events matching no rule. Empty means such events are not delivered.
+    RoutingPreviewInput:
+      type: object
+      description: The event fields routing rules can look at. No event is created.
+      properties:
+        type: { $ref: '#/components/schemas/EventType' }
+        severity:
+          allOf:
+            - $ref: '#/components/schemas/Severity'
+          description: Defaults to `info`, as it does on ingestion.
+        source: { type: string }
+        category: { type: string }
+    RoutingPreview:
+      type: object
+      properties:
+        matched_rule:
+          type: string
+          description: Name of the rule that fired; empty when no rule matched.
+        channels:
+          type: array
+          items: { type: string }
     Stats:
       type: object
       description: >

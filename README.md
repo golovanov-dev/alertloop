@@ -16,11 +16,12 @@ until the core product and market positioning are validated.
 ## Editions
 
 - **Community** (this repository): free, self-hosted, backend API, Swagger/OpenAPI,
-  basic events list page, Email/Telegram/Webhook delivery, delivery retries and
-  dead-letter replay, SQLite and PostgreSQL.
-- **Pro Self-hosted** (planned, paid): multi-project, routing rules, SDKs,
-  WhatsApp, Telegram fallback/proxy, RBAC, retention policies (per-project and
-  per-event-type rules managed from the UI), escalation policies.
+  basic events list page, Email/Telegram/Webhook delivery, routing rules,
+  Telegram delivery through a proxy, delivery retries and dead-letter replay,
+  SQLite and PostgreSQL.
+- **Pro Self-hosted** (planned, paid): multi-project, SDKs, WhatsApp, RBAC,
+  retention policies (per-project and per-event-type rules managed from the UI),
+  escalation policies.
 - **Enterprise** (planned, paid): on-prem license, SSO, HA, audit, custom
   adapters, support.
 
@@ -32,6 +33,11 @@ until the core product and market positioning are validated.
   (with a manual `escalate` action).
 - Idempotent ingestion via `dedupe_key`.
 - Delivery channels: Email (SMTP), Telegram, Webhook (HMAC-signed).
+- [Routing rules](#routing-rules): send each event to the channels that should
+  get it (by type, severity, source, or category), with a dry-run preview
+  endpoint.
+- [Telegram from a restricted network](#telegram-from-a-restricted-network): a
+  per-channel HTTP/SOCKS5 `proxy`, or an `api_base` mirror.
 - Delivery worker with retries, exponential backoff, dead-letter, and replay.
 - Delivery attempt history, separate from event state.
 - Three simple built-in web pages protected by an admin token: events list
@@ -288,8 +294,135 @@ YAML file. If you enable a channel you must fill in all of its required fields,
 or startup fails with a clear message (this catches typos like a missing
 `bot_token`).
 
-Every event is delivered to **every** configured channel — Community has no
-per-event routing (that is a paid capability).
+With no `routing` section configured, every event is delivered to **every**
+configured channel. To split events between audiences, see
+[Routing rules](#routing-rules).
+
+### Routing rules
+
+One AlertLoop instance usually serves more than one audience: the customer who
+only wants orders, and the developer who also wants the technical failures. The
+optional `routing` section decides which channels each event goes to.
+
+```yaml
+routing:
+  # Rules are checked top to bottom; the FIRST match wins.
+  rules:
+    - name: silence-healthchecks
+      match:
+        source: [healthcheck]
+      channels: []              # explicit "nowhere": stored, never delivered
+
+    - name: incidents-to-dev
+      match:
+        type: [incident]
+      channels: [dev-telegram, dev-email]
+
+    - name: orders-to-customer
+      match:
+        type: [business_event]
+        category: ["order.*"]
+      channels: [customer-telegram]
+
+  # Where events that matched no rule go.
+  default: [dev-telegram]
+```
+
+Conditions inside `match`:
+
+| Field | Matches | Format |
+|---|---|---|
+| `type` | event family | list of `incident`, `business_event`, `audit` |
+| `severity` | severity | list of `info`, `success`, `warning`, `error`, `critical` |
+| `min_severity` | severity | one value; matches that level and above |
+| `source` | event source | list; a trailing `*` is a prefix wildcard |
+| `category` | event category | list; a trailing `*` is a prefix wildcard |
+
+Rules of the road:
+
+- Values inside one field are OR-ed; different fields are AND-ed. An omitted
+  field constrains nothing, and a rule with no `match` at all is a catch-all.
+- Comparison ignores case and surrounding whitespace.
+- Only a **trailing** `*` is supported, and only for `source` and `category`:
+  `order.*` matches `order.created`. A `*` anywhere else is a configuration
+  error — there are no regular expressions.
+- `min_severity` ranks are `info` = 10, `success` = 10, `warning` = 20,
+  `error` = 30, `critical` = 40. `success` deliberately shares `info`'s rank:
+  this is an order of **alarm**, not of importance, and a successful outcome is
+  not more alarming than a notice.
+- **The first matching rule wins** and later rules are not consulted. Channel
+  lists from several rules are never merged — at three in the morning,
+  predictability beats expressiveness.
+- `channels: []` is deliberate suppression: the event is stored (and visible in
+  the API and the console) but nothing is delivered.
+- `default` applies **only** when no rule matched. Without it, unmatched events
+  are delivered nowhere and each one is logged at `warn` level with its id,
+  type, severity, source, and category.
+
+The startup log prints the resolved table, plus warnings for the two mistakes
+that are otherwise invisible: rules that can never match because a catch-all
+sits above them, and configured channels that no rule and no default sends to.
+A rule naming a channel that does not exist stops the process.
+
+To check rules against a live instance without raising a false incident, use the
+preview endpoint (`full` scope, creates nothing):
+
+```bash
+curl -X POST http://localhost:8080/v1/routing/preview \
+  -H "X-API-Key: change-me-admin" -H "Content-Type: application/json" \
+  -d '{"type":"business_event","source":"shop","category":"order.created"}'
+# {"matched_rule":"orders-to-customer","channels":["customer-telegram"]}
+```
+
+`GET /v1/routing` returns the whole table as it took effect.
+
+**Omitting the `routing` section keeps the pre-0.2.0 behavior**: every event goes
+to every configured channel. Upgrading from 0.1.1 needs no configuration change.
+
+### Telegram from a restricted network
+
+Some hosts cannot reach `api.telegram.org` directly. Two independent ways out,
+both per channel:
+
+```yaml
+channels:
+  telegram:
+    - name: dev-alerts
+      bot_token: "123456:ABC-DEF"
+      chat_id: "-1001234567890"
+      proxy: "socks5://user:pass@127.0.0.1:1080"   # or http://, https://
+    - name: customer-alerts
+      bot_token: "123456:ABC-DEF"
+      chat_id: "-1009876543210"
+      api_base: "https://tg-mirror.example.com"    # a trusted Bot API mirror
+```
+
+- **`proxy`** — when you have your own HTTP or SOCKS5 proxy and the traffic
+  should go through it. Supported schemes: `http`, `https`, `socks5`, and
+  `socks5h`. Anything else stops the process at startup with a clear message,
+  rather than quietly sending nothing.
+- **`api_base`** — when you have a trusted mirror or reverse proxy in front of
+  the Bot API.
+
+Notes:
+
+- **MTProto proxies do not work for the Bot API.** They speak Telegram's client
+  protocol, not HTTP; pointing `proxy` at one produces an obscure network error.
+  Use an HTTP/SOCKS5 proxy or a mirror instead.
+- `socks5` and `socks5h` behave **identically** here, and the difference people
+  expect does not apply: Go's HTTP transport sends the target **host name** to
+  the proxy (SOCKS5 address type `0x03`), so the **proxy resolves DNS**, not
+  AlertLoop. Verified by a test with a local SOCKS5 server
+  (`TestTelegramSendsThroughSOCKS5Proxy`), not by assumption.
+- The setting is per channel, not per process, so a Telegram channel can use a
+  proxy while a webhook into your internal network stays direct. There is no
+  `ALERTLOOP_*` variable for it: channels are configured in YAML only.
+- With `proxy` unset, the process-wide `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY`
+  variables keep working exactly as before.
+- Credentials in the proxy URL are supported, and the password is redacted from
+  logs, delivery errors, the API, and the console — as the bot token already is.
+- There is no way to disable TLS verification, by design.
+- A proxy for the email and webhook channels is not implemented.
 
 ### Split deployments (separate server + worker)
 

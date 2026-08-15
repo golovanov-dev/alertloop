@@ -6,8 +6,8 @@
 //
 // Multiple channels of the same type may be configured (e.g. two Telegram
 // chats); each carries a unique Name so deliveries and history can distinguish
-// them. Community fans every event out to all configured channels; per-event
-// routing rules are a paid capability.
+// them. Which channels receive a given event is decided by the routing package;
+// with no routing configured, every event goes to every channel.
 package channels
 
 import (

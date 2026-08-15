@@ -72,7 +72,7 @@ func TestTelegramSend(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	tg := NewTelegram("tg-main", "BOT123", "-100999", srv.URL, time.Second)
+	tg := NewTelegram(TelegramConfig{Name: "tg-main", BotToken: "BOT123", ChatID: "-100999", APIBase: srv.URL, Timeout: time.Second})
 	if err := tg.Send(context.Background(), sampleEvent()); err != nil {
 		t.Fatalf("send: %v", err)
 	}
@@ -99,7 +99,7 @@ func TestTelegramAPIErrorIsError(t *testing.T) {
 		_, _ = w.Write([]byte(`{"ok":false,"error_code":400,"description":"chat not found"}`))
 	}))
 	defer srv.Close()
-	tg := NewTelegram("tg", "t", "c", srv.URL, time.Second)
+	tg := NewTelegram(TelegramConfig{Name: "tg", BotToken: "t", ChatID: "c", APIBase: srv.URL, Timeout: time.Second})
 	if err := tg.Send(context.Background(), sampleEvent()); err == nil {
 		t.Fatal("expected error from telegram API failure")
 	}
@@ -189,7 +189,7 @@ func TestEmailHeaderInjectionSanitized(t *testing.T) {
 func TestTelegramRedactsTokenOnNetworkError(t *testing.T) {
 	// Point at a closed local port so client.Do fails with a *url.Error whose
 	// text embeds the request URL (which contains the bot token).
-	tg := NewTelegram("tg", "SUPERSECRETTOKEN", "chat", "http://127.0.0.1:1", 500*time.Millisecond)
+	tg := NewTelegram(TelegramConfig{Name: "tg", BotToken: "SUPERSECRETTOKEN", ChatID: "chat", APIBase: "http://127.0.0.1:1", Timeout: 500 * time.Millisecond})
 	err := tg.Send(context.Background(), sampleEvent())
 	if err == nil {
 		t.Fatal("expected a network error")

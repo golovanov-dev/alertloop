@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/golovanov-dev/alertloop/internal/api"
@@ -15,6 +16,7 @@ import (
 	"github.com/golovanov-dev/alertloop/internal/config"
 	"github.com/golovanov-dev/alertloop/internal/delivery"
 	"github.com/golovanov-dev/alertloop/internal/domain"
+	"github.com/golovanov-dev/alertloop/internal/routing"
 	"github.com/golovanov-dev/alertloop/internal/service"
 	"github.com/golovanov-dev/alertloop/internal/storage"
 )
@@ -26,6 +28,7 @@ type App struct {
 	log      *slog.Logger
 	store    storage.Store
 	registry *channels.Registry
+	router   *routing.Router
 	ingest   *service.IngestService
 	events   *service.EventService
 	delivery *service.DeliveryService
@@ -47,7 +50,17 @@ func New(ctx context.Context, cfg config.Config, version string, log *slog.Logge
 		return nil, fmt.Errorf("run migrations: %w", err)
 	}
 
-	registry := buildRegistry(cfg.Channels)
+	registry, err := buildRegistry(cfg.Channels)
+	if err != nil {
+		_ = store.Close()
+		return nil, err
+	}
+
+	router, err := buildRouter(cfg.Routing, registry.Targets())
+	if err != nil {
+		_ = store.Close()
+		return nil, err
+	}
 
 	app := &App{
 		cfg:      cfg,
@@ -55,7 +68,8 @@ func New(ctx context.Context, cfg config.Config, version string, log *slog.Logge
 		log:      log,
 		store:    store,
 		registry: registry,
-		ingest:   service.NewIngestService(store, registry.Targets(), cfg.Worker.MaxAttempts, time.Now),
+		router:   router,
+		ingest:   service.NewIngestService(store, router, cfg.Worker.MaxAttempts, time.Now, log),
 		events:   service.NewEventService(store, time.Now),
 		delivery: service.NewDeliveryService(store, time.Now),
 	}
@@ -73,8 +87,69 @@ func New(ctx context.Context, cfg config.Config, version string, log *slog.Logge
 			"BOTH processes must load the SAME channel config (the server decides which delivery " +
 			"jobs to create; the worker sends them).")
 	}
+	app.logRoutingTable()
 	app.warnOrphanedDeliveries(ctx)
 	return app, nil
+}
+
+// buildRouter assembles the router from the optional routing section. A nil
+// section means no routing is configured, which keeps the historical behavior:
+// every event goes to every channel.
+func buildRouter(cfg *config.Routing, targets []domain.ChannelTarget) (*routing.Router, error) {
+	if cfg == nil {
+		return routing.NewAllChannels(targets), nil
+	}
+	return routing.New(*cfg, targets)
+}
+
+// logRoutingTable prints the routing table that actually took effect, plus the
+// two mistakes that are otherwise silent: rules made unreachable by an earlier
+// catch-all, and configured channels nothing routes to. The operator should be
+// able to see what applied without opening the config file.
+func (a *App) logRoutingTable() {
+	if !a.router.Configured() {
+		a.log.Info("routing not configured — every event is delivered to every configured channel",
+			"channels", a.router.Default())
+		return
+	}
+	for i, rule := range a.router.Rules() {
+		a.log.Info("routing rule", "order", i+1, "rule", rule.Name,
+			"match", describeMatch(rule.Match), "channels", rule.Channels)
+	}
+	a.log.Info("routing default", "channels", a.router.Default())
+	if len(a.router.Rules()) == 0 && len(a.router.Default()) == 0 {
+		a.log.Warn("routing is configured with no rules and no default — no event will be delivered anywhere")
+	}
+	if catchAll, unreachable := a.router.UnreachableRules(); len(unreachable) > 0 {
+		a.log.Warn("routing rules below a catch-all rule can never match; move the catch-all last",
+			"catch_all_rule", catchAll, "unreachable_rules", unreachable)
+	}
+	if unused := a.router.UnusedChannels(); len(unused) > 0 {
+		a.log.Warn("configured channels that no routing rule and no default sends to; check for a typo",
+			"unused_channels", unused)
+	}
+}
+
+// describeMatch renders a rule's conditions as one log-friendly string, e.g.
+// `type=[incident] min_severity=warning`. An empty match reads "any event".
+func describeMatch(m routing.MatchView) string {
+	var parts []string
+	add := func(name string, values []string) {
+		if len(values) > 0 {
+			parts = append(parts, name+"=["+strings.Join(values, " ")+"]")
+		}
+	}
+	add("type", m.Type)
+	add("severity", m.Severity)
+	if m.MinSeverity != "" {
+		parts = append(parts, "min_severity="+m.MinSeverity)
+	}
+	add("source", m.Source)
+	add("category", m.Category)
+	if len(parts) == 0 {
+		return "any event"
+	}
+	return strings.Join(parts, " ")
 }
 
 // warnOrphanedDeliveries logs a warning if the store has undelivered attempts
@@ -108,7 +183,9 @@ func (a *App) Close() error { return a.store.Close() }
 
 // buildRegistry constructs the channel registry from the global channel config.
 // Every configured channel of every type is registered under its unique name.
-func buildRegistry(c config.Channels) *channels.Registry {
+// It returns an error only for input Config.Validate would already have
+// rejected (an unusable Telegram proxy URL).
+func buildRegistry(c config.Channels) (*channels.Registry, error) {
 	var chans []channels.Channel
 	for _, e := range c.Email {
 		chans = append(chans, channels.NewEmail(channels.EmailConfig{
@@ -125,12 +202,23 @@ func buildRegistry(c config.Channels) *channels.Registry {
 		}))
 	}
 	for _, t := range c.Telegram {
-		chans = append(chans, channels.NewTelegram(t.Name, t.BotToken, t.ChatID, t.APIBase, t.Timeout))
+		proxy, err := config.ParseProxyURL(t.Proxy)
+		if err != nil {
+			return nil, fmt.Errorf("telegram channel %q: %w", t.Name, err)
+		}
+		chans = append(chans, channels.NewTelegram(channels.TelegramConfig{
+			Name:     t.Name,
+			BotToken: t.BotToken,
+			ChatID:   t.ChatID,
+			APIBase:  t.APIBase,
+			Proxy:    proxy,
+			Timeout:  t.Timeout,
+		}))
 	}
 	for _, w := range c.Webhook {
 		chans = append(chans, channels.NewWebhook(w.Name, w.URL, w.Secret, w.Timeout))
 	}
-	return channels.NewRegistry(chans...)
+	return channels.NewRegistry(chans...), nil
 }
 
 // RunServer starts the HTTP server and blocks until ctx is cancelled.
@@ -144,6 +232,7 @@ func (a *App) RunServer(ctx context.Context) error {
 		Ingest:      a.ingest,
 		Events:      a.events,
 		Deliveries:  a.delivery,
+		Routing:     a.router,
 		APIKeys:     keyScopes,
 		AdminToken:  a.cfg.AdminToken,
 		Version:     a.version,

@@ -4,12 +4,15 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/golovanov-dev/alertloop/internal/domain"
 	"gopkg.in/yaml.v3"
 )
 
@@ -29,6 +32,11 @@ type Config struct {
 	Channels  Channels  `yaml:"channels"`
 	Log       Logging   `yaml:"log"`
 	RateLimit RateLimit `yaml:"rate_limit"`
+
+	// Routing selects which channels each event is delivered to. A nil pointer
+	// means the section is absent from the file, which keeps the pre-0.2.0
+	// behavior: every event goes to every configured channel.
+	Routing *Routing `yaml:"routing"`
 
 	// RetentionDays is the event retention window in days: events older than
 	// this are pruned by the worker. Defaults to 30 and is configurable here or
@@ -108,8 +116,9 @@ type Worker struct {
 }
 
 // Channels holds the global channel configuration. Multiple channels of each
-// type may be configured; in Community every event is delivered to every
-// configured channel (no per-event routing). Each channel has a unique name.
+// type may be configured, each under a unique name. Without a routing section
+// every event is delivered to every configured channel; with one, the rules in
+// Routing decide (see the Routing type).
 type Channels struct {
 	Email    []EmailChannel    `yaml:"email"`
 	Telegram []TelegramChannel `yaml:"telegram"`
@@ -132,11 +141,18 @@ type EmailChannel struct {
 
 // TelegramChannel configures one Telegram Bot API delivery target.
 type TelegramChannel struct {
-	Name     string        `yaml:"name"`
-	BotToken string        `yaml:"bot_token"`
-	ChatID   string        `yaml:"chat_id"`
-	APIBase  string        `yaml:"api_base"`
-	Timeout  time.Duration `yaml:"timeout"`
+	Name     string `yaml:"name"`
+	BotToken string `yaml:"bot_token"`
+	ChatID   string `yaml:"chat_id"`
+	APIBase  string `yaml:"api_base"`
+	// Proxy sends this channel's Bot API requests through an HTTP, HTTPS, or
+	// SOCKS5 proxy — for hosts that cannot reach api.telegram.org directly.
+	// Credentials may be embedded (socks5://user:pass@host:1080). Empty keeps
+	// the process-wide HTTP_PROXY/HTTPS_PROXY/NO_PROXY behavior. The setting is
+	// per channel on purpose: one instance may need a proxy for Telegram and a
+	// direct route for a webhook into an internal network.
+	Proxy   string        `yaml:"proxy"`
+	Timeout time.Duration `yaml:"timeout"`
 }
 
 // WebhookChannel configures one generic outbound webhook target. Deliveries are
@@ -146,6 +162,45 @@ type WebhookChannel struct {
 	URL     string        `yaml:"url"`
 	Secret  string        `yaml:"secret"`
 	Timeout time.Duration `yaml:"timeout"`
+}
+
+// Routing decides which channels an event is delivered to. Rules are evaluated
+// top to bottom and the FIRST match wins — channels from several rules are
+// never merged, so an operator reading the file top-down can tell where a given
+// event goes without simulating the whole set.
+//
+// Omitting the whole section (a nil *Routing) keeps the pre-0.2.0 behavior:
+// every event is delivered to every configured channel.
+type Routing struct {
+	Rules []RoutingRule `yaml:"rules"`
+	// Default receives events that matched no rule. Empty means such events are
+	// stored but not delivered, which is logged per event as a warning.
+	Default []string `yaml:"default"`
+}
+
+// RoutingRule is one entry of the routing table.
+type RoutingRule struct {
+	Name string `yaml:"name"`
+	// Match limits which events the rule applies to. An absent or empty match
+	// makes the rule a catch-all.
+	Match RoutingMatch `yaml:"match"`
+	// Channels are the channel names the event goes to. An explicit empty list
+	// is deliberate suppression: the event is stored, nothing is delivered.
+	Channels []string `yaml:"channels"`
+}
+
+// RoutingMatch holds the conditions of a rule. Values inside one field are
+// OR-ed, the fields themselves are AND-ed, and an absent field constrains
+// nothing. Comparison is case-insensitive and ignores surrounding whitespace.
+type RoutingMatch struct {
+	Type     []string `yaml:"type"`
+	Severity []string `yaml:"severity"`
+	// MinSeverity matches events at or above the given alarm level.
+	MinSeverity string `yaml:"min_severity"`
+	// Source and Category accept a trailing "*" as a prefix wildcard
+	// ("order.*"); a "*" anywhere else is a configuration error.
+	Source   []string `yaml:"source"`
+	Category []string `yaml:"category"`
 }
 
 // Default returns a Config populated with built-in defaults.
@@ -182,6 +237,48 @@ const (
 	defaultChanTimeout  = 10 * time.Second
 	defaultTelegramBase = "https://api.telegram.org"
 )
+
+// proxySchemes are the proxy URL schemes a channel may use. "socks5h" is
+// accepted as a synonym of "socks5": Go's http.Transport treats them
+// identically and hands the target host name to the proxy, which resolves it.
+var proxySchemes = map[string]bool{"http": true, "https": true, "socks5": true, "socks5h": true}
+
+// ParseProxyURL validates a channel proxy setting and returns the parsed URL,
+// or (nil, nil) when the setting is empty. It runs at config load time so a
+// broken proxy stops the process at startup instead of failing during the first
+// incident. Its errors never echo the raw value, which may carry credentials.
+func ParseProxyURL(raw string) (*url.URL, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return nil, nil
+	}
+	u, err := url.Parse(s)
+	if err != nil {
+		return nil, errors.New("proxy is not a valid URL (want scheme://[user:pass@]host:port)")
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if !proxySchemes[scheme] {
+		return nil, fmt.Errorf("unsupported proxy scheme %q (want http, https, socks5, or socks5h)", u.Scheme)
+	}
+	if u.Hostname() == "" {
+		return nil, fmt.Errorf("proxy %s:// is missing a host", scheme)
+	}
+	// http/https fall back to ports 80/443; SOCKS has no default, so a missing
+	// port would only surface as a dial error on the first delivery.
+	if u.Port() == "" && strings.HasPrefix(scheme, "socks5") {
+		return nil, fmt.Errorf("proxy %s://%s is missing a port (e.g. :1080)", scheme, u.Hostname())
+	}
+	return u, nil
+}
+
+// SafeProxyURL renders a proxy URL for logs, the API, and the web UI as
+// scheme://host:port — never the user name or password.
+func SafeProxyURL(u *url.URL) string {
+	if u == nil {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host
+}
 
 // Load builds a Config from defaults, then a YAML file (if configPath is set),
 // then environment variables. Command flags are applied by the caller after
@@ -322,6 +419,9 @@ func (c Config) Validate() error {
 		if t.BotToken == "" || t.ChatID == "" {
 			return fmt.Errorf("telegram channel %q is incomplete (need bot_token, chat_id)", t.Name)
 		}
+		if _, err := ParseProxyURL(t.Proxy); err != nil {
+			return fmt.Errorf("telegram channel %q: %w", t.Name, err)
+		}
 	}
 	for _, w := range c.Channels.Webhook {
 		if err := checkName("webhook", w.Name); err != nil {
@@ -331,18 +431,119 @@ func (c Config) Validate() error {
 			return fmt.Errorf("webhook channel %q is incomplete (need url)", w.Name)
 		}
 	}
+
+	if c.Routing != nil {
+		if err := c.Routing.validate(seen); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
+// validate checks the routing section against the set of configured channel
+// names. Every failure here stops the process: a routing table that points at a
+// channel that does not exist would silently drop the events it matches.
+func (r Routing) validate(channels map[string]bool) error {
+	names := map[string]bool{}
+	for i, rule := range r.Rules {
+		name := strings.TrimSpace(rule.Name)
+		if name == "" {
+			return fmt.Errorf("routing rule #%d is missing a name (names appear in logs and in the routing preview)", i+1)
+		}
+		if names[name] {
+			return fmt.Errorf("duplicate routing rule name %q (rule names must be unique)", name)
+		}
+		names[name] = true
+
+		if err := rule.Match.validate(name); err != nil {
+			return err
+		}
+		for _, ch := range rule.Channels {
+			if !channels[strings.TrimSpace(ch)] {
+				return fmt.Errorf("routing rule %q references unknown channel %q", name, ch)
+			}
+		}
+	}
+	for _, ch := range r.Default {
+		if !channels[strings.TrimSpace(ch)] {
+			return fmt.Errorf("routing default references unknown channel %q", ch)
+		}
+	}
+	return nil
+}
+
+// validate checks one rule's conditions: known enum values and wildcards only
+// where they are supported.
+func (m RoutingMatch) validate(rule string) error {
+	for _, t := range m.Type {
+		if !ValidRoutingType(t) {
+			return fmt.Errorf("routing rule %q: unknown event type %q (want incident, business_event, or audit)", rule, t)
+		}
+	}
+	for _, s := range m.Severity {
+		if !ValidRoutingSeverity(s) {
+			return fmt.Errorf("routing rule %q: unknown severity %q (want info, success, warning, error, or critical)", rule, s)
+		}
+	}
+	if strings.TrimSpace(m.MinSeverity) != "" && !ValidRoutingSeverity(m.MinSeverity) {
+		return fmt.Errorf("routing rule %q: unknown min_severity %q (want info, success, warning, error, or critical)", rule, m.MinSeverity)
+	}
+	for _, field := range []struct {
+		name   string
+		values []string
+	}{{"source", m.Source}, {"category", m.Category}} {
+		for _, v := range field.values {
+			if err := validPattern(v); err != nil {
+				return fmt.Errorf("routing rule %q, %s %q: %w", rule, field.name, v, err)
+			}
+		}
+	}
+	return nil
+}
+
+// validPattern accepts a literal value or one ending in "*". Anything richer
+// (a leading or embedded "*", a regular expression) is rejected rather than
+// quietly treated as a literal.
+func validPattern(v string) error {
+	s := strings.TrimSpace(v)
+	if i := strings.IndexByte(s, '*'); i >= 0 && i != len(s)-1 {
+		return errors.New(`only a trailing "*" wildcard is supported (e.g. "order.*")`)
+	}
+	return nil
+}
+
+// ValidRoutingType reports whether s names an event family, tolerating case and
+// surrounding whitespace as rule matching does.
+func ValidRoutingType(s string) bool {
+	return domain.ValidEventType(domain.EventType(normalizeMatchValue(s)))
+}
+
+// ValidRoutingSeverity reports whether s names a severity.
+func ValidRoutingSeverity(s string) bool {
+	return domain.ValidSeverity(domain.Severity(normalizeMatchValue(s)))
+}
+
+// normalizeMatchValue is the comparison form of a routing value: trimmed and
+// lower-cased, so "Incident " and "incident" mean the same thing.
+func normalizeMatchValue(s string) string {
+	return strings.ToLower(strings.TrimSpace(s))
+}
+
 // EnabledChannels lists the configured channel names, prefixed by type, for
-// startup logging (e.g. "email:ops", "telegram:alerts").
+// startup logging (e.g. "email:ops", "telegram:alerts"). A Telegram proxy is
+// shown as scheme://host:port so the operator can confirm it is in effect;
+// credentials in the proxy URL are never included.
 func (c Config) EnabledChannels() []string {
 	var out []string
 	for _, e := range c.Channels.Email {
 		out = append(out, "email:"+e.Name)
 	}
 	for _, t := range c.Channels.Telegram {
-		out = append(out, "telegram:"+t.Name)
+		entry := "telegram:" + t.Name
+		if u, err := ParseProxyURL(t.Proxy); err == nil && u != nil {
+			entry += " (proxy " + SafeProxyURL(u) + ")"
+		}
+		out = append(out, entry)
 	}
 	for _, w := range c.Channels.Webhook {
 		out = append(out, "webhook:"+w.Name)
