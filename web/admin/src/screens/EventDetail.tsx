@@ -223,7 +223,7 @@ export function EventDetail() {
             <table style={{ width: "100%", minWidth: 640, fontSize: 13.5 }}>
               <thead>
                 <tr>
-                  {["Channel", "State", "Attempts", "Next retry", "Last error", "Updated", ""].map((h, i) => (
+                  {["Channel", "State", "Attempts", "Next retry (local)", "Last error", "Updated (local)", ""].map((h, i) => (
                     <th key={i} style={th}>
                       {h}
                     </th>

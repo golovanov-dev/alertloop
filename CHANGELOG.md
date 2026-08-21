@@ -20,6 +20,16 @@
   containing `$` is never mangled; a missing variable without a default stops
   the process instead of leaving the setting empty; and substituted text is
   treated as data, so a password containing `: ` or `#` stays a password.
+- **Log timestamps are now always UTC**, matching the timestamps AlertLoop
+  stores and serves. They previously followed the server's local zone, so the
+  same build logged UTC inside Docker and local time under systemd. Not
+  configurable: which zone a log line is in should not depend on how the process
+  was deployed. If you parse logs, expect `...Z` instead of a local offset.
+- Timestamps are now labelled with their timezone wherever they are shown. The
+  built-in pages (`/events`, `/deliveries`) display UTC and say so in the column
+  headers; the admin console keeps rendering in each viewer's own timezone and
+  now names it. Previously the same event showed two different readings in the
+  two interfaces with nothing to tell them apart.
 - The Docker image ships a small default config file (`/etc/alertloop/alertloop.yaml`,
   overridable by mounting your own or pointing `ALERTLOOP_CONFIG` elsewhere) and
   no longer bakes a database DSN into the image. The bundled Compose profiles no

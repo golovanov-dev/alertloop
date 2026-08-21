@@ -157,7 +157,7 @@ export function Deliveries() {
             <table style={{ width: "100%", minWidth: 920, fontSize: 13.5 }}>
               <thead>
                 <tr>
-                  {["Channel", "Event", "State", "Attempts", "Next retry", "Last error", "Updated", ""].map((h, i) => (
+                  {["Channel", "Event", "State", "Attempts", "Next retry (local)", "Last error", "Updated (local)", ""].map((h, i) => (
                     <th key={i} style={th}>
                       {h}
                     </th>

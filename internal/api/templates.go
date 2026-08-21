@@ -71,7 +71,7 @@ const eventsHTML = `<!doctype html>
   {{if .Events}}
   <table>
     <thead><tr>
-      <th>Time</th><th>Type</th><th>Severity</th><th>State</th>
+      <th>Time (UTC)</th><th>Type</th><th>Severity</th><th>State</th>
       <th>Source</th><th>Message</th><th>ID</th>
     </tr></thead>
     <tbody>
@@ -120,7 +120,7 @@ const deliveriesHTML = `<!doctype html>
   {{if .Deliveries}}
   <table>
     <thead><tr>
-      <th>Time</th><th>Channel</th><th>Name</th><th>State</th><th>Attempts</th>
+      <th>Time (UTC)</th><th>Channel</th><th>Name</th><th>State</th><th>Attempts</th>
       <th>Last error</th><th>Event</th>
     </tr></thead>
     <tbody>
@@ -182,8 +182,8 @@ const eventDetailHTML = `<!doctype html>
   {{if .Deliveries}}
   <table>
     <thead><tr>
-      <th>Channel</th><th>Name</th><th>State</th><th>Attempts</th><th>Next retry</th>
-      <th>Last error</th><th>Updated</th>
+      <th>Channel</th><th>Name</th><th>State</th><th>Attempts</th><th>Next retry (UTC)</th>
+      <th>Last error</th><th>Updated (UTC)</th>
     </tr></thead>
     <tbody>
     {{range .Deliveries}}

@@ -1,6 +1,8 @@
 // Formatting helpers for timestamps and identifiers.
 
-// timeOfDay extracts a HH:MM:SS label from an ISO/RFC3339 or "... UTC" string.
+// timeOfDay extracts a HH:MM:SS label, in the viewer's timezone, from an
+// ISO/RFC3339 or "... UTC" string. Table columns using it are headed
+// "(local)": a zone on every row would be noise.
 export function timeOfDay(ts: string): string {
   const d = parseDate(ts);
   if (!d) return ts;
@@ -12,7 +14,10 @@ export function timeOfDay(ts: string): string {
   });
 }
 
-// fullTime renders an absolute local timestamp.
+// fullTime renders an absolute timestamp in the viewer's own timezone. The API
+// serves UTC; each viewer should read times in their zone, so the zone name is
+// shown to make clear which one that is — the built-in pages at /events label
+// theirs as UTC, and the two must not be silently mistaken for each other.
 export function fullTime(ts: string): string {
   const d = parseDate(ts);
   if (!d) return ts;
@@ -24,6 +29,7 @@ export function fullTime(ts: string): string {
     minute: "2-digit",
     second: "2-digit",
     hour12: false,
+    timeZoneName: "short",
   });
 }
 

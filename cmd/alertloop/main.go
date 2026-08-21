@@ -97,7 +97,8 @@ func run() error {
 }
 
 // setupLogger builds the application logger from config: log level, output
-// format (text or json), and an optional log file. When a file is configured,
+// format (text or json), and an optional log file. Timestamps are always UTC,
+// matching stored event times. When a file is configured,
 // logs are appended so external tools (tail, log shippers, journald) can read
 // them; otherwise output goes to stdout. The returned io.Closer, when non-nil,
 // must be closed on shutdown to flush and release the log file.
@@ -125,7 +126,20 @@ func setupLogger(c config.Logging) (*slog.Logger, io.Closer, error) {
 		closer = f
 	}
 
-	opts := &slog.HandlerOptions{Level: level}
+	opts := &slog.HandlerOptions{
+		Level: level,
+		// Log in UTC, always. Event timestamps are stored and served in UTC, and
+		// a log line that reads in the server's local zone cannot be compared
+		// with them without arithmetic. It is deliberately not configurable:
+		// which zone a log line is in should not depend on how the process was
+		// deployed (a container has no TZ, a systemd host usually does).
+		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+			if len(groups) == 0 && a.Key == slog.TimeKey {
+				a.Value = slog.TimeValue(a.Value.Time().UTC())
+			}
+			return a
+		},
+	}
 	var handler slog.Handler
 	if strings.ToLower(c.Format) == "json" {
 		handler = slog.NewJSONHandler(out, opts)

@@ -211,7 +211,7 @@ export function Events() {
           <table style={{ width: "100%", minWidth: 720, fontSize: 13.5 }}>
             <thead>
               <tr>
-                {["Time", "Type", "Severity", "State", "Source", "Message", "ID"].map((h) => (
+                {["Time (local)", "Type", "Severity", "State", "Source", "Message", "ID"].map((h) => (
                   <th key={h} style={th}>
                     {h}
                   </th>
