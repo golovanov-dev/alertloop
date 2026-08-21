@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.0 - Unreleased
+
+### Changed
+
+- Release binaries and the Docker image are now built with Go 1.27. Go stops
+  issuing security fixes for a release once two newer ones exist, so 1.25 — the
+  toolchain used until now — no longer receives them. Building from source still
+  works with Go 1.25 or newer: the minimum in `go.mod` is unchanged.
+  Two consequences of the newer toolchain are worth knowing:
+  - the macOS release binaries now require macOS 13 or later;
+  - Go removed the escape hatches that re-enabled TLS 1.0, RSA key exchange, and
+    3DES (`GODEBUG=tls10server`, `tlsrsakex`, `tls3des`). If your SMTP server is
+    old enough to need one of those, the Email channel can no longer connect to
+    it; the server has to be upgraded or fronted by a modern relay.
+
 ## 0.2.0 - 2026-08-15
 
 Routing rules and Telegram delivery through a proxy — both in Community.

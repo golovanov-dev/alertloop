@@ -11,7 +11,7 @@ RUN mkdir -p /internal/adminui && npm run build
 
 # Build stage: compile a static, CGO-free binary (modernc SQLite is pure Go, so
 # the image needs no libc and cross-compiles cleanly).
-FROM golang:1.25-alpine AS build
+FROM golang:1.27-alpine AS build
 WORKDIR /src
 
 COPY go.mod go.sum ./

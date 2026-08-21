@@ -1,7 +1,12 @@
 name: CI
 
-# Static analysis, tests, and formatting on every push and pull request. Go and
-# Node versions match go.mod (1.25) and the Dockerfile / release workflow (22).
+# Static analysis, tests, and formatting on every push and pull request.
+#
+# Go is pinned to a release that still receives security fixes (1.27), matching
+# the Dockerfile and the release workflow — that toolchain builds the shipped
+# artifacts. It deliberately does NOT match the lower `go` directive in go.mod,
+# which is the minimum needed to build from source and stays low so contributors
+# on an older toolchain are not locked out. Node matches the Dockerfile (22).
 on:
   push:
     branches: ["**"]
@@ -23,7 +28,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.25"
+          go-version: "1.27"
           cache: true
 
       # gofmt first: it is the cheapest check and the most annoying to discover
