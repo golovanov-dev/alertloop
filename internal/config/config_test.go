@@ -13,26 +13,21 @@ func TestDefaults(t *testing.T) {
 	}
 }
 
-func TestEnvOverridesYAML(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "alertloop.yaml")
-	yaml := "addr: \":9000\"\nadmin_token: fromfile\ndatabase:\n  driver: sqlite\n  dsn: file.db\n" +
-		"api_keys:\n  - key: k1\n    scope: ingest\n  - key: k2\n"
-	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	t.Setenv("ALERTLOOP_ADDR", ":7777")
-
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatalf("load: %v", err)
-	}
-	if cfg.Addr != ":7777" { // env beats file
-		t.Fatalf("expected env addr :7777, got %q", cfg.Addr)
-	}
-	if cfg.AdminToken != "fromfile" { // file beats default
-		t.Fatalf("expected admin_token fromfile, got %q", cfg.AdminToken)
+func TestYAMLIsTheOnlyConfigurationSource(t *testing.T) {
+	const doc = `
+addr: ":9000"
+admin_token: fromfile
+database:
+  driver: sqlite
+  dsn: file.db
+api_keys:
+  - key: k1
+    scope: ingest
+  - key: k2
+`
+	cfg := loadYAML(t, doc)
+	if cfg.Addr != ":9000" || cfg.AdminToken != "fromfile" {
+		t.Fatalf("file values not applied: addr=%q admin_token=%q", cfg.Addr, cfg.AdminToken)
 	}
 	// Keys load from YAML; an omitted scope defaults to full.
 	if len(cfg.APIKeys) != 2 {

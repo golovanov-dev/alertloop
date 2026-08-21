@@ -243,8 +243,8 @@ database:
 ./alertloop --config alertloop.yaml all
 ```
 
-(Or via environment variables instead of the file:
-`ALERTLOOP_DB_DRIVER=postgres ALERTLOOP_DB_DSN="postgres://…" ./alertloop all`.)
+(The DSN carries a password, so it is a good candidate for `${VAR}` — see
+[Configuration](#configuration).)
 Use `sslmode=require` for a remote database; `sslmode=disable` is only for a
 local/private-network Postgres.
 
@@ -269,8 +269,8 @@ log:
 How to read logs by deployment:
 
 - **Binary (stdout)**: run in a terminal, or redirect: `./alertloop all >> alertloop.log 2>&1`.
-- **Binary (file)**: set `log.file` (or `ALERTLOOP_LOG_FILE`) and read it with any
-  tool: `tail -f /var/log/alertloop/alertloop.log`.
+- **Binary (file)**: set `log.file` and read it with any tool:
+  `tail -f /var/log/alertloop/alertloop.log`.
 - **systemd**: logs go to the journal — `journalctl -u alertloop -f`. Set
   `format: json` for machine-readable output that log shippers can parse.
 - **Docker**: `docker compose logs -f alertloop` (or `docker logs`).
@@ -280,9 +280,43 @@ file or the container's stdout.
 
 ## Configuration
 
-Precedence (highest wins): command flags → environment variables → YAML config
-file → built-in defaults. See `alertloop.example.yaml` and `.env.example` for the
-full list.
+**One YAML file configures everything**, on top of built-in defaults. Point the
+binary at it with `--config /path/to/alertloop.yaml` (or `ALERTLOOP_CONFIG`).
+See `alertloop.example.yaml` for the full list of settings.
+
+The environment is not a second place to configure AlertLoop — it exists to keep
+secrets out of the file. Any value written as exactly `${VAR}` or
+`${VAR:-default}` is replaced from the environment at startup:
+
+```yaml
+admin_token: ${ALERTLOOP_ADMIN_TOKEN}
+channels:
+  telegram:
+    - name: alerts
+      bot_token: ${TELEGRAM_BOT_TOKEN}
+      chat_id: "-1001234567890"
+database:
+  dsn: ${ALERTLOOP_DB_DSN:-alertloop.db}
+```
+
+Rules, and there are only three:
+
+- **The whole value, or nothing.** `${VAR}` inside a longer string is left
+  alone — that way a password containing a literal `$` is never mangled.
+- **A missing variable stops the process**, unless the reference carries a
+  `:-default`. An empty `admin_token` caused by a typo in a variable name would
+  leave the API open, so it is refused instead.
+- **The substituted text is data, not YAML.** A password containing `: ` or `#`
+  stays a password.
+
+Everything else — channels, API keys, routing, worker and rate-limit tuning —
+lives in the file only.
+
+> **Upgrading from 0.2.x:** the `ALERTLOOP_ADDR`, `ALERTLOOP_DB_DSN`,
+> `ALERTLOOP_LOG_*`, `ALERTLOOP_WORKER_*`, and related variables no longer
+> configure anything. If one is still set, AlertLoop **refuses to start** and
+> names the config line to write instead — ignoring them could leave a process
+> running on a database its operator did not choose.
 
 ### Delivery channels are optional
 
@@ -415,8 +449,7 @@ Notes:
   AlertLoop. Verified by a test with a local SOCKS5 server
   (`TestTelegramSendsThroughSOCKS5Proxy`), not by assumption.
 - The setting is per channel, not per process, so a Telegram channel can use a
-  proxy while a webhook into your internal network stays direct. There is no
-  `ALERTLOOP_*` variable for it: channels are configured in YAML only.
+  proxy while a webhook into your internal network stays direct.
 - With `proxy` unset, the process-wide `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY`
   variables keep working exactly as before.
 - Credentials in the proxy URL are supported, and the password is redacted from

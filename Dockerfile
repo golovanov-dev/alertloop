@@ -33,9 +33,22 @@ RUN apk add --no-cache ca-certificates tzdata && \
 WORKDIR /data
 COPY --from=build /out/alertloop /usr/local/bin/alertloop
 
+# Built-in configuration, so the image runs with no files supplied. Since
+# 0.3.0 the config file is the only source of settings; the environment just
+# fills the ${VAR} references in it, which is how the admin token gets in
+# without being baked into the image. Mount your own file over this path — or
+# point ALERTLOOP_CONFIG elsewhere — to replace it entirely.
+RUN mkdir -p /etc/alertloop && { \
+      echo '# Default configuration shipped inside the AlertLoop image.'; \
+      echo 'admin_token: ${ALERTLOOP_ADMIN_TOKEN:-}'; \
+      echo 'database:'; \
+      echo '  driver: sqlite'; \
+      echo '  dsn: /data/alertloop.db'; \
+    } > /etc/alertloop/alertloop.yaml
+
 USER alertloop
 EXPOSE 8080
-ENV ALERTLOOP_DB_DSN=/data/alertloop.db
+ENV ALERTLOOP_CONFIG=/etc/alertloop/alertloop.yaml
 VOLUME ["/data"]
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s \

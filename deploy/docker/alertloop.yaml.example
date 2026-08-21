@@ -11,7 +11,7 @@ addr: ":8080"
 # Protects the admin console at /admin and grants full API access. CHANGE THIS
 # to a strong random value (e.g. `openssl rand -hex 32`). It is sent on every
 # request, so only reach the service through the HTTPS reverse proxy.
-admin_token: "change-me-admin-token"
+admin_token: ${ALERTLOOP_ADMIN_TOKEN:-change-me-admin-token}
 
 # Scoped API keys for services (ingest | read | full). Optional — the admin
 # token already has full access. CHANGE THESE if you use them.
@@ -25,6 +25,11 @@ database:
   driver: postgres
   # `postgres` is the compose service name; the password must match
   # POSTGRES_PASSWORD in the compose file (default: alertloop).
+  #
+  # Note: only a WHOLE value is substituted from the environment, so a password
+  # cannot be injected into the middle of a DSN. Either edit this line, or move
+  # the entire DSN into a variable:
+  #   dsn: ${ALERTLOOP_DB_DSN:-postgres://alertloop:alertloop@postgres:5432/alertloop?sslmode=disable}
   dsn: "postgres://alertloop:alertloop@postgres:5432/alertloop?sslmode=disable"
 
 log:

@@ -1,6 +1,7 @@
-// Package config loads AlertLoop configuration from, in decreasing priority:
-// explicit command flags, environment variables, a YAML config file, and
-// built-in defaults.
+// Package config loads AlertLoop configuration from a single YAML file, on top
+// of built-in defaults. The environment is not a second configuration layer: it
+// only fills ${VAR} references inside that file, so secrets need not be written
+// down (see env.go).
 package config
 
 import (
@@ -8,7 +9,6 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -39,8 +39,8 @@ type Config struct {
 	Routing *Routing `yaml:"routing"`
 
 	// RetentionDays is the event retention window in days: events older than
-	// this are pruned by the worker. Defaults to 30 and is configurable here or
-	// via ALERTLOOP_RETENTION_DAYS; there is no upper bound. (Retention
+	// this are pruned by the worker. Defaults to 30, with no upper bound.
+	// (Retention
 	// *policies* — per-project/per-event-type rules with UI management — are a
 	// planned paid capability; the plain number is not.)
 	RetentionDays int `yaml:"retention_days"`
@@ -280,23 +280,39 @@ func SafeProxyURL(u *url.URL) string {
 	return u.Scheme + "://" + u.Host
 }
 
-// Load builds a Config from defaults, then a YAML file (if configPath is set),
-// then environment variables. Command flags are applied by the caller after
-// Load, since they have the highest priority.
+// Load builds a Config from built-in defaults overlaid with a YAML file, if one
+// is given. ${VAR} references in the file are resolved from the environment
+// first; a leftover pre-0.3.0 ALERTLOOP_* variable stops the load instead of
+// being ignored.
 func Load(configPath string) (Config, error) {
 	cfg := Default()
+	referenced := map[string]bool{}
 
 	if configPath != "" {
 		data, err := os.ReadFile(configPath)
 		if err != nil {
 			return cfg, fmt.Errorf("read config file: %w", err)
 		}
-		if err := yaml.Unmarshal(data, &cfg); err != nil {
+		var doc yaml.Node
+		if err := yaml.Unmarshal(data, &doc); err != nil {
 			return cfg, fmt.Errorf("parse config file: %w", err)
+		}
+		// An empty file leaves a zero node, which Decode would reject; defaults
+		// alone are a valid configuration.
+		if doc.Kind != 0 {
+			if err := substituteEnv(&doc, referenced); err != nil {
+				return cfg, err
+			}
+			if err := doc.Decode(&cfg); err != nil {
+				return cfg, fmt.Errorf("parse config file: %w", err)
+			}
 		}
 	}
 
-	applyEnv(&cfg)
+	if err := checkLegacyEnv(referenced); err != nil {
+		return cfg, err
+	}
+
 	normalizeChannels(&cfg.Channels)
 	for i := range cfg.APIKeys {
 		if cfg.APIKeys[i].Scope == "" {
@@ -334,38 +350,6 @@ func normalizeChannels(c *Channels) {
 			c.Webhook[i].Timeout = defaultChanTimeout
 		}
 	}
-}
-
-// applyEnv overlays ALERTLOOP_-prefixed environment variables onto cfg.
-func applyEnv(cfg *Config) {
-	setString(&cfg.Addr, "ALERTLOOP_ADDR")
-	setString(&cfg.AdminToken, "ALERTLOOP_ADMIN_TOKEN")
-	// API keys are structured (each has a scope) and are configured in YAML only,
-	// like delivery channels. There is no ALERTLOOP_API_KEYS env var.
-	setString(&cfg.Database.Driver, "ALERTLOOP_DB_DRIVER")
-	setString(&cfg.Database.DSN, "ALERTLOOP_DB_DSN")
-	setInt(&cfg.RetentionDays, "ALERTLOOP_RETENTION_DAYS")
-
-	setString(&cfg.Log.Level, "ALERTLOOP_LOG_LEVEL")
-	setString(&cfg.Log.Format, "ALERTLOOP_LOG_FORMAT")
-	setString(&cfg.Log.File, "ALERTLOOP_LOG_FILE")
-
-	if v := os.Getenv("ALERTLOOP_CORS_ORIGINS"); v != "" {
-		cfg.CORSOrigins = splitList(v)
-	}
-
-	setInt(&cfg.Worker.Concurrency, "ALERTLOOP_WORKER_CONCURRENCY")
-	setInt(&cfg.Worker.MaxAttempts, "ALERTLOOP_WORKER_MAX_ATTEMPTS")
-
-	if v := os.Getenv("ALERTLOOP_RATELIMIT_ENABLED"); v != "" {
-		if b, err := strconv.ParseBool(v); err == nil {
-			cfg.RateLimit.Enabled = b
-		}
-	}
-
-	// Delivery channels are configured in the YAML file only (a single, list-
-	// based source of truth). Infrastructure settings above stay env-tunable for
-	// container/12-factor deploys.
 }
 
 // Validate checks that the configuration is internally consistent enough to
@@ -568,18 +552,4 @@ func splitList(v string) []string {
 		}
 	}
 	return out
-}
-
-func setString(dst *string, env string) {
-	if v := os.Getenv(env); v != "" {
-		*dst = v
-	}
-}
-
-func setInt(dst *int, env string) {
-	if v := os.Getenv(env); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			*dst = n
-		}
-	}
 }

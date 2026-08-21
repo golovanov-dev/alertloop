@@ -6,8 +6,9 @@
 //
 //	alertloop [flags] [server|worker|all]
 //
-// Configuration precedence is flags > environment variables > YAML config file
-// > built-in defaults.
+// Configuration comes from one YAML file (--config, or ALERTLOOP_CONFIG) on top
+// of built-in defaults. The environment only fills ${VAR} references inside that
+// file, so there is no precedence puzzle: the file is what runs.
 package main
 
 import (
@@ -38,10 +39,7 @@ func main() {
 func run() error {
 	fs := flag.NewFlagSet("alertloop", flag.ContinueOnError)
 	var (
-		configPath  = fs.String("config", "", "path to YAML config file")
-		addr        = fs.String("addr", "", "HTTP listen address (overrides config)")
-		dbDSN       = fs.String("db-dsn", "", "database DSN (overrides config)")
-		dbDriver    = fs.String("db-driver", "", "database driver: sqlite or postgres")
+		configPath  = fs.String("config", os.Getenv("ALERTLOOP_CONFIG"), "path to the YAML config file")
 		showVersion = fs.Bool("version", false, "print version and exit")
 	)
 	fs.Usage = func() {
@@ -64,16 +62,6 @@ func run() error {
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		return err
-	}
-	// Flags have the highest precedence.
-	if *addr != "" {
-		cfg.Addr = *addr
-	}
-	if *dbDSN != "" {
-		cfg.Database.DSN = *dbDSN
-	}
-	if *dbDriver != "" {
-		cfg.Database.Driver = *dbDriver
 	}
 
 	log, logCloser, err := setupLogger(cfg.Log)

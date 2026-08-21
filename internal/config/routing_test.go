@@ -21,6 +21,16 @@ func loadYAML(t *testing.T, yaml string) Config {
 	return cfg
 }
 
+// loadYAMLErr is loadYAML for the cases where the load itself must fail.
+func loadYAMLErr(t *testing.T, yaml string) (Config, error) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "alertloop.yaml")
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return Load(path)
+}
+
 const routingChannels = `
 database:
   driver: sqlite

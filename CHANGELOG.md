@@ -4,6 +4,28 @@
 
 ### Changed
 
+- **The YAML file is now the only place AlertLoop is configured.** The
+  `ALERTLOOP_*` settings variables (`ALERTLOOP_ADDR`, `ALERTLOOP_DB_DSN`,
+  `ALERTLOOP_DB_DRIVER`, `ALERTLOOP_ADMIN_TOKEN`, `ALERTLOOP_RETENTION_DAYS`,
+  `ALERTLOOP_LOG_*`, `ALERTLOOP_CORS_ORIGINS`, `ALERTLOOP_WORKER_*`,
+  `ALERTLOOP_RATELIMIT_ENABLED`) no longer configure anything, and the
+  `--addr`, `--db-dsn`, and `--db-driver` flags are gone. **What to do:** move
+  those values into your config file. A leftover variable makes AlertLoop
+  refuse to start, naming the config line to write instead — ignoring it could
+  leave a process running on a database you did not choose. `ALERTLOOP_CONFIG`
+  still selects the config file, and `--config` still overrides it.
+- Secrets stay out of the config file through `${VAR}` references: a value
+  written as exactly `${VAR}` or `${VAR:-default}` is replaced from the
+  environment at startup. Only a whole value is substituted, so a password
+  containing `$` is never mangled; a missing variable without a default stops
+  the process instead of leaving the setting empty; and substituted text is
+  treated as data, so a password containing `: ` or `#` stays a password.
+- The Docker image ships a small default config file (`/etc/alertloop/alertloop.yaml`,
+  overridable by mounting your own or pointing `ALERTLOOP_CONFIG` elsewhere) and
+  no longer bakes a database DSN into the image. The bundled Compose profiles no
+  longer need the workaround that blanked that variable so the configured
+  PostgreSQL DSN would win.
+
 - Release binaries and the Docker image are now built with Go 1.27. Go stops
   issuing security fixes for a release once two newer ones exist, so 1.25 — the
   toolchain used until now — no longer receives them. Building from source still

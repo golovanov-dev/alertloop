@@ -1,22 +1,31 @@
 # AlertLoop example configuration.
-# Precedence (highest wins): command flags > environment variables > this file >
-# built-in defaults.
 #
-# What accepts an ALERTLOOP_* env var: addr, admin_token, database driver/dsn,
-# log level/format/file, retention_days, cors_origins, plus two worker knobs
-# (ALERTLOOP_WORKER_CONCURRENCY, ALERTLOOP_WORKER_MAX_ATTEMPTS) and the
-# rate-limit on/off switch (ALERTLOOP_RATELIMIT_ENABLED). See .env.example.
+# THIS FILE IS THE ONLY SOURCE OF CONFIGURATION, on top of built-in defaults.
+# Point the binary at it:  alertloop --config alertloop.yaml all
+# (or set ALERTLOOP_CONFIG=/path/to/alertloop.yaml).
 #
-# YAML only: structured lists (api_keys, channels) and the remaining
-# worker/rate_limit tuning (poll_interval, base_backoff, max_backoff,
-# per_ip_*, ingest_*).
+# The environment is not a second place to configure AlertLoop — it only keeps
+# secrets out of this file. A value written as exactly ${VAR} or ${VAR:-default}
+# is replaced from the environment at startup:
+#
+#   admin_token: ${ALERTLOOP_ADMIN_TOKEN}
+#
+# Three rules: the WHOLE value is substituted or nothing (so a password with a
+# literal "$" is never mangled); a missing variable without a :-default stops
+# the process rather than leaving an empty setting; and the substituted text is
+# data, not YAML, so a password containing ": " or "#" stays a password.
+#
+# Upgrading from 0.2.x: ALERTLOOP_ADDR, ALERTLOOP_DB_DSN, ALERTLOOP_LOG_*,
+# ALERTLOOP_WORKER_* and friends no longer configure anything. A leftover one
+# stops startup with the config line to write instead.
 
 # HTTP listen address for the API and web UI.
 addr: ":8080"
 
 # Admin token protects the events web page and the admin console at /admin, and
-# grants FULL API access (it is the admin console credential). CHANGE THIS.
-admin_token: "change-me-admin-token"
+# grants FULL API access (it is the admin console credential). CHANGE THIS —
+# and prefer keeping it out of the file entirely, as shown here.
+admin_token: ${ALERTLOOP_ADMIN_TOKEN:-change-me-admin-token}
 
 # API keys for services calling the JSON API. Each key has a scope:
 #   ingest - may only create events (POST /v1/events)   → for event sources
@@ -31,7 +40,7 @@ api_keys:
   #   scope: read
 
 # Event retention window in days: events older than this are pruned automatically
-# by the worker. Configurable here or via ALERTLOOP_RETENTION_DAYS; no upper bound.
+# by the worker. No upper bound.
 retention_days: 30
 
 # Logging. Output goes to stdout by default; set `file` to also persist logs to
@@ -62,7 +71,8 @@ database:
   driver: "sqlite"
   # SQLite: a file path or ":memory:".
   # PostgreSQL: e.g. "postgres://user:pass@host:5432/alertloop?sslmode=disable".
-  dsn: "alertloop.db"
+  # A DSN carries a password, so it is a good candidate for ${VAR} too.
+  dsn: ${ALERTLOOP_DB_DSN:-alertloop.db}
 
 worker:
   concurrency: 2
@@ -95,7 +105,7 @@ channels: {}
   #
   # telegram:
   #   - name: dev-telegram
-  #     bot_token: "123456:ABC-DEF"    # from @BotFather
+  #     bot_token: ${TELEGRAM_BOT_TOKEN}   # from @BotFather; keep it in .env
   #     chat_id: "-1001234567890"
   #     # If this host cannot reach api.telegram.org directly, send this
   #     # channel's requests through a proxy. Schemes: http, https, socks5,
