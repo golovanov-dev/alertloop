@@ -8,10 +8,13 @@
 
 addr: ":8080"
 
-# Protects the admin console at /admin and grants full API access. CHANGE THIS
-# to a strong random value (e.g. `openssl rand -hex 32`). It is sent on every
-# request, so only reach the service through the HTTPS reverse proxy.
-admin_token: ${ALERTLOOP_ADMIN_TOKEN:-change-me-admin-token}
+# Protects the admin console at /admin and grants full API access. It comes from
+# ALERTLOOP_ADMIN_TOKEN in .env (the compose file passes that variable into both
+# containers) — generate one with `openssl rand -hex 32`. There is deliberately
+# NO fallback: a production profile that silently starts with a token published
+# in this repository is worse than one that refuses to start. It is sent on
+# every request, so only reach the service through the HTTPS reverse proxy.
+admin_token: ${ALERTLOOP_ADMIN_TOKEN}
 
 # Scoped API keys for services (ingest | read | full). Optional — the admin
 # token already has full access. CHANGE THESE if you use them.

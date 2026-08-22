@@ -32,7 +32,9 @@ install -d "$CONF_DIR"
 
 if [[ ! -f "$CONF_DIR/alertloop.yaml" ]]; then
   echo "==> Installing example config to $CONF_DIR/alertloop.yaml (edit before starting)"
-  install -m 0640 "$CONF_SRC" "$CONF_DIR/alertloop.yaml"
+  # Owned by the service user: the unit runs as User=alertloop, so a root-owned
+  # 0640 config would fail to start with "permission denied".
+  install -m 0640 -o alertloop -g alertloop "$CONF_SRC" "$CONF_DIR/alertloop.yaml"
 else
   echo "==> Keeping existing $CONF_DIR/alertloop.yaml"
 fi

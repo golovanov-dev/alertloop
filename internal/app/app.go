@@ -78,12 +78,15 @@ func New(ctx context.Context, cfg config.Config, version string, log *slog.Logge
 		"driver", cfg.Database.Driver,
 		"channels", cfg.EnabledChannels(),
 	)
+	for _, w := range cfg.Warnings {
+		log.Warn(w)
+	}
 	if len(cfg.APIKeys) == 0 {
 		log.Warn("no API keys configured — the JSON API is open to anyone who can reach it")
 	}
 	if registry.Len() == 0 {
 		log.Warn("no delivery channels configured — events will be STORED BUT NOT DELIVERED. " +
-			"Configure channels in your config file/env. In split server+worker deployments, " +
+			"Configure channels in your config file. In split server+worker deployments, " +
 			"BOTH processes must load the SAME channel config (the server decides which delivery " +
 			"jobs to create; the worker sends them).")
 	}

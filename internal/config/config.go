@@ -5,8 +5,10 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"strings"
@@ -49,6 +51,11 @@ type Config struct {
 	// the admin console is served from a different origin (standalone). Use "*"
 	// to allow any origin. Empty disables CORS (same-origin only).
 	CORSOrigins []string `yaml:"cors_origins"`
+
+	// Warnings are notes produced while loading (never read from the file): a
+	// pre-0.3.0 environment variable that the config file overrides, for
+	// instance. The caller logs them at startup.
+	Warnings []string `yaml:"-"`
 }
 
 // RateLimit configures in-process request rate limiting.
@@ -287,15 +294,26 @@ func SafeProxyURL(u *url.URL) string {
 func Load(configPath string) (Config, error) {
 	cfg := Default()
 	referenced := map[string]bool{}
+	present := map[string]bool{}
 
 	if configPath != "" {
 		data, err := os.ReadFile(configPath)
 		if err != nil {
 			return cfg, fmt.Errorf("read config file: %w", err)
 		}
+		// Decode explicitly rather than yaml.Unmarshal: a file with a second
+		// "---" document used to have everything past the separator silently
+		// dropped, which is exactly the quiet loss the single-source rule is
+		// supposed to prevent.
+		dec := yaml.NewDecoder(bytes.NewReader(data))
 		var doc yaml.Node
-		if err := yaml.Unmarshal(data, &doc); err != nil {
+		if err := dec.Decode(&doc); err != nil && !errors.Is(err, io.EOF) {
 			return cfg, fmt.Errorf("parse config file: %w", err)
+		}
+		var extra yaml.Node
+		if err := dec.Decode(&extra); err == nil {
+			return cfg, errors.New("config file contains more than one YAML document; " +
+				"everything after the \"---\" separator would be ignored")
 		}
 		// An empty file leaves a zero node, which Decode would reject; defaults
 		// alone are a valid configuration.
@@ -306,12 +324,15 @@ func Load(configPath string) (Config, error) {
 			if err := doc.Decode(&cfg); err != nil {
 				return cfg, fmt.Errorf("parse config file: %w", err)
 			}
+			present = collectFields(&doc)
 		}
 	}
 
-	if err := checkLegacyEnv(referenced); err != nil {
+	warnings, err := checkLegacyEnv(referenced, present)
+	if err != nil {
 		return cfg, err
 	}
+	cfg.Warnings = warnings
 
 	normalizeChannels(&cfg.Channels)
 	for i := range cfg.APIKeys {
@@ -543,13 +564,3 @@ func inferDriver(dsn string) string {
 	return "sqlite"
 }
 
-func splitList(v string) []string {
-	parts := strings.Split(v, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		if s := strings.TrimSpace(p); s != "" {
-			out = append(out, s)
-		}
-	}
-	return out
-}

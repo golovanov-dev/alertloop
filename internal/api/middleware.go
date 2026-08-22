@@ -79,7 +79,8 @@ func adminTokenAuth(token string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if token == "" {
 			writeError(w, http.StatusServiceUnavailable, "admin_disabled",
-				"admin token is not configured; set ALERTLOOP_ADMIN_TOKEN to enable the events page")
+				"admin token is not configured; set admin_token in your config file "+
+					"(e.g. admin_token: ${ALERTLOOP_ADMIN_TOKEN}) to enable the events page")
 			return
 		}
 		presented := extractAdminToken(r)

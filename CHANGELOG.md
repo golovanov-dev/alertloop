@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.3.1 - 2026-08-22
+
+Fixes for defects found reviewing 0.3.0 right after it shipped. Two of them made
+0.3.0 either not start or start insecurely, so upgrade rather than staying on
+0.3.0. No configuration changes are required.
+
+### Fixed
+
+- `${VAR}` now works in every field, not only string ones. In 0.3.0 the
+  substituted value was forced to a string, so `retention_days: ${DAYS}`,
+  `rate_limit.enabled: ${FLAG}`, `worker.concurrency`, an SMTP `port`, or
+  `cors_origins` failed at startup with `cannot unmarshal !!str into int`. The
+  documentation promised no such limitation.
+- The PostgreSQL Compose profile now passes `ALERTLOOP_ADMIN_TOKEN` into the
+  `api` and `worker` containers. In 0.3.0 the profile's example config read the
+  token from that variable, but nothing forwarded it, so an operator who set it
+  in `.env` — as documented — silently got the placeholder token published in
+  this repository. The example config no longer carries a fallback either: a
+  production profile with no token now refuses to start instead of running on a
+  well-known one.
+- A leftover pre-0.3.0 `ALERTLOOP_*` variable is now refused only when nothing
+  else supplies that setting. If the config file sets the same field, the file
+  wins and the variable is reported as a warning — 0.3.0 refused to start there
+  too, which blocked a correct configuration (mounting your own config into a
+  container that still exports the variable).
+- `/events` no longer tells an unauthenticated visitor to set
+  `ALERTLOOP_ADMIN_TOKEN` — advice that made 0.3.0 refuse to start. It now names
+  the config file setting.
+- Two adjacent references (`${A:-x}${B}`) are left verbatim, as documented for
+  partial interpolation. 0.3.0 read the default greedily and produced `x}${B`.
+- A config file with more than one YAML document is refused instead of silently
+  ignoring everything after the `---` separator.
+- `deploy/systemd/install.sh` installs the config owned by the `alertloop`
+  service user. It was installed root-owned with mode 0640 while the unit runs
+  as `User=alertloop`, so a fresh systemd install failed to start with
+  `permission denied` — a defect present since 0.1.0.
+- Startup no longer suggests configuring channels "in your config file/env";
+  channels have always been file-only.
+
 ## 0.3.0 - 2026-08-22
 
 One configuration file, one place to look. **Upgrading requires a configuration

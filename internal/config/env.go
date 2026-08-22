@@ -18,7 +18,10 @@ import (
 // "${VAR}" or "${VAR:-default}" is replaced. Interpolation inside a longer
 // string is deliberately unsupported — supporting it would require escaping
 // rules, and an SMTP password containing a literal "$" would be silently eaten.
-var envRef = regexp.MustCompile(`^\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-(.*))?\}$`)
+// The default may not contain "}": a greedy match turned "${A:-tok}${B}" —
+// two references, which the whole-value rule says to leave alone — into the
+// single default "tok}${B".
+var envRef = regexp.MustCompile(`^\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}$`)
 
 // substituteEnv walks a parsed YAML tree and resolves every ${VAR} scalar in
 // place. Names that were resolved are recorded in seen (the caller uses them to
@@ -50,9 +53,13 @@ func substituteEnv(n *yaml.Node, seen map[string]bool) error {
 				missing = append(missing, name)
 				return
 			}
-			// A substituted value is data, never YAML to re-parse: a password
-			// containing ": " or "#" must not become a mapping or a comment.
-			n.Tag = "!!str"
+			// Clear the tag so the value resolves to its natural type: forcing
+			// !!str here made ${VAR} unusable in every non-string field
+			// (retention_days, worker.*, rate_limit.*, an SMTP port). Nothing is
+			// re-parsed as YAML either way — the value lands in an already
+			// parsed scalar node, so a password containing ": " or "#" cannot
+			// turn into a mapping or a comment.
+			n.Tag = ""
 			n.Style = 0
 			return
 		}
@@ -64,60 +71,117 @@ func substituteEnv(n *yaml.Node, seen map[string]bool) error {
 
 	if len(missing) > 0 {
 		sort.Strings(missing)
-		return fmt.Errorf("config references environment variable(s) that are not set and have no default: %s "+
+		return fmt.Errorf("config references environment variable(s) that are unset or empty and have no default: %s "+
 			"(set them, or write ${VAR:-default} to allow a fallback)", strings.Join(dedupe(missing), ", "))
 	}
 	return nil
+}
+
+// legacyVar is a pre-0.3.0 configuration variable: the config field it used to
+// control, and the line to write in the file instead.
+type legacyVar struct {
+	field string
+	hint  string
 }
 
 // legacyEnvVars are the pre-0.3.0 configuration variables. They are gone, and a
 // leftover one is refused rather than ignored: silently dropping a stale
 // ALERTLOOP_DB_DSN would let a process run on SQLite while its operator is
 // certain it runs on PostgreSQL — the 0.1.1 failure, in reverse.
-var legacyEnvVars = map[string]string{
-	"ALERTLOOP_ADDR":                `addr: "..."`,
-	"ALERTLOOP_ADMIN_TOKEN":         `admin_token: ${ALERTLOOP_ADMIN_TOKEN}`,
-	"ALERTLOOP_DB_DRIVER":           `database.driver: "..."`,
-	"ALERTLOOP_DB_DSN":              `database.dsn: ${ALERTLOOP_DB_DSN}`,
-	"ALERTLOOP_RETENTION_DAYS":      `retention_days: 30`,
-	"ALERTLOOP_LOG_LEVEL":           `log.level: "info"`,
-	"ALERTLOOP_LOG_FORMAT":          `log.format: "text"`,
-	"ALERTLOOP_LOG_FILE":            `log.file: "..."`,
-	"ALERTLOOP_CORS_ORIGINS":        `cors_origins: ["..."]`,
-	"ALERTLOOP_WORKER_CONCURRENCY":  `worker.concurrency: 2`,
-	"ALERTLOOP_WORKER_MAX_ATTEMPTS": `worker.max_attempts: 5`,
-	"ALERTLOOP_RATELIMIT_ENABLED":   `rate_limit.enabled: true`,
+var legacyEnvVars = map[string]legacyVar{
+	"ALERTLOOP_ADDR":                {"addr", `addr: "..."`},
+	"ALERTLOOP_ADMIN_TOKEN":         {"admin_token", `admin_token: ${ALERTLOOP_ADMIN_TOKEN}`},
+	"ALERTLOOP_DB_DRIVER":           {"database.driver", `database.driver: "..."`},
+	"ALERTLOOP_DB_DSN":              {"database.dsn", `database.dsn: ${ALERTLOOP_DB_DSN}`},
+	"ALERTLOOP_RETENTION_DAYS":      {"retention_days", `retention_days: 30`},
+	"ALERTLOOP_LOG_LEVEL":           {"log.level", `log.level: "info"`},
+	"ALERTLOOP_LOG_FORMAT":          {"log.format", `log.format: "text"`},
+	"ALERTLOOP_LOG_FILE":            {"log.file", `log.file: "..."`},
+	"ALERTLOOP_CORS_ORIGINS":        {"cors_origins", `cors_origins: ["..."]`},
+	"ALERTLOOP_WORKER_CONCURRENCY":  {"worker.concurrency", `worker.concurrency: 2`},
+	"ALERTLOOP_WORKER_MAX_ATTEMPTS": {"worker.max_attempts", `worker.max_attempts: 5`},
+	"ALERTLOOP_RATELIMIT_ENABLED":   {"rate_limit.enabled", `rate_limit.enabled: true`},
 }
 
-// checkLegacyEnv fails when a pre-0.3.0 variable is set in the environment and
-// the config file does not reference it. A variable the file does reference via
-// ${VAR} is a secret being injected, which is the supported use.
+// checkLegacyEnv reports what to do about pre-0.3.0 variables still present in
+// the environment.
 //
-// An empty value counts as unset: Docker Compose blanks variables
-// (FOO: ${FOO:-}) as a way of clearing them, and that is not a leftover.
-func checkLegacyEnv(referenced map[string]bool) error {
-	var found []string
-	for name := range legacyEnvVars {
+// A variable is REFUSED when nothing else supplies its setting: the operator
+// believes it is in effect, and starting anyway is how a process ends up on a
+// database nobody chose. It is only WARNED about when the config file sets the
+// same field itself — the file wins, the outcome is unambiguous, and refusing
+// there would block a perfectly correct configuration (mounting your own file
+// into a container that still exports the variable).
+//
+// A variable the file references via ${VAR} is a secret being injected, which
+// is the supported use. An empty value counts as unset: Compose blanks
+// variables (FOO: ${FOO:-}) as a way of clearing them.
+func checkLegacyEnv(referenced, present map[string]bool) ([]string, error) {
+	var refused, shadowed []string
+	for name, lv := range legacyEnvVars {
 		if referenced[name] {
 			continue
 		}
-		if v, ok := os.LookupEnv(name); ok && v != "" {
-			found = append(found, name)
+		if v, ok := os.LookupEnv(name); !ok || v == "" {
+			continue
 		}
+		if present[lv.field] {
+			shadowed = append(shadowed, name)
+			continue
+		}
+		refused = append(refused, name)
 	}
-	if len(found) == 0 {
-		return nil
+	sort.Strings(refused)
+	sort.Strings(shadowed)
+
+	var warnings []string
+	for _, name := range shadowed {
+		warnings = append(warnings, fmt.Sprintf(
+			"%s is set but no longer configures anything; %s from the config file is what runs",
+			name, legacyEnvVars[name].field))
 	}
-	sort.Strings(found)
+	if len(refused) == 0 {
+		return warnings, nil
+	}
 
 	var b strings.Builder
 	b.WriteString("these environment variables no longer configure AlertLoop (0.3.0 made the YAML file the single source):\n")
-	for _, name := range found {
-		fmt.Fprintf(&b, "  %s — write it in the config file instead:  %s\n", name, legacyEnvVars[name])
+	for _, name := range refused {
+		fmt.Fprintf(&b, "  %s — write it in the config file instead:  %s\n", name, legacyEnvVars[name].hint)
 	}
 	b.WriteString("Refusing to start rather than ignoring them, so the process cannot run on settings you believe are in effect. " +
 		"Unset them once the config file carries the values.")
-	return fmt.Errorf("%s", b.String())
+	return warnings, fmt.Errorf("%s", b.String())
+}
+
+// collectFields records the dotted paths a config file actually sets, so a
+// leftover variable can be told from one the file overrides.
+func collectFields(n *yaml.Node) map[string]bool {
+	out := map[string]bool{}
+	var walk func(*yaml.Node, string)
+	walk = func(n *yaml.Node, prefix string) {
+		if n == nil {
+			return
+		}
+		switch n.Kind {
+		case yaml.DocumentNode:
+			for _, c := range n.Content {
+				walk(c, prefix)
+			}
+		case yaml.MappingNode:
+			for i := 0; i+1 < len(n.Content); i += 2 {
+				key, value := n.Content[i], n.Content[i+1]
+				path := key.Value
+				if prefix != "" {
+					path = prefix + "." + key.Value
+				}
+				out[path] = true
+				walk(value, path)
+			}
+		}
+	}
+	walk(n, "")
+	return out
 }
 
 func dedupe(in []string) []string {

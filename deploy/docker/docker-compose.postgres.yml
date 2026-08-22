@@ -39,6 +39,12 @@ services:
         VERSION: compose-pg
     image: alertloop:latest
     command: ["--config", "/etc/alertloop/alertloop.yaml", "server"]
+    environment:
+      # Carries the secret from .env into the container, where alertloop.yaml
+      # picks it up as ${ALERTLOOP_ADMIN_TOKEN}. Empty counts as unset, so a
+      # missing token stops the container with a clear message instead of
+      # starting on a placeholder anyone can read in this repository.
+      ALERTLOOP_ADMIN_TOKEN: ${ALERTLOOP_ADMIN_TOKEN:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -60,6 +66,12 @@ services:
   worker:
     image: alertloop:latest
     command: ["--config", "/etc/alertloop/alertloop.yaml", "worker"]
+    environment:
+      # Carries the secret from .env into the container, where alertloop.yaml
+      # picks it up as ${ALERTLOOP_ADMIN_TOKEN}. Empty counts as unset, so a
+      # missing token stops the container with a clear message instead of
+      # starting on a placeholder anyone can read in this repository.
+      ALERTLOOP_ADMIN_TOKEN: ${ALERTLOOP_ADMIN_TOKEN:-}
     depends_on:
       postgres:
         condition: service_healthy
