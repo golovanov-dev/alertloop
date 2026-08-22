@@ -1,6 +1,11 @@
 # Changelog
 
-## 0.3.0 - Unreleased
+## 0.3.0 - 2026-08-22
+
+One configuration file, one place to look. **Upgrading requires a configuration
+change** if you set any `ALERTLOOP_*` variable other than `ALERTLOOP_CONFIG`:
+those values move into the config file, and AlertLoop refuses to start while a
+leftover one is set. Nothing about your stored events changes.
 
 ### Changed
 
@@ -35,7 +40,10 @@
   no longer bakes a database DSN into the image. The bundled Compose profiles no
   longer need the workaround that blanked that variable so the configured
   PostgreSQL DSN would win.
-
+- The README is organised around what you are trying to do — try it, run it on a
+  server with or without Docker, grow into split roles — instead of a grid of
+  deployment variants. The database is presented as the single configuration
+  line it is, rather than as a demo/production split.
 - Release binaries and the Docker image are now built with Go 1.27. Go stops
   issuing security fixes for a release once two newer ones exist, so 1.25 — the
   toolchain used until now — no longer receives them. Building from source still

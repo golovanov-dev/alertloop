@@ -52,15 +52,29 @@ until the core product and market positioning are validated.
 
 - **Go**: 1.25 or newer — only to build from source. Release binaries are static
   and need no runtime; there is no CGO dependency.
-- **PostgreSQL** (production): 12 or newer (14+ recommended, tested on 16). Uses
-  `JSONB`, partial indexes, and `FOR UPDATE SKIP LOCKED`.
-- **SQLite** (local/demo): none — it is embedded (pure-Go driver). Just a file.
+- **SQLite**: nothing to install — it is embedded (pure-Go driver). This is the
+  default and needs no decision.
+- **PostgreSQL**, only if you choose it: 12 or newer (14+ recommended, tested on
+  16). Uses `JSONB`, partial indexes, and `FOR UPDATE SKIP LOCKED`.
 - **Docker** (optional): any recent Docker Engine with Compose v2 for the
   container deployment path.
 
-## Quick Start
+## Install
 
-### Docker Compose (demo, SQLite)
+There is **one** AlertLoop and **one** configuration file. What differs between
+the paths below is only how the process is supervised — and the database is a
+single line in that file, not a separate flavour of the product.
+
+Pick by what you are doing:
+
+| You want to… | Path | Database |
+|---|---|---|
+| see what it is, in a minute | Docker Compose demo | SQLite, thrown away with the volume |
+| run it on a server, no Docker | prebuilt binary + systemd | SQLite by default |
+| run it on a server, with Docker | Compose + PostgreSQL profile | PostgreSQL |
+| split API and workers | Compose + PostgreSQL profile | PostgreSQL (required) |
+
+### Try it (Docker Compose, SQLite)
 
 ```bash
 docker compose up -d
@@ -68,21 +82,41 @@ docker compose up -d
 
 Then open:
 
+- Admin console: <http://localhost:8080/admin>
 - API docs: <http://localhost:8080/swagger>
 - Events page: <http://localhost:8080/events?token=change-me-admin> (admin token)
 
-### Prebuilt binary
+Nothing is configured yet, so events are stored and delivered nowhere — which
+is a valid way to run. Add channels when you want notifications.
+
+### Run it on a server without Docker (binary + systemd)
 
 Download a release binary (linux/amd64, linux/arm64; darwin/windows for local
-evaluation), then run all-in-one mode backed by SQLite:
+evaluation) and give it a config file:
 
 ```bash
+cp alertloop.example.yaml alertloop.yaml   # edit: admin_token, channels
 ./alertloop --config alertloop.yaml all
 ```
 
-To install as a systemd service, see `deploy/systemd/` (`install.sh`).
+`deploy/systemd/install.sh` turns that into a supervised service (unit file,
+`alertloop` user, `/etc/alertloop/alertloop.yaml`, `/var/lib/alertloop`). The
+binary is static and CGO-free, so there is nothing else to install — SQLite is
+embedded.
 
-### From source
+### Run it on a server with Docker (PostgreSQL)
+
+```bash
+cd deploy/docker
+cp alertloop.yaml.example alertloop.yaml    # edit: admin_token, dsn, channels
+docker compose -f docker-compose.postgres.yml up -d
+```
+
+This profile runs the API and the delivery worker as separate containers against
+a PostgreSQL container, with **one** `alertloop.yaml` mounted into both — so the
+channel and routing configuration can never drift between them.
+
+### Build from source
 
 ```bash
 make run                 # build + run all-in-one on :8080 (SQLite)
@@ -203,10 +237,13 @@ plaintext HTTP.
 
 ## Database
 
-### SQLite (local/demo)
+The database is **one line of configuration**, not a different edition of the
+product. Both drivers run the same code, the same migrations, and the same
+queue; they differ in what they let you do around it.
 
-Point the DSN at a file path; AlertLoop creates the file and its tables
-automatically on first run. `:memory:` is supported for throwaway runs.
+**SQLite** — the default. Nothing to install: it is embedded (pure Go, no CGO),
+and AlertLoop creates the file and its tables on first run. Right for a
+single-host install, which is most installs. `:memory:` works for throwaway runs.
 
 ```yaml
 database:
@@ -214,24 +251,9 @@ database:
   dsn: alertloop.db
 ```
 
-### PostgreSQL (production)
-
-AlertLoop connects to an **existing database** and creates/updates only its own
-tables (`events`, `delivery_attempts`, `schema_migrations`) via migrations that
-run automatically at startup. **It does not create the database itself** — the
-target database must already exist (this is standard PostgreSQL client behavior:
-you cannot connect to a database that has not been created).
-
-Create the database once:
-
-```bash
-createdb -U postgres alertloop
-#   or:  psql -U postgres -c "CREATE DATABASE alertloop;"
-```
-
-Then point AlertLoop at it. With the **binary**, put it in your config file
-(e.g. `alertloop.yaml`) — this is the only part you change to switch from SQLite
-to PostgreSQL:
+**PostgreSQL** — when you need what SQLite cannot give: the API and the delivery
+worker as separate processes (they share the queue through the database), a
+database you already operate and back up, or room to grow.
 
 ```yaml
 database:
@@ -239,20 +261,27 @@ database:
   dsn: "postgres://USER:PASSWORD@HOST:5432/alertloop?sslmode=require"
 ```
 
+The DSN carries a password, so it is a good candidate for `${VAR}` — see
+[Configuration](#configuration). Use `sslmode=require` for a remote database;
+`sslmode=disable` only on a local or private-network Postgres.
+
+AlertLoop connects to an **existing database** and creates only its own tables
+(`events`, `delivery_attempts`, `schema_migrations`) through migrations that run
+at startup. **It does not create the database itself** — create it once:
+
 ```bash
-./alertloop --config alertloop.yaml all
+createdb -U postgres alertloop
+#   or:  psql -U postgres -c "CREATE DATABASE alertloop;"
 ```
 
-(The DSN carries a password, so it is a good candidate for `${VAR}` — see
-[Configuration](#configuration).)
-Use `sslmode=require` for a remote database; `sslmode=disable` is only for a
-local/private-network Postgres.
+Sharing that database with another application is fine: AlertLoop never touches
+tables that are not its own. Just make sure nothing else owns tables named
+`events`, `delivery_attempts`, or `schema_migrations`. (A configurable table
+prefix is on the roadmap for shared databases.)
 
-Using an **existing/shared database** is fine: AlertLoop only touches its own
-tables and never drops or alters unrelated tables. Just make sure no other
-application uses tables named `events`, `delivery_attempts`, or
-`schema_migrations` in that database. (A configurable table prefix/schema is on
-the roadmap for shared databases.)
+Switching later means changing those two lines and starting with an empty
+history: there is no migration path between the two engines, and event history
+is not carried over.
 
 ## Logs
 
@@ -475,8 +504,7 @@ cp alertloop.yaml.example alertloop.yaml    # set admin_token; api_keys & channe
 docker compose -f docker-compose.postgres.yml up -d
 ```
 
-The single-process `all` mode (and the SQLite demo) has no such split and needs
-no special handling.
+The single-process `all` mode has no such split and needs no special handling.
 
 ## API
 
