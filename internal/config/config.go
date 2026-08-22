@@ -563,4 +563,3 @@ func inferDriver(dsn string) string {
 	}
 	return "sqlite"
 }
-
