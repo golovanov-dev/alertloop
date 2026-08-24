@@ -3,7 +3,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 ADMIN_DIR := web/admin
 
-.PHONY: build run test vet fmt tidy release docker clean \
+.PHONY: build run test test-postgres upgrade-test vet lint fmt tidy release docker clean \
 	admin admin-install admin-dev admin-clean
 
 build: ## Build the local binary into bin/ (embeds the current admin UI in internal/adminui/dist)
@@ -26,11 +26,26 @@ all-build: admin build ## Build the admin UI and then the binary that embeds it
 run: build ## Run all-in-one mode against a local SQLite database
 	./bin/alertloop all
 
-test: ## Run the full test suite
+test: ## Run the full test suite (PostgreSQL tests skip without a DSN)
 	go test ./...
+
+test-postgres: ## Run the suite against PostgreSQL in a throwaway container
+	docker run --rm -d --name alertloop-test-pg \
+		-e POSTGRES_USER=alertloop -e POSTGRES_PASSWORD=alertloop -e POSTGRES_DB=alertloop_test \
+		-p 55432:5432 postgres:16-alpine
+	@until docker exec alertloop-test-pg pg_isready -U alertloop >/dev/null 2>&1; do sleep 1; done
+	-ALERTLOOP_TEST_POSTGRES_DSN='postgres://alertloop:alertloop@127.0.0.1:55432/alertloop_test?sslmode=disable' \
+		go test -count=1 ./internal/storage/...
+	docker rm -f alertloop-test-pg
+
+upgrade-test: ## Install with v0.1.0, upgrade to this tree, check the data survived
+	bash scripts/upgrade-test.sh
 
 vet: ## Static analysis
 	go vet ./...
+
+lint: ## Run golangci-lint (see .golangci.yml)
+	golangci-lint run --timeout=5m
 
 fmt: ## Format all Go source
 	gofmt -w internal cmd api

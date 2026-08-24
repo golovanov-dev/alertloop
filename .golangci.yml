@@ -1,0 +1,59 @@
+# golangci-lint configuration.
+#
+# The bar for 1.0.0 is "the linter finds real defects", not "the linter is
+# loud". Every linter enabled here has caught something in a Go codebase of this
+# shape; style-only linters are left off, and one linter (contextcheck) was
+# tried and removed because both findings it produced on this tree were false.
+# A lint failure people learn to ignore is worse than no lint at all.
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: none
+  enable:
+    - errcheck      # an unchecked error is how a failed write becomes silent
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - bodyclose     # a leaked HTTP body leaks a connection, and this code dials
+                    # SMTP, Telegram, and customer webhooks in a loop
+    - rowserrcheck  # rows.Err() after a scan loop: without it a truncated
+                    # result set reads as an empty one
+    - sqlclosecheck
+    - noctx         # an outbound request with no context cannot be cancelled or
+                    # timed out, which is how a worker wedges
+    - errorlint     # %v on an error breaks errors.Is/As, and the storage layer
+                    # depends on both
+    - nilerr
+
+  settings:
+    errcheck:
+      # Deferred Close on a handle whose data has already been read. The error
+      # it can report is about releasing the handle, not about the data, and
+      # there is nothing a caller could do with it. What actually matters after
+      # a scan loop — rows.Err() — is enforced by rowserrcheck instead.
+      exclude-functions:
+        - (*database/sql.Rows).Close
+        - (*net/smtp.Client).Close
+        - (*github.com/golovanov-dev/alertloop/internal/app.App).Close
+        - (io.Closer).Close
+        - (io.ReadCloser).Close
+
+  exclusions:
+    presets:
+      - common-false-positives
+    rules:
+      # bodyclose cannot see through a test helper that closes the body for the
+      # caller, which is how every request in these tests is made.
+      - path: _test\.go
+        linters:
+          - bodyclose
+          - errcheck
+          - noctx
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

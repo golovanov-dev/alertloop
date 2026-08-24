@@ -7,12 +7,18 @@ on:
   push:
     tags: ["v*"]
 
+# Least privilege at the top; each job widens only what it needs. The release
+# job writes Releases, the image job writes packages, and neither gets the
+# other's token.
 permissions:
-  contents: write # required to create the release and upload assets
+  contents: read
 
 jobs:
   release:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release and upload assets
+      id-token: write # keyless signing with cosign
     steps:
       - uses: actions/checkout@v4
 
@@ -22,13 +28,28 @@ jobs:
       - name: Extract release notes from CHANGELOG
         run: |
           version="${GITHUB_REF_NAME#v}"
+
+          # Require a DATED heading before anything else.
+          #
+          # The old check compared only the version field, so a heading still
+          # reading "## 0.4.0 - unreleased" matched happily and would have
+          # published a GitHub Release whose notes announced themselves as
+          # unreleased. The emptiness check below could not catch it: the
+          # section was not empty, it was wrong.
+          if ! grep -qE "^## ${version} - [0-9]{4}-[0-9]{2}-[0-9]{2}\$" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no dated section for ${version}."
+            echo "::error::Expected a heading of exactly: ## ${version} - YYYY-MM-DD"
+            echo "::error::Found instead:"
+            grep -nE "^## ${version}" CHANGELOG.md || echo "  (no heading for this version at all)"
+            exit 1
+          fi
+
           awk -v ver="$version" '
             /^## / { if (found) exit; if ($2 == ver) { found = 1; next } }
             found  { print }
           ' CHANGELOG.md > release-notes.md
           if [ ! -s release-notes.md ]; then
-            echo "::error::CHANGELOG.md has no '## $version - <date>' section."
-            echo "::error::Add the section (and its release date) before tagging v$version."
+            echo "::error::The section for ${version} in CHANGELOG.md is empty."
             exit 1
           fi
           echo "--- release body ---"
@@ -51,11 +72,109 @@ jobs:
       - name: Cross-compile release binaries
         run: VERSION="${GITHUB_REF_NAME}" bash scripts/build-release.sh
 
+      # Sign the checksum file, keylessly. Anyone can then verify that these
+      # binaries came from this workflow in this repository, without us
+      # distributing or guarding a signing key. The checksums file covers every
+      # artifact, so one signature is enough.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign the checksums
+        run: |
+          cosign sign-blob --yes \
+            --output-signature "dist/checksums_${GITHUB_REF_NAME}.txt.sig" \
+            --output-certificate "dist/checksums_${GITHUB_REF_NAME}.txt.pem" \
+            "dist/checksums_${GITHUB_REF_NAME}.txt"
+
       - name: Publish to GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "${GITHUB_REF_NAME}" \
-            dist/alertloop_* dist/checksums_*.txt \
+            dist/alertloop_* dist/checksums_*.txt dist/checksums_*.sig dist/checksums_*.pem \
             --title "${GITHUB_REF_NAME}" \
             --notes-file release-notes.md
+
+  image:
+    name: Container image
+    runs-on: ubuntu-latest
+    # The published image IS the Docker delivery path: docker-compose.yml pulls
+    # it and builds nothing. Until 0.4.0 the compose file built from source,
+    # which meant "run AlertLoop with Docker" started with "clone the
+    # repository".
+    #
+    # It runs after the binaries so a tag never produces an image without the
+    # matching release, and both are built from the same commit.
+    needs: release
+    permissions:
+      contents: read
+      packages: write # push the image to GHCR
+      id-token: write # keyless signing and provenance attestation
+    steps:
+      - uses: actions/checkout@v4
+
+      # linux/arm64 matters: a large share of self-hosted installs are ARM VPS
+      # and single-board machines, and the binary releases already target it.
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # `latest` follows stable releases only. A pre-release tag (v0.5.0-rc1)
+      # publishes its own tag and leaves `latest` where it is, so nobody is
+      # upgraded to a release candidate by a `docker compose pull`.
+      - name: Derive image tags
+        id: tags
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          tags="$image:$version"
+          case "$version" in
+            *-*) echo "pre-release: not moving :latest" ;;
+            *)   tags="$tags,$image:latest" ;;
+          esac
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          echo "Publishing: $tags"
+
+      - uses: docker/build-push-action@v6
+        id: build
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          # Provenance and an SBOM travel with the image. For a self-hosted
+          # product this is what lets somebody answer "what is actually in this
+          # thing, and who built it" without trusting our word for it.
+          provenance: mode=max
+          sbom: true
+          build-args: |
+            VERSION=${{ github.ref_name }}
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=AGPL-3.0-only
+            org.opencontainers.image.description=AlertLoop Community — self-hosted event and incident notification service
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign the image
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          cosign sign --yes "${image}@${DIGEST}"
+          echo "Signed ${image}@${DIGEST}"
+          echo
+          echo "Verify with:"
+          echo "  cosign verify ${image}@${DIGEST} \\"
+          echo "    --certificate-identity-regexp '^https://github.com/${GITHUB_REPOSITORY}/' \\"
+          echo "    --certificate-oidc-issuer https://token.actions.githubusercontent.com"

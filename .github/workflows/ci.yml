@@ -19,6 +19,9 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  GO_VERSION: "1.27"
+
 jobs:
   go:
     name: Go (vet, test, gofmt)
@@ -28,7 +31,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.27"
+          go-version: ${{ env.GO_VERSION }}
           cache: true
 
       # gofmt first: it is the cheapest check and the most annoying to discover
@@ -49,6 +52,249 @@ jobs:
 
       - name: go test
         run: go test ./...
+
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          # Pinned, not `latest`. A new linter release adds checks, and with
+          # `latest` it lands in CI on whatever day upstream ships it - which is
+          # as likely as not the day you are trying to cut a release. Bump this
+          # deliberately, in its own commit.
+          version: v2.13.1
+          args: --timeout=5m
+
+  postgres:
+    name: PostgreSQL integration tests
+    runs-on: ubuntu-latest
+    # PostgreSQL is the production database, and until 0.4.0 nothing was tested
+    # against it: every test ran on SQLite. The two differ exactly where it
+    # matters — placeholder syntax, JSONB payloads, partial indexes, and
+    # `FOR UPDATE SKIP LOCKED`, which is the entire basis of the delivery queue.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: alertloop
+          POSTGRES_PASSWORD: alertloop
+          POSTGRES_DB: alertloop_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U alertloop"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      ALERTLOOP_TEST_POSTGRES_DSN: postgres://alertloop:alertloop@127.0.0.1:5432/alertloop_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      # -count=1 defeats the test cache: these tests depend on a database the
+      # cache knows nothing about, so a cached PASS would be meaningless.
+      - name: Storage tests against PostgreSQL
+        run: go test -count=1 ./internal/storage/...
+
+      # The suite must actually have run. A skipped integration suite reports
+      # the same green tick as a passing one, which is how "we test PostgreSQL"
+      # quietly becomes false.
+      - name: Assert the PostgreSQL tests were not skipped
+        run: |
+          go test -count=1 -v -run 'TestPostgres' ./internal/storage/ > result.txt
+          cat result.txt
+          if grep -q -- '--- SKIP' result.txt; then
+            echo "::error::PostgreSQL tests were skipped; the DSN did not reach them."
+            exit 1
+          fi
+          passed=$(grep -c -- '--- PASS' result.txt || true)
+          if [ "$passed" -lt 5 ]; then
+            echo "::error::only $passed PostgreSQL tests passed; expected the full suite."
+            exit 1
+          fi
+          echo "PostgreSQL integration tests: $passed passed"
+
+  upgrade:
+    name: Upgrade from v0.1.0
+    runs-on: ubuntu-latest
+    # An upgrade runs against data somebody cares about, on a machine we will
+    # never see. It gets tested with the real old binary, not a reconstruction.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: alertloop
+          POSTGRES_PASSWORD: alertloop
+          POSTGRES_DB: alertloop_upgrade
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U alertloop"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      # The script builds the old release from its tag, so the full history has
+      # to be there.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: Upgrade test (SQLite and PostgreSQL)
+        env:
+          ALERTLOOP_TEST_POSTGRES_DSN: postgres://alertloop:alertloop@127.0.0.1:5433/alertloop_upgrade?sslmode=disable
+        run: bash scripts/upgrade-test.sh
+
+  compose:
+    name: Compose file
+    runs-on: ubuntu-latest
+    # Both deployment profiles live in one file now. A typo in it does not fail
+    # any test — it fails somebody's install, which is how 0.3.0 shipped a
+    # production profile that started on a placeholder admin token.
+    steps:
+      - uses: actions/checkout@v4
+      # Both profiles must parse with no .env at all: Compose interpolates the
+      # whole file before it filters by profile, so a required-variable guard on
+      # one profile would block the other. That is why the missing-secret guard
+      # lives in the config file (covered by TestExampleConfigRefusesWithoutAnAdminToken)
+      # rather than here.
+      - name: Validate both profiles with no .env
+        run: |
+          rm -f .env
+          docker compose --profile demo config --quiet
+          docker compose --profile postgres config --quiet
+          echo "both profiles parse without a .env"
+
+      - name: Validate both profiles with the example .env
+        run: |
+          cp .env.example .env
+          docker compose --profile demo config --quiet
+          docker compose --profile postgres config --quiet
+          echo "both profiles parse with .env.example"
+
+      # Exactly one profile may claim port 8080, or `docker compose up` fails on
+      # a port collision after the user has already been told it would work.
+      # COMPOSE_PROFILES is cleared per case: Compose UNIONS the variable with
+      # --profile, so leaving the value from .env in place would select both and
+      # test something nobody does on purpose.
+      - name: Each profile publishes port 8080 exactly once
+        run: |
+          for profile in demo postgres; do
+            count=$(COMPOSE_PROFILES= docker compose --profile "$profile" config \
+              | grep -c 'published: *"8080"' || true)
+            if [ "$count" != "1" ]; then
+              echo "::error::profile $profile publishes port 8080 $count times, expected 1."
+              COMPOSE_PROFILES= docker compose --profile "$profile" config
+              exit 1
+            fi
+          done
+          echo "port 8080 is claimed once per profile"
+
+      # Selecting a profile the documented way — by editing COMPOSE_PROFILES —
+      # must also yield exactly one service on 8080.
+      - name: COMPOSE_PROFILES selects one deployment
+        run: |
+          for profile in demo postgres; do
+            count=$(COMPOSE_PROFILES="$profile" docker compose config \
+              | grep -c 'published: *"8080"' || true)
+            if [ "$count" != "1" ]; then
+              echo "::error::COMPOSE_PROFILES=$profile publishes port 8080 $count times, expected 1."
+              exit 1
+            fi
+          done
+          echo "COMPOSE_PROFILES selects exactly one deployment"
+
+  monit-integration:
+    name: Monit integration (shellcheck, tests)
+    runs-on: ubuntu-latest
+    # The integration is shipped, supported code that runs as root on somebody
+    # else's server. It gets the same bar as the Go: a linter and a test suite,
+    # on every push.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck jq
+
+      # -x follows sourced files; -S style is the strictest level. Every script
+      # here is one somebody will read while their production is on fire.
+      - name: shellcheck
+        run: |
+          shellcheck -x -S style \
+            integrations/monit/alertloop-send \
+            integrations/monit/alertloop-monit \
+            integrations/monit/install.sh \
+            integrations/monit/uninstall.sh \
+            integrations/monit/examples/*.sh \
+            integrations/monit/test/run-tests.sh \
+            scripts/upgrade-test.sh
+          echo "shellcheck: clean"
+
+      - name: Adapter tests
+        run: bash integrations/monit/test/run-tests.sh
+
+      # A shell tool runs under whatever locale the host has and pipes through
+      # `tr`, which is byte-oriented. A multi-byte character in a literal is one
+      # LC_ALL=C away from arriving as mojibake in somebody's alert, so the
+      # scripts stay ASCII and this proves it. (Text the CALLER supplies is
+      # passed through untouched; that is not what this checks.)
+      - name: The shipped scripts are ASCII
+        run: |
+          bad=0
+          for f in integrations/monit/alertloop-send \
+                   integrations/monit/alertloop-monit \
+                   integrations/monit/examples/*.sh; do
+            if LC_ALL=C grep -qP '[^\x00-\x7F]' "$f"; then
+              echo "::error file=$f::contains non-ASCII characters"
+              LC_ALL=C grep -nP '[^\x00-\x7F]' "$f"
+              bad=1
+            fi
+          done
+          [ "$bad" -eq 0 ] || exit 1
+          echo "all shipped scripts are ASCII"
+
+      # Monit itself validates the example rules. A rule that does not parse is
+      # a rule that silently monitors nothing.
+      - name: Monit accepts the example rules
+        run: |
+          sudo apt-get install -y -qq monit
+          sudo install -d -m 0755 /etc/alertloop
+          sudo install -m 0600 integrations/monit/alertloop.env.example /etc/alertloop/monit.env
+          sudo install -m 0755 integrations/monit/alertloop-send  /usr/local/bin/alertloop-send
+          sudo install -m 0755 integrations/monit/alertloop-monit /usr/local/bin/alertloop-monit
+
+          # Monit refuses to read a control file that others can write, and
+          # rejects rules referencing programs that do not exist - so the
+          # helpers go in first.
+          sudo install -m 0755 integrations/monit/examples/check-worker-heartbeat.sh /usr/local/bin/
+          sudo install -m 0755 integrations/monit/examples/cron-wrapper.sh /usr/local/bin/
+
+          for f in integrations/monit/conf.d/*.conf; do
+            name="$(basename "$f")"
+            printf 'set daemon 30\nset pidfile /run/monit-check.pid\n' | sudo tee /tmp/monitrc.$name >/dev/null
+            cat "$f" | sudo tee -a /tmp/monitrc.$name >/dev/null
+            sudo chmod 0600 /tmp/monitrc.$name
+            if sudo monit -t -c /tmp/monitrc.$name; then
+              echo "  ok   $name"
+            else
+              echo "::error file=$f::monit -t rejected this rule file"
+              exit 1
+            fi
+          done
+          echo "every example rule parses"
 
   admin-ui:
     name: Admin console (typecheck, build)
@@ -76,3 +322,20 @@ jobs:
       - name: Build
         working-directory: web/admin
         run: npm run build
+
+  vulncheck:
+    name: Dependency vulnerabilities
+    runs-on: ubuntu-latest
+    # Criterion 5 of the 1.0.0 bar: dependency scanning in CI. govulncheck
+    # reports only vulnerabilities in code paths this binary actually reaches,
+    # so a finding here is a finding worth acting on rather than noise.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
