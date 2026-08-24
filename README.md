@@ -32,6 +32,15 @@ until the core product and market positioning are validated.
 - Event lifecycle: `new`, `acknowledged`, `resolved`, `muted`, `escalated`
   (with a manual `escalate` action).
 - Idempotent ingestion via `dedupe_key`.
+- [Incident lifecycle](#incident-lifecycle-firing-and-resolved): a monitoring
+  source reports `status: firing` while a problem lasts and `status: resolved`
+  when it ends; repeats update the open incident instead of notifying again, and
+  a recovery closes it automatically.
+- **Recovery notifications**: closing an incident tells the channels that were
+  told about it, with how long the outage lasted. On by default.
+- [Monit integration](integrations/monit/): watch processes, ports,
+  filesystems, load, workers, and cron jobs on a Linux host, and have every
+  finding become an incident that opens and closes on its own.
 - Delivery channels: Email (SMTP), Telegram, Webhook (HMAC-signed).
 - [Routing rules](#routing-rules): send each event to the channels that should
   get it (by type, severity, source, or category), with a dry-run preview
@@ -47,6 +56,12 @@ until the core product and market positioning are validated.
 - Structured logs (text or JSON), to stdout or a file.
 - Event retention with automatic cleanup (30 days by default, configurable via
   `retention_days`).
+- Health probes under both names: `/health` and `/health/live`, `/ready` and
+  `/health/ready`.
+
+Operating it — backup and restore, upgrades, and runbooks for the failures that
+actually happen — is in [OPERATIONS.md](OPERATIONS.md). Reporting a
+vulnerability is in [SECURITY.md](SECURITY.md).
 
 ## Requirements
 
@@ -77,8 +92,17 @@ Pick by what you are doing:
 ### Try it (Docker Compose, SQLite)
 
 ```bash
+cp .env.example .env      # presets COMPOSE_PROFILES=demo
 docker compose up -d
 ```
+
+Both deployments live in the single `docker-compose.yml` at the repository root,
+selected by profile — `demo` here, `postgres` below. Switch by **editing**
+`COMPOSE_PROFILES` in `.env`; do not leave it set and add `--profile` as well,
+because Compose combines the two and would start both on the same port. With no
+`.env` at all, `docker compose --profile demo up -d` selects one directly.
+
+The images are pulled from GHCR; nothing is built from the compose file.
 
 Then open:
 
@@ -107,14 +131,28 @@ embedded.
 ### Run it on a server with Docker (PostgreSQL)
 
 ```bash
-cd deploy/docker
-cp alertloop.yaml.example alertloop.yaml    # edit: admin_token, dsn, channels
-docker compose -f docker-compose.postgres.yml up -d
+cp .env.example .env                        # then edit it:
+                                            #   COMPOSE_PROFILES=postgres
+                                            #   ALERTLOOP_ADMIN_TOKEN=$(openssl rand -hex 32)
+                                            #   POSTGRES_PASSWORD=$(openssl rand -base64 32)
+cp alertloop.example.yaml alertloop.yaml    # edit: channels, routing
+docker compose up -d
 ```
+
+Create `alertloop.yaml` **before** starting. Docker creates a directory in place
+of a bind mount whose source is missing, and AlertLoop then fails on "is a
+directory".
 
 This profile runs the API and the delivery worker as separate containers against
 a PostgreSQL container, with **one** `alertloop.yaml` mounted into both — so the
-channel and routing configuration can never drift between them.
+channel and routing configuration can never drift between them. The database
+driver and DSN reach that file from the environment, which is why the same
+example config serves this profile and a binary install.
+
+It refuses to start without `ALERTLOOP_ADMIN_TOKEN` and `POSTGRES_PASSWORD`
+rather than falling back to placeholders published in this repository. Pin
+`ALERTLOOP_IMAGE` to a version tag in production: `latest` moves under you on
+the next `docker compose pull`.
 
 ### Build from source
 
@@ -144,6 +182,89 @@ curl -X POST http://localhost:8080/v1/events \
 For real integrations, create least-privilege **API keys** with a scope
 (`ingest` for event sources, `read` for dashboards, `full` for trusted tools) in
 the config file — see `alertloop.example.yaml`.
+
+### Incident lifecycle: `firing` and `resolved`
+
+A monitoring source does not send one-off notifications. It reports that a
+problem *is happening*, keeps reporting it while it lasts, and reports when it
+is over. Add `status` to say so:
+
+```bash
+# The problem starts. Creates an incident and notifies. -> 201
+curl -X POST http://localhost:8080/v1/events \
+  -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
+  -d '{"status":"firing","type":"incident","severity":"critical","source":"monit",
+       "message":"PostgreSQL does not respond on port 5432",
+       "dedupe_key":"server-01:postgresql:availability"}'
+
+# Still broken, reported every minute. Updates the SAME incident with the newest
+# severity and message. No second incident, and nobody is notified again. -> 200
+# (identical request)
+
+# Fixed. Closes the incident and records when. -> 200
+curl -X POST http://localhost:8080/v1/events \
+  -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
+  -d '{"status":"resolved","dedupe_key":"server-01:postgresql:availability"}'
+```
+
+Rules worth knowing:
+
+- **`dedupe_key` is the incident's identity.** Keep it stable for one logical
+  check — `host:service:check`. Never put a timestamp, a random id, a measured
+  value, or varying error text in it.
+- **Resolving frees the key.** The same failure happening again opens a *new*
+  incident and notifies again, which is what you want from a service that
+  flaps.
+- **A recovery only needs `dedupe_key`.** It identifies an incident to close; it
+  does not describe a new event.
+- **A recovery for something unknown is a success, not an error.** It returns
+  `204` when no event has ever carried that key — the source may be reporting a
+  recovery after retention removed the incident, or after restarting without
+  having seen the failure.
+- **Repeats do not re-notify.** Refreshing an incident creates no delivery
+  attempts. A check that fails every minute must not page anyone every minute.
+- **An acknowledged incident stays acknowledged** while it keeps firing.
+- **Closing an incident sends a recovery notice** to the channels that received
+  the alert, and to no others:
+
+  ```
+  [RESOLVED] PostgreSQL does not respond on port 5432
+    Key:      server-01:postgresql:availability
+    Started:  2026-08-22 03:14:07 UTC
+    Resolved: 2026-08-22 03:26:37 UTC
+    Duration: 12m30s
+  ```
+
+  Resolving is deliberately **not** re-routed: routing ran once at ingestion,
+  and the audience for "it is fixed" is the audience of "it is broken". A
+  channel whose alert dead-lettered is skipped — it never learned there was a
+  problem. Repeating a recovery does not notify twice. The manual resolve action
+  in the console notifies too. Turn it all off with `notify_on_resolve: false`.
+
+**Without `status`, nothing changes from earlier versions.** `dedupe_key` remains
+a plain idempotency key: a repeat returns the stored event untouched. The two
+readings of that field are now explicit rather than conflated.
+
+### Monitoring a Linux server
+
+The [Monit integration](integrations/monit/) connects AlertLoop to Monit, which
+watches processes, ports, filesystems, memory, load, workers, and cron jobs:
+
+```bash
+cd integrations/monit
+sudo ./install.sh --with-examples
+```
+
+Monit detects; AlertLoop receives, deduplicates, routes, and delivers. AlertLoop
+does not grow its own server monitoring, and Monit runs on the host rather than
+in a container — it has to see host processes and real filesystems, and it has
+to be able to notice that Docker itself has died.
+
+It ships eleven example rules, `install`/`uninstall` scripts, wrappers for cron
+jobs and worker heartbeats, and a README that is explicit about what it cannot
+do. It is Community, like every inbound integration: what stays paid is the
+policy layer on top — escalation policies, on-call schedules, per-project
+routing.
 
 ## Runtime Modes
 
@@ -494,14 +615,13 @@ actual sending. **Both processes must load the same channel configuration** — 
 the server has no channels, no delivery jobs are created and nothing is ever
 sent (it will log a prominent warning at startup).
 
-The PostgreSQL Compose profile (`deploy/docker/docker-compose.postgres.yml`)
-does this correctly by mounting a **single** `alertloop.yaml` into both the api
-and worker containers — one source of truth, no drift. To use it:
+The PostgreSQL Compose profile does this correctly by mounting a **single**
+`alertloop.yaml` into both the api and worker containers — one source of truth,
+no drift. To use it:
 
 ```bash
-cd deploy/docker
-cp alertloop.yaml.example alertloop.yaml    # set admin_token; api_keys & channels optional
-docker compose -f docker-compose.postgres.yml up -d
+cp alertloop.example.yaml alertloop.yaml    # api_keys & channels optional
+COMPOSE_PROFILES=postgres docker compose up -d
 ```
 
 The single-process `all` mode has no such split and needs no special handling.
@@ -559,6 +679,12 @@ For a single local binary for your own machine, just `make build` (Go only).
   when TLS is requested but unavailable.
 - **Secrets**: never commit real `alertloop.yaml` / `.env` (they are gitignored);
   keep the `*.example` templates only.
+- **Monitor AlertLoop itself**: alert on `deliveries.dead_letter` from
+  `/v1/stats`, and check `/health/ready` from *outside* this host — a service
+  that is down cannot report that it is down. See
+  [OPERATIONS.md](OPERATIONS.md).
+- **Back up before upgrading**: migrations run automatically at startup and are
+  not reversible in place. Downgrading is not supported; restoring a backup is.
 
 ## License
 

@@ -1,5 +1,385 @@
 # Changelog
 
+## 0.4.0 - 2026-08-24
+
+AlertLoop learns the full incident lifecycle - a problem opens an incident,
+keeps it updated while it lasts, and closes it with a notice saying how long it
+went on - and ships its first integration with a monitoring system, Monit. The
+Docker delivery path becomes a published image instead of a build from source.
+
+**Upgrading the binary or the image needs nothing**: two migrations run
+automatically at startup, in a transaction, and backfill every existing row.
+Nothing about your stored events changes.
+
+**On a large PostgreSQL installation, plan for the migration to take time.**
+Migration 0003 rewrites every row in `events` to fill `last_seen_at`, and
+rebuilds the `dedupe_key` index — inside one transaction, so the table is locked
+against writes for the duration and the WAL grows by roughly the size of the
+table. Check what you are in for before upgrading:
+
+```sql
+SELECT count(*) FROM events;
+```
+
+Up to a few hundred thousand rows this is seconds. In the millions, do it in a
+maintenance window, and make sure event sources will retry — ingestion returns
+5xx while the table is locked. SQLite has the same work to do but no
+concurrency to block. Both are covered by the upgrade test in CI, which runs a
+real v0.1.0 database forward on both engines.
+
+**Upgrading a Docker Compose deployment needs three deliberate steps**, because
+the Compose layout changed. Read "How to upgrade a Compose deployment" below
+before pulling — one of them, if skipped, makes a working PostgreSQL
+installation come up with an empty database.
+
+### Added
+
+- **Incident lifecycle on ingestion.** `POST /v1/events` accepts `status`:
+  - `firing` — the problem is happening now. A repeat for the same `dedupe_key`
+    **updates the open incident** with the newest severity, message, and payload
+    and moves `last_seen_at` forward. It creates no new delivery attempts, so a
+    check that fails every minute does not notify anyone every minute. An
+    incident an operator has acknowledged stays acknowledged.
+  - `resolved` — the problem is over. Closes the open incident carrying that
+    `dedupe_key` and records `resolved_at`. It needs only `dedupe_key`. A repeat
+    is idempotent, and a recovery for a key nothing was ever stored under
+    returns `204` rather than an error: the source may be reporting a recovery
+    after retention removed the incident, or after restarting.
+
+  Requests **without** `status` behave exactly as before — `dedupe_key` stays a
+  plain idempotency key and a repeat returns the stored event untouched. This is
+  covered by a regression test.
+- **Recovery notifications.** Closing an incident tells the channels that were
+  told about it:
+
+  ```
+  [RESOLVED] postgresql: Connection failed
+    Started:  2026-08-22 03:14:07 UTC
+    Resolved: 2026-08-22 03:26:37 UTC
+    Duration: 12m30s
+  ```
+
+  It goes to the channels that received the alert **and to nobody else** —
+  resolving is not re-routed, because routing already ran at ingestion and the
+  rules may have changed since. A channel whose alert dead-lettered is skipped:
+  it never learned there was a problem. A channel whose alert is still queued is
+  included: it will be delivered, and its recipient would otherwise be left with
+  a problem that never ended.
+
+  Both paths notify — an ingested `status: resolved` and the manual resolve
+  action. **This changes what the resolve action does:** in 0.3.x it was silent.
+  Repeating a recovery does not notify twice. Turn it off with
+  `notify_on_resolve: false`.
+- **Delivery attempts record what they announce** (`kind`: `alert` or
+  `recovery`), in the API, the built-in `/deliveries` page, and the admin
+  console, and as a `?kind=` filter. Webhook payloads carry it as a top-level
+  `kind` field, so a receiver can close its own ticket instead of opening a
+  second one. Attempts created before 0.4.0 read as `alert`.
+- **The Monit integration**, under `integrations/monit/` — the first inbound
+  integration, and **Community**, not paid:
+
+  - `alertloop-send`, a shell adapter with bounded retries, timeouts, a
+    documented exit-code contract, `--dry-run`, and no secret in its process
+    arguments or its logs;
+  - `alertloop-monit`, the glue that reads Monit's own `MONIT_*` variables so
+    the example rules stay one line long;
+  - eleven example rules: system resources, filesystem and inodes, PostgreSQL,
+    PHP-FPM, HTTP health, worker process, worker heartbeat, cron exit code, cron
+    freshness, Docker, and AlertLoop itself;
+  - `cron-wrapper.sh` and `check-worker-heartbeat.sh`, which cover the two
+    failure modes process checks cannot see: a job that failed, and a job that
+    never ran;
+  - `install.sh` / `uninstall.sh` that never overwrite an existing
+    configuration, install the examples **disabled**, and refuse to reload Monit
+    on a configuration it rejects;
+  - 85 tests and `shellcheck -S style` in CI, plus `monit -t` against every
+    shipped rule.
+
+  It runs on the host, never inside AlertLoop's container, and its README is
+  explicit about what it cannot do — including that a local Monit cannot report
+  through an AlertLoop that is itself down.
+- **`notify_on_resolve`** in the config file, default true. It is read as a
+  pointer, so a config file written before 0.4.0 gets recovery notices without
+  being edited.
+- **`rate_limit.trusted_proxies`** — the addresses whose `X-Forwarded-For` may
+  be believed when identifying a client for the per-IP limit. Empty by default,
+  which is right for a directly exposed instance and wrong behind a proxy: set
+  it to your proxy's address, or the limiter counts every request as coming
+  from the same client. `deploy/proxy/nginx.conf` now ships with `limit_req`
+  configured as well; the two are complementary.
+- **Health probes are exempt from the per-IP limit**, in the app and in the
+  shipped nginx configuration. A Docker HEALTHCHECK, an orchestrator probe, and
+  an external uptime check all come from one address, and throttling them would
+  make "is it up?" stop answering during an incident — which is when it is
+  asked.
+- **Release artifacts and the container image are signed with cosign**
+  (keyless, verifiable against this repository), and the image carries an SBOM
+  and provenance attestation.
+- **The systemd unit is hardened to match the container**: no capabilities, no
+  device access, no kernel tuning or module loading, a restricted syscall set,
+  and `RestrictAddressFamilies` limited to what a network service needs.
+- **`last_seen_at` and `resolved_at` on the event**, in the API, the built-in
+  event page, and the admin console. Existing rows are backfilled: `last_seen_at`
+  from `created_at`, and `resolved_at` from `updated_at` on events that were
+  already resolved.
+- **`/health/live` and `/health/ready`** as aliases of `/health` and `/ready`,
+  which keep working. Monitoring tools are overwhelmingly configured against the
+  sub-path form.
+- **A published container image at `ghcr.io/golovanov-dev/alertloop`**, built for
+  `linux/amd64` and `linux/arm64` on every version tag. `latest` follows stable
+  releases only; a pre-release tag does not move it.
+- **`SECURITY.md`** — supported versions, how to report a vulnerability
+  privately, what is in scope, and the security properties a break in which is a
+  vulnerability.
+- **`OPERATIONS.md`** — backup and restore for both databases, the upgrade and
+  downgrade policy, how to monitor AlertLoop itself, and runbooks for a channel
+  that has been down for a day, a full disk, an unreachable database, and events
+  that arrive but are never delivered.
+- **PostgreSQL integration tests.** Until now every test ran on SQLite while
+  PostgreSQL was the production database. CI now runs the storage suite against a
+  real PostgreSQL — including a concurrency test that proves two workers never
+  claim the same delivery, which is the `FOR UPDATE SKIP LOCKED` path SQLite
+  never executes — and fails if those tests are skipped rather than run.
+- **An upgrade test from v0.1.0** (`scripts/upgrade-test.sh`), run in CI on both
+  SQLite and PostgreSQL. It builds the real v0.1.0 binary from its tag, writes a
+  database with it, starts the current build against that same database, and
+  checks the events, their payloads, and the backfilled columns.
+- **golangci-lint and govulncheck in CI**, plus validation of the Compose file
+  for both profiles.
+
+### How to upgrade a Compose deployment
+
+Do this before `git pull`, or at least before `docker compose up`.
+
+**1. Write down your current Compose project name and volumes.**
+
+```bash
+docker volume ls | grep -i alertloop
+docker compose ls
+```
+
+This matters because the compose file now sets `name: alertloop` explicitly,
+while before it inherited the project name from **the directory the compose
+file was in**. For the PostgreSQL profile that directory was `deploy/docker`,
+so the project was called `docker` and the volume `docker_pgdata`. After the
+upgrade AlertLoop looks for `alertloop_pgdata`, finds nothing, and initialises
+an empty database. The old volume is still there and still intact — but a
+service that starts empty and healthy is the worst way to find out.
+
+Two ways through it. **Back up and restore** (safe, and you wanted a backup
+anyway):
+
+```bash
+# with the OLD stack still running
+docker compose -f deploy/docker/docker-compose.postgres.yml \
+  exec -T postgres pg_dump -U alertloop -Fc alertloop > alertloop-pre-0.4.0.dump
+docker compose -f deploy/docker/docker-compose.postgres.yml down
+
+# ... upgrade, then with the NEW stack up ...
+docker compose exec -T postgres \
+  pg_restore -U alertloop -d alertloop --clean --if-exists < alertloop-pre-0.4.0.dump
+```
+
+Or **keep the existing volume** by declaring it external, in a
+`docker-compose.override.yml` next to the compose file:
+
+```yaml
+volumes:
+  pgdata:
+    external: true
+    name: docker_pgdata      # whatever `docker volume ls` actually showed
+```
+
+The SQLite demo profile is usually unaffected: its project name was already
+derived from a directory called `alertloop`. Check `docker volume ls` anyway.
+
+**2. Select a profile.** Services now carry profiles, so `docker compose up -d`
+with nothing selected starts **nothing at all** and says so quietly.
+
+```bash
+cp .env.example .env      # then set COMPOSE_PROFILES=demo or =postgres
+docker compose up -d
+```
+
+Do not set the variable *and* pass `--profile`: Compose combines them, and both
+deployments would start and collide on port 8080.
+
+**3. Point at an image.** The compose file pulls
+`ghcr.io/golovanov-dev/alertloop:latest` and no longer builds from source. That
+image exists once v0.4.0 is tagged and the release workflow has run. To deploy
+before that — or to run your own build — build it and name it:
+
+```bash
+make docker VERSION=v0.4.0-rc
+echo 'ALERTLOOP_IMAGE=alertloop:v0.4.0-rc' >> .env
+```
+
+In production, pin `ALERTLOOP_IMAGE` to a version tag. `latest` moves under you
+on the next `docker compose pull`, which is the last thing you want from an
+alerting service.
+
+### Changed
+
+- **Closing an incident now notifies.** In 0.3.x the manual resolve action was
+  silent. It now sends a recovery notice to the channels that received the
+  alert, as does an ingested `status: resolved`. If you resolve events in bulk
+  from the console, expect one message per incident per channel that was
+  alerted. `notify_on_resolve: false` restores the old silence.
+- **One Compose file.** `docker-compose.yml` at the repository root now carries
+  both deployments as profiles — `demo` (all-in-one, SQLite) and `postgres`
+  (separate api and worker containers, PostgreSQL) — with an explicit project
+  `name: alertloop`. `deploy/docker/docker-compose.postgres.yml` is gone.
+  See "How to upgrade a Compose deployment" above: the profile selection and
+  the project name are both breaking for an existing install.
+- **The Compose file pulls the published image and builds nothing.** Running
+  AlertLoop with Docker no longer begins with cloning the repository. Set
+  `ALERTLOOP_IMAGE` to run a build of your own, and pin it to a version tag in
+  production.
+- **One example config.** `alertloop.example.yaml` serves the binary install and
+  both Compose profiles; it reads the database driver and DSN from the
+  environment with SQLite as the default. `deploy/docker/alertloop.yaml.example`
+  is gone.
+- **`alertloop.example.yaml` no longer has a fallback admin token.** It
+  references `${ALERTLOOP_ADMIN_TOKEN}` with no default, so an installation that
+  does not supply one stops at startup naming the variable, instead of running
+  on a placeholder published in this repository. **What to do:** set
+  `ALERTLOOP_ADMIN_TOKEN` — in `.env` under Compose, or in the
+  `EnvironmentFile` under systemd. `deploy/systemd/install.sh` now generates one
+  into `/etc/alertloop/alertloop.env` and the unit reads that file, so a fresh
+  systemd install needs nothing extra. A test asserts the example config refuses
+  to load without a token.
+
+### Fixed
+
+Everything below except the last two items was found by a pre-release audit of
+the whole repository on 2026-08-24, before 0.4.0 was tagged. Three of them were
+defects in the incident lifecycle this release introduces — they broke exactly
+the scenario the release exists for.
+
+- **Retention deleted incidents that were still firing.** An event's age was its
+  creation time, so once a repeated `firing` started moving `last_seen_at`
+  without moving `created_at`, the first incident retention deleted was the one
+  that had been burning longest — while it was still burning. Everything after
+  that went wrong quietly: the incident vanished from the API and the console
+  mid-outage, the eventual `status: resolved` found nothing to close and
+  notified nobody, and the next report opened a fresh incident and woke everyone
+  again. An event now ages from when it stopped mattering: `resolved_at` if it
+  is closed, `last_seen_at` if it is open. An incident reported a minute ago is
+  kept however old it is; one nobody has reported for the whole retention window
+  is swept. Behaviour for events that carry no `status` is unchanged, because
+  for them `last_seen_at` IS `created_at`.
+- **A delivery error containing non-Latin text could wedge a delivery forever
+  on PostgreSQL.** `last_error` was truncated by bytes, so a cut through a
+  multi-byte character produced invalid UTF-8. SQLite stored it; PostgreSQL
+  rejected the whole statement, which left the attempt in `sending`, and five
+  minutes later the reaper requeued it — and the same thing happened again,
+  indefinitely, re-sending to the recipient each time and never reaching
+  dead-letter. Telegram error descriptions and SMTP replies are routinely
+  non-ASCII. Truncation is now by runes everywhere text is stored or sent,
+  including email subjects.
+- **A late delivery result could overwrite a job already requeued.**
+  `MarkResult` now writes only while the attempt is still `sending`. A worker
+  whose save failed once would otherwise stamp a stale outcome over a row the
+  reaper had already returned to the queue.
+- **The `kind` column was missing or misplaced on the built-in pages.** The
+  0.4.0 notes said delivery kind was visible there; on `/deliveries` there was
+  no such column and no `?kind=` filter, and on the event page the header row
+  and the cells were in different orders, so the error text printed under
+  "Kind" and "alert"/"recovery" printed under "Last error". Both fixed, both now
+  covered by a test that compares header positions to cell positions.
+- **A repeated `firing` could be dropped entirely.** If the incident was
+  resolved in the narrow window between the deduplication lookup and the
+  refresh, the report — which says the problem is still happening — produced
+  nothing at all: no update, no new incident, no notification, until the next
+  check cycle. It now opens a new incident, which is what the source is
+  reporting.
+- **Resolving an incident could close the wrong one.** `ResolveByDedupe` closed
+  the open incident and then read it back in a second statement — but closing
+  frees the key, so a new `firing` arriving in between was returned instead. The
+  recovery notice would then have gone to that new incident's channels,
+  announcing the end of a problem that had just started, with a duration
+  computed from the wrong start time. The write and the read are now one
+  statement.
+- **Resolving a muted incident sent a recovery notice.** Mute means "stop
+  telling me about this"; the end of a story a channel was deliberately not told
+  the beginning of is not an exception to that.
+- **The startup warning about an open API cried wolf.** It fired whenever no API
+  keys were configured, but the API is only open when there is neither a key nor
+  an admin token — which is to say it warned about the default image
+  configuration and about every systemd install. An operator who learns to
+  ignore it will ignore the real one.
+- **The per-IP rate limiter did nothing behind a reverse proxy** — the
+  documented production setup. Every request arrived from the proxy's address,
+  so the whole internet shared one bucket: guessing at the admin token was
+  effectively unlimited, and a single noisy client could exhaust the bucket and
+  get every legitimate event source a 429. See `rate_limit.trusted_proxies`
+  under "Added", and the rate limiting now shipped in `deploy/proxy/nginx.conf`.
+- **API keys were compared with a plain map lookup**, while the admin token in
+  the same file used a constant-time comparison. Keys are now compared as
+  SHA-256 digests in constant time.
+- **`foreign_keys` was silently switched off on SQLite** for anyone who put a
+  `?` in their DSN — for instance to raise `busy_timeout`. The pragma string was
+  appended only when the DSN had no query at all, so tuning one setting dropped
+  the other, and with it `ON DELETE CASCADE`: deleting an event left its
+  delivery attempts behind to retry five times against an event that no longer
+  existed. Pragmas are now merged into whatever the DSN already carries, and
+  part of the storage suite runs against a real file rather than `:memory:`,
+  where foreign keys are off and this was invisible.
+- **The published image could come up with a completely open API.** With no
+  `ALERTLOOP_ADMIN_TOKEN` and no API keys, `docker run` gave an unauthenticated
+  service that could create, read, and modify events and replay deliveries.
+  0.4.0 makes the image the primary Docker path, so it now refuses to start and
+  explains what to set.
+- **The delivery queue moved two attempts at a time.** A tick claimed exactly
+  `Concurrency` rows and waited for all of them, so the semaphore bounded
+  nothing and one slow channel stalled everything behind it: with a 30-second
+  send timeout, the whole product delivered two notifications per half-minute
+  while a healthy Telegram sat idle. A tick now claims ten times the
+  concurrency and starts a new attempt as each slot frees, so a dead SMTP server
+  no longer delays alerts going somewhere that works.
+- **Retention monopolised SQLite's single connection.** The sweep looped without
+  pausing, so every API request and every delivery queued behind garbage
+  collection. It now yields between batches and stops on shutdown.
+- **`RunAll` could close the database during graceful shutdown.** It returned as
+  soon as either the server or the worker finished, and `main`'s deferred
+  `Close` then pulled the database out from under the HTTP server's ten-second
+  drain — failing exactly the requests graceful shutdown exists to protect.
+- **Emails had no `Date` or `Message-ID` header.** RFC 5322 requires both, and
+  Gmail and Microsoft 365 treat their absence as a spam signal. For a product
+  whose entire job is putting a notification in front of a person, the spam
+  folder is total failure — and it looks like "email is broken", not like a
+  missing header. `Auto-Submitted: auto-generated` was added too, so
+  out-of-office responders do not reply to alerts. An alert and its recovery get
+  distinct message ids; retries of the same notification reuse theirs.
+- **`alpine:3.20` in the runtime image** stopped receiving security updates in
+  spring 2026. Now 3.22 — which matters because 0.4.0 is the first release that
+  publishes an image rather than expecting a local build.
+- **`npm install` in the Dockerfile** was allowed to update the lock file, so
+  the published image could carry dependency versions CI never tested. Now
+  `npm ci`, as in CI.
+- **The release workflow would have published notes headed "unreleased".** The
+  guard compared only the version number, so a heading of
+  `## 0.4.0 - unreleased` matched. It now requires a dated heading.
+- **The `tee` in the cron wrapper could lose a failing job's output.** A process
+  substitution is not waited on, so the output could still be unflushed when the
+  alert was built - and the output is the most useful thing in that alert.
+  Found while writing the integration; never shipped.
+- **A resolved incident no longer blocks its own recurrence.** `dedupe_key` was
+  unique across every event in every state, so a service that failed, was fixed,
+  and failed again produced no second event — the second outage was silently
+  swallowed as a duplicate of the closed one. Uniqueness is now scoped to *open*
+  incidents. Present since 0.1.0.
+- **The migration runner no longer splits a statement on a semicolon inside a
+  comment or a string literal.** A `;` in an explanatory comment cut a migration
+  in half and handed the database the English prose as SQL, failing the upgrade
+  with a syntax error pointing at a comment. Migrations are the one thing that
+  runs against a customer's data on upgrade, so this is not a matter of how a
+  comment is punctuated. A chunk containing no SQL at all is no longer submitted
+  as a statement either.
+- **The manual `resolve` action records `resolved_at`**, exactly as an ingested
+  recovery does. The two paths would otherwise disagree about when the same
+  incident ended.
+
 ## 0.3.1 - 2026-08-22
 
 Fixes for defects found reviewing 0.3.0 right after it shipped. Two of them made
