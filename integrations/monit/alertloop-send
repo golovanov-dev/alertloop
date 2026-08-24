@@ -1,0 +1,413 @@
+#!/usr/bin/env bash
+#
+# alertloop-send - turn a Monit event into an AlertLoop incident report.
+#
+# Monit detects; AlertLoop receives, deduplicates, routes, and delivers. This
+# script is the seam between them and does nothing else: it validates its
+# arguments, builds one JSON document, POSTs it, and exits with a code that says
+# what happened.
+#
+#   alertloop-send --status firing --severity critical \
+#     --event-type service_unavailable --host server-01 --service postgresql \
+#     --dedupe-key server-01:postgresql:availability \
+#     --title "PostgreSQL unavailable" \
+#     --message "PostgreSQL does not respond on port 5432"
+#
+#   alertloop-send --status resolved --dedupe-key server-01:postgresql:availability
+#
+# The API key is read from /etc/alertloop/monit.env and is never passed as an
+# argument: process arguments are world-readable in /proc.
+#
+# Exit codes are documented in README.md and are part of this script's contract
+# with Monit and with cron wrappers.
+set -euo pipefail
+
+VERSION="0.4.0"
+CONFIG="${ALERTLOOP_CONFIG_FILE:-/etc/alertloop/monit.env}"
+
+# --- exit codes ------------------------------------------------------------
+EX_OK=0        # AlertLoop accepted the event
+EX_USAGE=2     # bad arguments or unusable configuration
+EX_PAYLOAD=3   # could not build the payload
+EX_HTTP4XX=4   # AlertLoop rejected the request (do not retry)
+EX_HTTP5XX=5   # AlertLoop failed (retried, still failing)
+EX_NETWORK=6   # could not reach AlertLoop
+EX_RETRIES=7   # retries exhausted
+EX_INTERNAL=8  # a bug in this script
+
+# --- defaults, overridable from the config file ----------------------------
+ALERTLOOP_URL=""
+ALERTLOOP_API_KEY=""
+ALERTLOOP_HOST=""
+ALERTLOOP_TIMEOUT_SECONDS=5
+ALERTLOOP_CONNECT_TIMEOUT_SECONDS=2
+ALERTLOOP_RETRY_COUNT=2
+ALERTLOOP_RETRY_DELAY_SECONDS=1
+ALERTLOOP_SOURCE="monit"
+
+# --- limits ----------------------------------------------------------------
+# Monit hands us whatever a check produced, including the entire output of a
+# failing program. Truncating here keeps one broken check from posting a
+# megabyte of text and being rejected by the rate limiter, or by AlertLoop's
+# 256 KB payload cap, which would lose the event entirely.
+MAX_TITLE=200
+MAX_MESSAGE=4000
+MAX_KEY=200
+MAX_LABEL_VALUE=200
+MAX_METADATA_VALUE=1000
+
+log() { printf 'level=%s integration=monit %s\n' "$1" "$2" >&2; }
+info() { log info "$1"; }
+err() { log error "$1"; }
+
+die() {
+  local code="$1"; shift
+  err "status=failed error=$*"
+  exit "$code"
+}
+
+usage() {
+  sed -n '3,20p' "$0" | sed 's/^# \{0,1\}//'
+  echo
+  echo "Run 'alertloop-send --help' for the full option list; see README.md for examples."
+}
+
+# --- argument parsing ------------------------------------------------------
+status="" severity="" event_type="" source="" host="" service=""
+dedupe_key="" title="" message="" occurred_at=""
+dry_run=0
+labels=() metadata=()
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --status)       status="${2-}"; shift 2 ;;
+    --severity)     severity="${2-}"; shift 2 ;;
+    --event-type)   event_type="${2-}"; shift 2 ;;
+    --source)       source="${2-}"; shift 2 ;;
+    --host)         host="${2-}"; shift 2 ;;
+    --service)      service="${2-}"; shift 2 ;;
+    --dedupe-key)   dedupe_key="${2-}"; shift 2 ;;
+    --title)        title="${2-}"; shift 2 ;;
+    --message)      message="${2-}"; shift 2 ;;
+    --occurred-at)  occurred_at="${2-}"; shift 2 ;;
+    --label)        labels+=("${2-}"); shift 2 ;;
+    --metadata)     metadata+=("${2-}"); shift 2 ;;
+    --config)       CONFIG="${2-}"; shift 2 ;;
+    --timeout)      ALERTLOOP_TIMEOUT_SECONDS="${2-}"; shift 2 ;;
+    --dry-run)      dry_run=1; shift ;;
+    --version)      echo "alertloop-send $VERSION"; exit 0 ;;
+    -h|--help)      usage; exit 0 ;;
+    --api-key|--api-key=*)
+      # Refused on purpose. A key on the command line is visible in /proc to
+      # every user on the host and lands in Monit's own logs.
+      die "$EX_USAGE" "api_key_on_command_line (put it in $CONFIG instead)" ;;
+    *) die "$EX_USAGE" "unknown_argument:$1" ;;
+  esac
+done
+
+# --- dependencies ----------------------------------------------------------
+command -v curl >/dev/null 2>&1 || die "$EX_USAGE" "missing_dependency:curl"
+command -v jq   >/dev/null 2>&1 || die "$EX_USAGE" "missing_dependency:jq"
+
+# --- configuration ---------------------------------------------------------
+if [ ! -f "$CONFIG" ]; then
+  die "$EX_USAGE" "config_not_found:$CONFIG"
+fi
+if [ ! -r "$CONFIG" ]; then
+  die "$EX_USAGE" "config_not_readable:$CONFIG (this script runs as the user Monit runs as)"
+fi
+
+# Warn, do not fail, on loose permissions: refusing to send an incident because
+# of a file mode would turn a hardening problem into an outage nobody hears
+# about. install.sh sets 0600.
+if [ -n "${ALERTLOOP_SKIP_PERM_CHECK:-}" ]; then
+  :
+elif command -v stat >/dev/null 2>&1; then
+  mode="$(stat -c '%a' "$CONFIG" 2>/dev/null || stat -f '%Lp' "$CONFIG" 2>/dev/null || echo '')"
+  case "$mode" in
+    ''|600|400) ;;
+    *) err "status=warning config_mode=$mode (expected 600; it holds an API key)" ;;
+  esac
+fi
+
+# The config file is `KEY=value` lines. Sourcing it means a stray command in it
+# would run as whoever Monit runs as, so parse instead: only known keys, only
+# scalar values.
+while IFS= read -r line || [ -n "$line" ]; do
+  case "$line" in ''|'#'*) continue ;; esac
+  key="${line%%=*}"
+  value="${line#*=}"
+  [ "$key" = "$line" ] && continue          # no '=' on the line
+  key="$(printf '%s' "$key" | tr -d '[:space:]')"
+  # Strip one layer of surrounding quotes, if present.
+  case "$value" in
+    \"*\") value="${value#\"}"; value="${value%\"}" ;;
+    \'*\') value="${value#\'}"; value="${value%\'}" ;;
+  esac
+  case "$key" in
+    ALERTLOOP_URL|ALERTLOOP_API_KEY|ALERTLOOP_HOST|ALERTLOOP_SOURCE|\
+    ALERTLOOP_TIMEOUT_SECONDS|ALERTLOOP_CONNECT_TIMEOUT_SECONDS|\
+    ALERTLOOP_RETRY_COUNT|ALERTLOOP_RETRY_DELAY_SECONDS)
+      printf -v "$key" '%s' "$value" ;;
+    *) ;;                                    # unknown keys ignored on purpose
+  esac
+done < "$CONFIG"
+
+[ -n "$ALERTLOOP_URL" ] || die "$EX_USAGE" "config_missing:ALERTLOOP_URL"
+[ -n "$ALERTLOOP_API_KEY" ] || die "$EX_USAGE" "config_missing:ALERTLOOP_API_KEY"
+
+# HTTPS is required for anything that is not this machine. The API key travels
+# in a header on every request; over plain HTTP to another host it is on the
+# wire in clear text. There is no flag to disable this and no --insecure.
+case "$ALERTLOOP_URL" in
+  https://*) ;;
+  http://127.0.0.1*|http://localhost*|http://[::1]*|http://0.0.0.0*) ;;
+  http://*) die "$EX_USAGE" "insecure_url (plain HTTP is allowed only to localhost; use https:// for a remote AlertLoop)" ;;
+  *) die "$EX_USAGE" "bad_url:$ALERTLOOP_URL (expected http:// or https://)" ;;
+esac
+
+for n in ALERTLOOP_TIMEOUT_SECONDS ALERTLOOP_CONNECT_TIMEOUT_SECONDS ALERTLOOP_RETRY_COUNT ALERTLOOP_RETRY_DELAY_SECONDS; do
+  case "${!n}" in
+    ''|*[!0-9]*) die "$EX_USAGE" "config_not_a_number:$n=${!n}" ;;
+  esac
+done
+
+# --- normalisation and validation -----------------------------------------
+# Everything this script emits is ASCII on purpose. A shell tool runs under
+# whatever locale the host happens to have and pipes through `tr`, which is
+# byte-oriented: a multi-byte character in a literal here is one `LC_ALL=C` away
+# from arriving as mojibake in somebody's alert. Text the CALLER supplies is
+# passed through untouched, so a check message in Russian or German still reads
+# correctly.
+truncate_to() {
+  local value="$1" limit="$2"
+  if [ "${#value}" -le "$limit" ]; then
+    printf '%s' "$value"
+  else
+    printf '%s...' "${value:0:$limit}"
+  fi
+}
+
+# Identifiers end up in a dedupe_key and in labels, where a stray newline or
+# control character would make one logical check look like several.
+sanitize_id() {
+  printf '%s' "$1" | tr -d '\000-\037' | tr -c 'A-Za-z0-9._:@/-' '-'
+}
+
+# Free text keeps its newlines (a Monit check's output is worth reading) but
+# loses the other control characters.
+sanitize_text() {
+  printf '%s' "$1" | tr -d '\000-\010\013\014\016-\037'
+}
+
+[ -n "$status" ] || die "$EX_USAGE" "missing_argument:--status"
+case "$status" in
+  firing|resolved) ;;
+  *) die "$EX_USAGE" "invalid_status:$status (expected firing or resolved)" ;;
+esac
+
+host="${host:-$ALERTLOOP_HOST}"
+host="${host:-$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo unknown)}"
+host="$(sanitize_id "$host")"
+service="$(sanitize_id "$service")"
+
+dedupe_key="$(sanitize_id "$dedupe_key")"
+[ -n "$dedupe_key" ] || die "$EX_USAGE" "missing_argument:--dedupe-key (it identifies the incident; without it every report is a new one)"
+dedupe_key="$(truncate_to "$dedupe_key" "$MAX_KEY")"
+
+# A recovery identifies an incident to close. It carries no event fields, and
+# demanding them would mean every Monit `unmonitor`/`recovery` line had to
+# repeat what the alert already said.
+if [ "$status" = "resolved" ]; then
+  payload="$(jq -nc --arg key "$dedupe_key" '{status:"resolved", dedupe_key:$key}')" \
+    || die "$EX_PAYLOAD" "payload_build_failed"
+else
+  severity="${severity:-critical}"
+  case "$severity" in
+    info|warning|critical) ;;
+    # AlertLoop also accepts success and error; Monit only ever means one of
+    # these three, and mapping the rest here keeps the examples honest.
+    error) severity="critical" ;;
+    warn) severity="warning" ;;
+    *) die "$EX_USAGE" "invalid_severity:$severity (expected info, warning or critical)" ;;
+  esac
+
+  [ -n "$title" ] || die "$EX_USAGE" "missing_argument:--title"
+  [ -n "$message" ] || die "$EX_USAGE" "missing_argument:--message"
+
+  event_type="$(sanitize_id "${event_type:-monit_check}")"
+  source="$(sanitize_id "${source:-$ALERTLOOP_SOURCE}")"
+  title="$(truncate_to "$(sanitize_text "$title")" "$MAX_TITLE")"
+  message="$(truncate_to "$(sanitize_text "$message")" "$MAX_MESSAGE")"
+
+  if [ -n "$occurred_at" ]; then
+    case "$occurred_at" in
+      [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*) ;;
+      *) die "$EX_USAGE" "invalid_occurred_at:$occurred_at (expected RFC3339, e.g. 2026-08-22T09:00:00Z)" ;;
+    esac
+  else
+    occurred_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  fi
+
+  # Labels and metadata both start from the check's identity, then take
+  # whatever the caller added. jq builds the object, so a value containing a
+  # quote, a brace, or a newline cannot break out of the JSON.
+  label_args=(--arg host "$host" --arg monitor "monit")
+  label_obj='{host:$host, monitor:$monitor}'
+  if [ -n "$service" ]; then
+    label_args+=(--arg service "$service")
+    label_obj="${label_obj%\}}, service:\$service}"
+  fi
+
+  extra_labels='{}'
+  i=0
+  # Length-guarded rather than the ${arr+"${arr[@]}"} idiom: that expansion is
+  # unquoted, so a label value with a space in it would be split into two
+  # arguments and silently lose half of itself.
+  for kv in ${labels[@]+"${labels[@]}"}; do
+    case "$kv" in
+      *=*) ;;
+      *) die "$EX_USAGE" "invalid_label:$kv (expected key=value)" ;;
+    esac
+    k="$(sanitize_id "${kv%%=*}")"
+    v="$(truncate_to "$(sanitize_text "${kv#*=}")" "$MAX_LABEL_VALUE")"
+    [ -n "$k" ] || die "$EX_USAGE" "invalid_label:$kv (empty key)"
+    extra_labels="$(printf '%s' "$extra_labels" | jq -c --arg k "$k" --arg v "$v" '. + {($k): $v}')" \
+      || die "$EX_PAYLOAD" "payload_build_failed:label"
+    i=$((i + 1))
+    [ "$i" -le 20 ] || die "$EX_USAGE" "too_many_labels (max 20)"
+  done
+
+  extra_metadata='{}'
+  i=0
+  for kv in ${metadata[@]+"${metadata[@]}"}; do
+    case "$kv" in
+      *=*) ;;
+      *) die "$EX_USAGE" "invalid_metadata:$kv (expected key=value)" ;;
+    esac
+    k="$(sanitize_id "${kv%%=*}")"
+    v="$(truncate_to "$(sanitize_text "${kv#*=}")" "$MAX_METADATA_VALUE")"
+    [ -n "$k" ] || die "$EX_USAGE" "invalid_metadata:$kv (empty key)"
+    extra_metadata="$(printf '%s' "$extra_metadata" | jq -c --arg k "$k" --arg v "$v" '. + {($k): $v}')" \
+      || die "$EX_PAYLOAD" "payload_build_failed:metadata"
+    i=$((i + 1))
+    [ "$i" -le 20 ] || die "$EX_USAGE" "too_many_metadata (max 20)"
+  done
+
+  # AlertLoop's event model: `type` is the family (incident), the specific check
+  # kind travels as `category`, and everything Monit gave us goes in `payload`.
+  # The adapter does the mapping so AlertLoop does not grow a field per
+  # monitoring tool.
+  payload="$(jq -nc \
+    "${label_args[@]}" \
+    --arg status "firing" \
+    --arg severity "$severity" \
+    --arg source "$source" \
+    --arg category "$event_type" \
+    --arg title "$title" \
+    --arg message "$message" \
+    --arg key "$dedupe_key" \
+    --arg occurred_at "$occurred_at" \
+    --argjson extra_labels "$extra_labels" \
+    --argjson extra_metadata "$extra_metadata" \
+    '{
+       status: $status,
+       type: "incident",
+       severity: $severity,
+       source: $source,
+       category: $category,
+       message: (if $title == $message then $message else $title + ": " + $message end),
+       dedupe_key: $key,
+       payload: ({
+         title: $title,
+         detail: $message,
+         occurred_at: $occurred_at,
+         labels: ('"$label_obj"' + $extra_labels)
+       } + $extra_metadata)
+     }')" || die "$EX_PAYLOAD" "payload_build_failed"
+fi
+
+if [ "$dry_run" -eq 1 ]; then
+  # The payload never contains the API key, so printing it is safe. This is the
+  # documented way to check a Monit rule before wiring it up for real.
+  printf '%s\n' "$payload" | jq .
+  info "status=dry-run dedupe_key=$dedupe_key event_status=$status"
+  exit "$EX_OK"
+fi
+
+# --- send ------------------------------------------------------------------
+url="${ALERTLOOP_URL%/}/v1/events"
+attempt=0
+last_reason="unknown"
+
+while :; do
+  attempt=$((attempt + 1))
+
+  # The key goes in via @- on stdin rather than as an argument, so it never
+  # appears in /proc/<pid>/cmdline. Response body and status code are captured
+  # together; the body is only used for diagnostics and is truncated.
+  set +e
+  response="$(printf 'X-API-Key: %s' "$ALERTLOOP_API_KEY" | curl \
+    --silent --show-error \
+    --connect-timeout "$ALERTLOOP_CONNECT_TIMEOUT_SECONDS" \
+    --max-time "$ALERTLOOP_TIMEOUT_SECONDS" \
+    --header @- \
+    --header 'Content-Type: application/json' \
+    --header "User-Agent: alertloop-send/$VERSION" \
+    --data-binary "$payload" \
+    --write-out '\n%{http_code}' \
+    --output - \
+    "$url" 2>&1)"
+  curl_rc=$?
+  set -e
+
+  http_code="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+
+  if [ "$curl_rc" -ne 0 ]; then
+    last_reason="network_error:rc=$curl_rc"
+    case "$curl_rc" in
+      28) last_reason="timeout" ;;
+      7)  last_reason="connection_refused" ;;
+      6)  last_reason="dns_failure" ;;
+      35|60) last_reason="tls_error" ;;
+    esac
+  else
+    case "$http_code" in
+      2*)
+        info "status=sent dedupe_key=$dedupe_key event_status=$status http_status=$http_code attempt=$attempt"
+        exit "$EX_OK"
+        ;;
+      429|5*)
+        last_reason="http_$http_code"
+        ;;
+      4*)
+        # A 4xx is this script's fault, or the key's. Retrying cannot fix it and
+        # only multiplies the noise.
+        err "status=failed dedupe_key=$dedupe_key http_status=$http_code error=client_error body=$(truncate_to "$(sanitize_text "$body")" 300)"
+        exit "$EX_HTTP4XX"
+        ;;
+      *)
+        last_reason="unexpected_http_$http_code"
+        ;;
+    esac
+  fi
+
+  if [ "$attempt" -gt "$ALERTLOOP_RETRY_COUNT" ]; then
+    break
+  fi
+  err "status=retrying dedupe_key=$dedupe_key attempt=$attempt error=$last_reason"
+  sleep "$ALERTLOOP_RETRY_DELAY_SECONDS"
+done
+
+err "status=failed dedupe_key=$dedupe_key event_status=$status attempts=$attempt error=$last_reason"
+case "$last_reason" in
+  http_5*|http_429|unexpected_http_*) exit "$EX_HTTP5XX" ;;
+  timeout|connection_refused|dns_failure|tls_error|network_error:*)
+    # Distinguish "never reached it once" from "reached it and it kept failing":
+    # the first is a network problem on this host, the second is AlertLoop's.
+    [ "$attempt" -gt 1 ] && exit "$EX_RETRIES"
+    exit "$EX_NETWORK"
+    ;;
+  *) exit "$EX_INTERNAL" ;;
+esac

@@ -14,8 +14,11 @@ coverage
 # Real config with secrets must never enter the build context (only the binary
 # is copied to the final image, but keep it out of the build stage regardless).
 alertloop.yaml
-deploy/docker/alertloop.yaml
 docs
+# The Monit integration runs on the HOST, never inside this container. Keeping
+# it out of the build context also keeps it out of any layer that might
+# accidentally copy it in.
+integrations
 web/admin/node_modules
 web/admin/out
 .ai

@@ -1,0 +1,49 @@
+# AlertLoop next to Monit, on the machine Monit watches.
+#
+# This is a REFERENCE for the integration, not the project's main Compose file.
+# The one you deploy from is docker-compose.yml in the repository root; this one
+# shows the two things this integration cares about.
+#
+# 1. AlertLoop's port is published to 127.0.0.1 ONLY.
+#
+#    Monit runs on the host, so the loopback address is all it needs, and a
+#    published Docker port is NOT filtered by ufw or firewalld: Docker writes
+#    its own iptables rules in a chain that bypasses them. Binding 0.0.0.0 here
+#    would put the admin console on the internet while `ufw status` still said
+#    the port was denied.
+#
+# 2. Monit is NOT in this file, and must not be.
+#
+#    It runs on the host, outside Docker, because it has to see host processes,
+#    systemd units, real filesystems, and the memory and load figures of the
+#    machine rather than of a container. It also has to be able to notice that
+#    Docker itself has died - which it cannot do from inside Docker.
+name: alertloop
+
+services:
+  alertloop:
+    image: ghcr.io/golovanov-dev/alertloop:latest
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      ALERTLOOP_ADMIN_TOKEN: ${ALERTLOOP_ADMIN_TOKEN:-}
+    volumes:
+      # Contains the ingest API key Monit uses. Keep it out of version control.
+      - ./alertloop.yaml:/etc/alertloop/alertloop.yaml:ro
+      - alertloop-data:/data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health/ready"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+
+volumes:
+  alertloop-data:

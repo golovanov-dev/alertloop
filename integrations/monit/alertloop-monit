@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+#
+# alertloop-monit - the glue between a Monit rule and alertloop-send.
+#
+# Why this exists: Monit's `exec` takes one string and splits it on whitespace,
+# so passing a human-readable title through it means escaping quotes inside
+# quotes inside a config file. Instead Monit already exports what happened as
+# environment variables, and this script reads them. A rule stays readable:
+#
+#   if failed port 5432 for 3 cycles
+#     then exec "/usr/local/bin/alertloop-monit firing critical availability"
+#     else if succeeded
+#       then exec "/usr/local/bin/alertloop-monit resolved availability"
+#
+# Usage:
+#   alertloop-monit <firing|resolved> [severity] [check]
+#   alertloop-monit resolved [check]
+#
+#   severity  info | warning | critical            (default: critical)
+#   check     the aspect being checked, e.g. availability, memory, usage,
+#             heartbeat, freshness. It is the last segment of the dedupe_key,
+#             which is what keeps "postgresql is down" and "postgresql is using
+#             too much memory" as two separate incidents for the same service.
+#             (default: status)
+#
+# Monit supplies, and this script uses:
+#   MONIT_SERVICE      the name of the checked service
+#   MONIT_HOST         the host Monit runs on
+#   MONIT_EVENT        what happened, e.g. "Connection failed"
+#   MONIT_DESCRIPTION  the detail line, e.g. "failed protocol test [PGSQL]"
+#   MONIT_DATE         when
+set -euo pipefail
+
+SEND="${ALERTLOOP_SEND:-/usr/local/bin/alertloop-send}"
+
+status="${1:-}"
+case "$status" in
+  firing)
+    severity="${2:-critical}"
+    check="${3:-status}"
+    ;;
+  resolved)
+    # `resolved` takes no severity: a recovery closes the incident whatever
+    # severity opened it. Accept both spellings so a rule can pass the same
+    # three arguments as its firing counterpart without surprising anyone.
+    if [ "${2:-}" = "info" ] || [ "${2:-}" = "warning" ] || [ "${2:-}" = "critical" ]; then
+      check="${3:-status}"
+    else
+      check="${2:-status}"
+    fi
+    severity=""
+    ;;
+  *)
+    echo "usage: alertloop-monit <firing|resolved> [severity] [check]" >&2
+    exit 2
+    ;;
+esac
+
+service="${MONIT_SERVICE:-unknown}"
+host="${ALERTLOOP_HOST_OVERRIDE:-${MONIT_HOST:-}}"
+
+# Identifiers only: a service name with a space or a slash in it would otherwise
+# split the dedupe_key into something unstable.
+sanitize() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '-' | tr -s '-'; }
+service_id="$(sanitize "$service")"
+check_id="$(sanitize "$check")"
+
+if [ -z "$host" ]; then
+  host="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo unknown)"
+fi
+host_id="$(sanitize "$host")"
+
+# The identity of one logical check. Stable across cycles by construction: it
+# contains no timestamp, no measured value, and none of Monit's message text.
+dedupe_key="${host_id}:${service_id}:${check_id}"
+
+if [ "$status" = "resolved" ]; then
+  exec "$SEND" --status resolved --dedupe-key "$dedupe_key"
+fi
+
+event="${MONIT_EVENT:-check failed}"
+description="${MONIT_DESCRIPTION:-$event}"
+
+# event_type is what kind of problem this is, and it becomes the event's
+# category in AlertLoop - which routing rules can match on.
+case "$check_id" in
+  availability|status)        event_type="service_unavailable" ;;
+  heartbeat|freshness)        event_type="stale_heartbeat" ;;
+  usage|inode|memory|swap|cpu|load) event_type="resource_limit" ;;
+  exit-code|exitcode)         event_type="job_failed" ;;
+  *)                          event_type="monit_${check_id}" ;;
+esac
+
+exec "$SEND" \
+  --status firing \
+  --severity "$severity" \
+  --event-type "$event_type" \
+  --host "$host_id" \
+  --service "$service_id" \
+  --dedupe-key "$dedupe_key" \
+  --title "${service}: ${event}" \
+  --message "$description" \
+  --metadata "monit_event=${event}" \
+  --metadata "monit_date=${MONIT_DATE:-}"
