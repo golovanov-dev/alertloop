@@ -231,6 +231,41 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # First, because everything after it depends on being able to RUN these.
+      #
+      # 0.4.1 shipped every one of them non-executable: they were authored on a
+      # machine with core.filemode=false, where `chmod +x` never reaches git's
+      # index, so the mode stayed 100644 and a Linux checkout produced
+      # "Permission denied" - 74 test failures with one cause. The mode is
+      # checked here rather than on disk, because git's recorded mode is what a
+      # clone actually gets, and it is verifiable from any platform.
+      - name: The shipped scripts are executable
+        run: |
+          expected="integrations/monit/alertloop-send
+          integrations/monit/alertloop-monit
+          integrations/monit/install.sh
+          integrations/monit/uninstall.sh
+          integrations/monit/examples/check-worker-heartbeat.sh
+          integrations/monit/examples/cron-wrapper.sh
+          integrations/monit/test/run-tests.sh
+          scripts/upgrade-test.sh
+          scripts/build-release.sh
+          docker-entrypoint.sh"
+          bad=0
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            mode="$(git ls-files -s -- "$f" | awk '{print $1}')"
+            if [ "$mode" != "100755" ]; then
+              echo "::error file=$f::mode is ${mode:-missing}, expected 100755 (git update-index --chmod=+x $f)"
+              bad=1
+            elif [ ! -x "$f" ]; then
+              echo "::error file=$f::not executable in the checkout"
+              bad=1
+            fi
+          done <<< "$expected"
+          [ "$bad" -eq 0 ] || exit 1
+          echo "every shipped script is executable"
+
       - name: Install shellcheck
         run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck jq
 

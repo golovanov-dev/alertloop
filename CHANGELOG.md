@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.4.2 - 2026-08-24
+
+One fix: the integration's scripts were shipped without the executable bit.
+Nothing else changed. If you installed 0.4.1 through `install.sh` it already
+set the mode on copy, so a working installation stays working; this matters if
+you run anything from the repository checkout.
+
+### Fixed
+
+- **`integrations/monit/*` and `scripts/*` were committed as non-executable.**
+  They were authored on a machine with `core.filemode=false`, where `chmod +x`
+  never reaches git's index, so the recorded mode stayed `100644` and a Linux
+  checkout produced `Permission denied` for every one of them. In practice:
+  `sudo ./install.sh` failed, and so did running `alertloop-send` from a clone.
+  CI now asserts the recorded mode rather than the mode on disk, because git's
+  mode is what a clone actually gets and it is checkable from any platform.
+
 ## 0.4.1 - 2026-08-24
 
 Fixes found by CI on the 0.4.0 tag, plus the dependency vulnerability those
