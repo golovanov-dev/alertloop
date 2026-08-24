@@ -4,6 +4,12 @@
 # Point the binary at it:  alertloop --config alertloop.yaml all
 # (or set ALERTLOOP_CONFIG=/path/to/alertloop.yaml).
 #
+# It is also the ONLY example: the same file serves the binary install and both
+# Compose profiles. The database section reads its driver and DSN from the
+# environment with SQLite as the default, which is what lets the postgres
+# profile point it at PostgreSQL without a second, divergent copy of this
+# file to keep in sync.
+#
 # The environment is not a second place to configure AlertLoop — it only keeps
 # secrets out of this file. A value written as exactly ${VAR} or ${VAR:-default}
 # is replaced from the environment at startup:
@@ -23,9 +29,19 @@
 addr: ":8080"
 
 # Admin token protects the events web page and the admin console at /admin, and
-# grants FULL API access (it is the admin console credential). CHANGE THIS —
-# and prefer keeping it out of the file entirely, as shown here.
-admin_token: ${ALERTLOOP_ADMIN_TOKEN:-change-me-admin-token}
+# grants FULL API access (it is the admin console credential).
+#
+# There is deliberately NO fallback here. A reference with no default stops
+# startup when the variable is unset, naming what is missing — which is the only
+# safe behaviour for the credential that opens the whole API. An installation
+# silently running on a placeholder published in this repository is worse than
+# one that refuses to start, and that is not hypothetical: 0.3.0 shipped exactly
+# that and it was fixed in 0.3.1.
+#
+#   export ALERTLOOP_ADMIN_TOKEN="$(openssl rand -hex 32)"
+#
+# Under systemd put it in an EnvironmentFile; under Compose put it in .env.
+admin_token: ${ALERTLOOP_ADMIN_TOKEN}
 
 # API keys for services calling the JSON API. Each key has a scope:
 #   ingest - may only create events (POST /v1/events)   → for event sources
@@ -43,6 +59,20 @@ api_keys:
 # by the worker. No upper bound.
 retention_days: 30
 
+# When an incident closes, tell the channels that were told about it.
+#
+# Applies both to an ingested `status: resolved` and to the manual resolve
+# action in the console. The notice goes ONLY to the channels that received the
+# alert — resolving is not re-routed, and a channel whose alert dead-lettered is
+# skipped, because it never learned there was a problem. Repeating a recovery
+# does not notify twice.
+#
+# On by default: an alerting service that says the database is down and never
+# says it came back leaves you to guess. Set it to false if your channel is a
+# ticketing webhook that opens an issue per message — such a receiver should
+# read the `kind` field ("alert" or "recovery") in the webhook body instead.
+notify_on_resolve: true
+
 # Logging. Output goes to stdout by default; set `file` to also persist logs to
 # disk so external tools (tail, Loki, Vector, journald) can read them.
 log:
@@ -50,14 +80,37 @@ log:
   format: "text"    # text (human-readable) | json (for log processors)
   file: ""          # empty = stdout; e.g. "/var/log/alertloop/alertloop.log"
 
-# In-process rate limiting. If you run behind a reverse proxy that already rate
-# limits, you may set enabled: false and limit there instead.
+# In-process rate limiting.
 rate_limit:
   enabled: true
   per_ip_per_second: 20    # requests per second per client IP
   per_ip_burst: 40
   ingest_per_second: 100   # overall event ingestion cap for the process
   ingest_burst: 200
+
+  # IF YOU RUN BEHIND A REVERSE PROXY, SET THIS.
+  #
+  # Otherwise every request reaches AlertLoop from the proxy's address, the
+  # per-IP limiter sees exactly one client, and the whole internet shares a
+  # single bucket. Two things follow, and both are worse than having no limiter
+  # at all — because the documentation says there is one:
+  #
+  #   * guessing at the admin token is effectively unlimited;
+  #   * one noisy client empties the shared bucket and every legitimate event
+  #     source starts getting 429.
+  #
+  # List the addresses of proxies you actually run. Their X-Forwarded-For is
+  # then believed, and only theirs: the header is trivially forged by anyone
+  # talking to AlertLoop directly, so trusting it unconditionally would be
+  # worse still — every request would look like a new client and the limiter
+  # would never fire.
+  #
+  # trusted_proxies:
+  #   - "127.0.0.1"          # nginx or Caddy on this host
+  #   - "10.0.0.0/8"         # a load balancer range
+  #
+  # Also add rate limiting at the proxy itself; deploy/proxy/nginx.conf ships
+  # with it configured. The two are complementary, not alternatives.
 
 # The admin console is served by this API at /admin (same origin — no CORS
 # needed). Only set cors_origins if you build your OWN browser app on a
@@ -68,7 +121,10 @@ rate_limit:
 
 database:
   # "sqlite" (local/demo) or "postgres" (production). Inferred from dsn if empty.
-  driver: "sqlite"
+  # Written as a reference so the Compose postgres profile can select the driver
+  # without editing this file; hard-code "postgres" instead if you prefer the
+  # file to be self-contained.
+  driver: ${ALERTLOOP_DB_DRIVER:-sqlite}
   # SQLite: a file path or ":memory:".
   # PostgreSQL: e.g. "postgres://user:pass@host:5432/alertloop?sslmode=disable".
   # A DSN carries a password, so it is a good candidate for ${VAR} too.

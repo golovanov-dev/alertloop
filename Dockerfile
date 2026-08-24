@@ -2,8 +2,12 @@
 # of what is checked in.
 FROM node:22-alpine AS ui
 WORKDIR /ui
-COPY web/admin/package.json web/admin/package-lock.json* ./
-RUN npm install --no-audit --no-fund
+COPY web/admin/package.json web/admin/package-lock.json ./
+# `npm ci`, not `npm install`. install is allowed to update the lock file, so
+# the published image could contain dependency versions CI never tested - and
+# CI uses `npm ci`. For a build that goes straight to users that is a break in
+# the supply chain, and it fails silently.
+RUN npm ci --no-audit --no-fund
 COPY web/admin/ ./
 # Vite's outDir points at ../../internal/adminui/dist; recreate that layout so
 # the build lands where the Go stage expects to embed it.
@@ -26,7 +30,18 @@ RUN CGO_ENABLED=0 go build -trimpath \
     -o /out/alertloop ./cmd/alertloop
 
 # Runtime stage: minimal image with CA certs for outbound TLS (SMTP/Telegram).
-FROM alpine:3.20
+#
+# 3.22, not 3.20. Alpine supports a branch for two years, and 3.20 (May 2024)
+# stopped receiving security updates in spring 2026 - which stopped being a
+# theoretical problem the moment 0.4.0 made the published image the primary
+# Docker path instead of a local build. Whatever has been found in busybox,
+# musl, or ca-certificates since then would ship to every user.
+#
+# Track the current stable branch and rebuild on release; that is what actually
+# keeps this current. Pin by digest if your policy requires reproducible bases -
+# it is deliberately not pinned here, because a digest nobody updates is how an
+# image quietly ages past its support window all over again.
+FROM alpine:3.22
 RUN apk add --no-cache ca-certificates tzdata && \
     adduser -D -u 10001 alertloop && \
     mkdir -p /data && chown alertloop:alertloop /data
@@ -38,13 +53,26 @@ COPY --from=build /out/alertloop /usr/local/bin/alertloop
 # fills the ${VAR} references in it, which is how the admin token gets in
 # without being baked into the image. Mount your own file over this path — or
 # point ALERTLOOP_CONFIG elsewhere — to replace it entirely.
+#
+# ${ALERTLOOP_ADMIN_TOKEN} carries NO default. With an empty token and no API
+# keys the API accepts everything with full scope, so `docker run` with no
+# environment used to hand out an unauthenticated service that can create,
+# read, and modify events and replay deliveries. Now it refuses to start and
+# names the variable. The entrypoint below turns that into an instruction
+# rather than a stack trace.
 RUN mkdir -p /etc/alertloop && { \
       echo '# Default configuration shipped inside the AlertLoop image.'; \
-      echo 'admin_token: ${ALERTLOOP_ADMIN_TOKEN:-}'; \
+      echo 'admin_token: ${ALERTLOOP_ADMIN_TOKEN}'; \
       echo 'database:'; \
       echo '  driver: sqlite'; \
       echo '  dsn: /data/alertloop.db'; \
     } > /etc/alertloop/alertloop.yaml
+
+# A first-run check that explains itself. Without it the failure is a config
+# error about an unset variable, which is correct but tells a newcomer nothing
+# about what to do.
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
 
 USER alertloop
 EXPOSE 8080
@@ -52,7 +80,7 @@ ENV ALERTLOOP_CONFIG=/etc/alertloop/alertloop.yaml
 VOLUME ["/data"]
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s \
-    CMD wget -qO- http://127.0.0.1:8080/health || exit 1
+    CMD wget -qO- http://127.0.0.1:8080/health/ready || exit 1
 
-ENTRYPOINT ["alertloop"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["all"]

@@ -9,8 +9,11 @@ Type=simple
 User=alertloop
 Group=alertloop
 # Everything is configured in the YAML file. Secrets stay out of it by writing
-# ${VAR} in the file and supplying the variables from an EnvironmentFile:
-#EnvironmentFile=/etc/alertloop/alertloop.env
+# ${VAR} in the file and supplying the variables from here. install.sh creates
+# this file with a generated admin token; the leading "-" makes it optional so a
+# missing file produces AlertLoop's own message naming the variable that is
+# missing, rather than a systemd error about a file.
+EnvironmentFile=-/etc/alertloop/alertloop.env
 ExecStart=/usr/local/bin/alertloop --config /etc/alertloop/alertloop.yaml all
 Restart=on-failure
 RestartSec=5s
@@ -19,12 +22,49 @@ RestartSec=5s
 StateDirectory=alertloop
 WorkingDirectory=/var/lib/alertloop
 
-# Hardening.
+# Hardening. The container runs with no capabilities, a read-only root, and no
+# privilege escalation; a binary install had none of that, so the same service
+# was materially less contained depending on how it was installed.
+#
+# AlertLoop binds 8080, writes to /var/lib/alertloop, and makes outbound TCP to
+# SMTP, Telegram, and webhooks. Everything else is denied.
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 ReadWritePaths=/var/lib/alertloop
+
+# No device access, no kernel tuning, no module loading, no cgroup writes.
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+
+# It needs no capabilities at all: port 8080 is unprivileged and the data
+# directory is owned by the service user.
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+# IPv4, IPv6, and Unix sockets. AF_NETLINK and the rest are not used.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# The syscall set a network service needs, minus anything privileged.
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete
+SystemCallArchitectures=native
+
+# Only the service user's own account data is visible.
+PrivateUsers=false
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target

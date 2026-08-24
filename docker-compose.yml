@@ -1,46 +1,154 @@
-# AlertLoop demo profile: single all-in-one container backed by SQLite.
-# Quick start:  docker compose up -d
-# Then open http://localhost:8080/admin (admin console — sign in with the admin
-# token), http://localhost:8080/swagger, and http://localhost:8080/events.
+# AlertLoop — the one Compose file.
 #
-# This demo stores events and serves the API/UI without any delivery channels.
-# To actually send notifications, mount a config file with a `channels:` section
-# (see alertloop.example.yaml) and add:  command: ["--config", "/etc/alertloop/alertloop.yaml", "all"]
-# plus a volume  ./alertloop.yaml:/etc/alertloop/alertloop.yaml:ro
+# Two profiles live here so they cannot drift apart the way two separate files
+# did:
+#
+#   demo      one all-in-one container on SQLite. Loopback only, no setup.
+#   postgres  separate api and worker containers on PostgreSQL. Production.
+#
+# Pick exactly one. Both publish port 8080, so running them together fails.
+#
+#   cp .env.example .env      # COMPOSE_PROFILES=demo is preset there
+#   docker compose up -d
+#
+# For production, EDIT that line to COMPOSE_PROFILES=postgres and run the same
+# command. Do NOT set the variable and pass --profile as well: Compose COMBINES
+# them, so `COMPOSE_PROFILES=demo docker compose --profile postgres up` starts
+# both and collides on the port. With no .env at all, `--profile <name>` on its
+# own is the way to select one.
+#
+# The postgres profile needs two things first:
+#   1. cp alertloop.example.yaml alertloop.yaml   and edit it. Create the file
+#      BEFORE starting: a bind mount whose source is missing gets a directory
+#      created in its place, and AlertLoop then fails on "is a directory".
+#   2. set ALERTLOOP_ADMIN_TOKEN in .env          (openssl rand -hex 32)
+# It refuses to start without the token rather than running on a placeholder
+# published in this repository.
+#
+# Images are pulled from GHCR; nothing is built from this file. To run a build
+# of your own:  make docker  then  ALERTLOOP_IMAGE=alertloop:$(git describe) …
+
+name: alertloop
+
+# The published image. Pinning a version instead of `latest` is the right thing
+# to do in production — `latest` moves under you on the next `docker compose
+# pull`, which is precisely what you do not want from an alerting service.
+x-image: &image ${ALERTLOOP_IMAGE:-ghcr.io/golovanov-dev/alertloop:latest}
+
+# Hardening shared by every AlertLoop container: no privilege escalation, no
+# Linux capabilities (it binds 8080 and writes only to its volume), a read-only
+# root filesystem, and a writable tmpfs for scratch files.
+x-hardening: &hardening
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  read_only: true
+  tmpfs:
+    - /tmp
+  restart: unless-stopped
+
 services:
+  # --- demo profile ------------------------------------------------------
+  # Stores events and serves the API, the admin console, and Swagger. It
+  # delivers nothing until channels are configured: mount your own config with
+  #   volumes: ["./alertloop.yaml:/etc/alertloop/alertloop.yaml:ro"]
+  # (see alertloop.example.yaml).
   alertloop:
-    build:
-      context: .
-      args:
-        VERSION: demo
-    image: alertloop:demo
+    profiles: ["demo"]
+    image: *image
     ports:
-      # Loopback-only: the demo is reachable at http://localhost:8080, not from
-      # other hosts. A published Docker port bypasses host firewalls like ufw, so
-      # do NOT bind 0.0.0.0 here. For remote access, front it with the reverse
-      # proxy in deploy/proxy/ (or override this mapping deliberately).
+      # Loopback only: the demo is reachable at http://localhost:8080 and not
+      # from other hosts. A published Docker port bypasses host firewalls such
+      # as ufw, so do NOT bind 0.0.0.0 here. For remote access put the reverse
+      # proxy from deploy/proxy/ in front of it.
       - "127.0.0.1:8080:8080"
     environment:
-      # The image ships a config file that reads the admin token from this
-      # variable — the environment carries secrets, the file carries settings.
-      # The token signs in to /admin AND grants full API access; override it via
-      # .env (copy .env.example → .env) and change it before exposing the demo
-      # anywhere real. Scoped service API keys, channels, and routing go in a
-      # mounted YAML config — see alertloop.example.yaml.
+      # The image ships a config file that reads the token from this variable.
+      # It signs in to /admin AND grants full API access. The demo has a
+      # fallback because it is loopback-only; the postgres profile does not.
       ALERTLOOP_ADMIN_TOKEN: ${ALERTLOOP_ADMIN_TOKEN:-change-me-admin}
     volumes:
       - alertloop-data:/data
-    # Hardening: no privilege escalation, drop all Linux capabilities (the app
-    # needs none — it binds 8080 and writes only to the /data volume), and run on
-    # a read-only root filesystem with a writable tmpfs for scratch files.
+    <<: *hardening
+
+  # --- postgres profile --------------------------------------------------
+  postgres:
+    profiles: ["postgres"]
+    image: postgres:16-alpine
+    # No `ports:` — PostgreSQL stays on the internal Docker network and is
+    # never published to the host. Keep it that way.
+    environment:
+      POSTGRES_USER: alertloop
+      # The postgres image itself refuses to initialise with an empty password,
+      # so a missing one fails loudly at startup rather than quietly creating a
+      # trust-authenticated database.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+      POSTGRES_DB: alertloop
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U alertloop"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # The Postgres image needs a writable data directory and the capabilities to
+    # drop from root to the postgres user, so it gets only no-new-privileges.
     security_opt:
       - no-new-privileges:true
-    cap_drop:
-      - ALL
-    read_only: true
-    tmpfs:
-      - /tmp
     restart: unless-stopped
+
+  api:
+    profiles: ["postgres"]
+    image: *image
+    command: ["--config", "/etc/alertloop/alertloop.yaml", "server"]
+    environment: &pg-env
+      # Empty when unset, on purpose. AlertLoop treats empty as unset, and
+      # alertloop.example.yaml references ${ALERTLOOP_ADMIN_TOKEN} with no
+      # fallback — so a missing token stops the container with a message naming
+      # it, instead of starting on a placeholder published in this repository.
+      #
+      # The guard lives in the config file rather than as a Compose `:?` because
+      # Compose interpolates the WHOLE file before it filters by profile: a `:?`
+      # here would also block `docker compose --profile demo up`, which needs
+      # none of these secrets.
+      ALERTLOOP_ADMIN_TOKEN: ${ALERTLOOP_ADMIN_TOKEN:-}
+      # The same example config serves the binary and both profiles: it reads
+      # the driver and DSN from these references, defaulting to SQLite when they
+      # are absent. Referencing them from the config is the supported way to
+      # inject a secret — a *leftover* one that the file does not reference is
+      # what AlertLoop refuses to start on.
+      ALERTLOOP_DB_DRIVER: postgres
+      ALERTLOOP_DB_DSN: postgres://alertloop:${POSTGRES_PASSWORD}@postgres:5432/alertloop?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      # Loopback only — see the note on the demo service.
+      - "127.0.0.1:8080:8080"
+    volumes:
+      # Both containers mount the SAME file, so channels and routing are defined
+      # once and cannot drift between the API and the worker.
+      - ./alertloop.yaml:/etc/alertloop/alertloop.yaml:ro
+    <<: *hardening
+
+  worker:
+    profiles: ["postgres"]
+    image: *image
+    command: ["--config", "/etc/alertloop/alertloop.yaml", "worker"]
+    environment: *pg-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_started
+    volumes:
+      - ./alertloop.yaml:/etc/alertloop/alertloop.yaml:ro
+    <<: *hardening
+
+  # The admin console is served by the api container at /admin, on the same
+  # origin as the API. There is no separate UI service to run.
 
 volumes:
   alertloop-data:
+  pgdata:

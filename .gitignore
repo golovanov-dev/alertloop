@@ -20,7 +20,6 @@ npm-debug.log*
 
 # Real config files with secrets (keep the *.example templates)
 /alertloop.yaml
-deploy/docker/alertloop.yaml
 
 # AI-инструкции и конфиги ассистентов (не публикуются)
 AGENTS.md
