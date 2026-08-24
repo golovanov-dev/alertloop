@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.4.1 - 2026-08-24
+
+Fixes found by CI on the 0.4.0 tag, plus the dependency vulnerability those
+checks exist to catch. Upgrade from 0.4.0; nothing about your configuration or
+your stored events changes.
+
+### Fixed
+
+- **A vulnerable `golang.org/x/text` was compiled into the 0.4.0 binaries and
+  image** (GO-2026-5970, infinite loop on invalid input, reachable through the
+  database driver). Updated to v0.39.0. `govulncheck` on the release toolchain
+  now reports nothing.
+- **The Monit adapter refused `http://[::1]:8080`** as an insecure URL. In a
+  shell `case`, `[::1]` is a bracket expression matching one character out of
+  `:` and `1`, not the literal text — so an IPv6 loopback address never matched
+  the localhost arm and was treated as a remote plain-HTTP endpoint. An
+  installation reaching AlertLoop over IPv6 loopback could not send anything.
+  Found by `shellcheck`, which had never actually run.
+- **Three CI checks could not pass on 0.4.0**, so 0.4.0 shipped with a red
+  pipeline:
+  - `golangci-lint` used action v6, which runs golangci-lint v1 only, while
+    `.golangci.yml` is a v2 config. The action's major version and the linter's
+    are coupled; both are pinned now, with a comment saying so.
+  - `shellcheck -S style` reported five findings, one of them the IPv6 defect
+    above and the rest genuine (`A && B || C` read as if-then-else, and a jq
+    program fragment that needed an explicit exemption rather than a shrug).
+  - `govulncheck` failed on the `x/text` advisory above.
+
+  All three now run locally against the same toolchain versions CI uses, which
+  is how they should have been checked before 0.4.0 was tagged.
+
 ## 0.4.0 - 2026-08-24
 
 AlertLoop learns the full incident lifecycle - a problem opens an incident,

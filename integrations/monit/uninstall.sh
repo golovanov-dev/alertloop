@@ -99,7 +99,9 @@ if [ "$PURGE" -eq 1 ]; then
       rm -f "$ENV_FILE"
       echo "    removed $ENV_FILE"
       # Only if empty: /etc/alertloop may also hold the server's own config.
-      rmdir "$CONF_DIR" 2>/dev/null && echo "    removed empty $CONF_DIR" || true
+      if rmdir "$CONF_DIR" 2>/dev/null; then
+        echo "    removed empty $CONF_DIR"
+      fi
     else
       echo "    kept $ENV_FILE"
     fi

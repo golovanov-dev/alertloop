@@ -161,7 +161,12 @@ done < "$CONFIG"
 # wire in clear text. There is no flag to disable this and no --insecure.
 case "$ALERTLOOP_URL" in
   https://*) ;;
-  http://127.0.0.1*|http://localhost*|http://[::1]*|http://0.0.0.0*) ;;
+  # The IPv6 arm is QUOTED on purpose. Unquoted, `[::1]` is a bracket
+  # expression matching ONE character out of ':' and '1', so an IPv6 loopback
+  # URL never matched this arm and was refused as insecure. Quoting makes the
+  # brackets literal; backslash-escaping inside quotes does NOT - it would
+  # match a URL containing actual backslashes.
+  http://127.0.0.1*|http://localhost*|'http://[::1]'*|http://0.0.0.0*) ;;
   http://*) die "$EX_USAGE" "insecure_url (plain HTTP is allowed only to localhost; use https:// for a remote AlertLoop)" ;;
   *) die "$EX_USAGE" "bad_url:$ALERTLOOP_URL (expected http:// or https://)" ;;
 esac
@@ -253,6 +258,8 @@ else
   # whatever the caller added. jq builds the object, so a value containing a
   # quote, a brace, or a newline cannot break out of the JSON.
   label_args=(--arg host "$host" --arg monitor "monit")
+  # shellcheck disable=SC2016  # jq program text: $host and $monitor are jq
+  # variables bound by --arg above, and must NOT be expanded by the shell.
   label_obj='{host:$host, monitor:$monitor}'
   if [ -n "$service" ]; then
     label_args+=(--arg service "$service")

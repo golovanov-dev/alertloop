@@ -29,7 +29,9 @@ new_bin="$work/alertloop-new$GOEXE"
 server_pid=""
 
 cleanup() {
-  [ -n "$server_pid" ] && kill "$server_pid" 2>/dev/null || true
+  if [ -n "$server_pid" ]; then
+    kill "$server_pid" 2>/dev/null || true
+  fi
   git -C "$repo_root" worktree remove --force "$worktree" >/dev/null 2>&1 || true
   rm -rf "$work"
 }
@@ -113,7 +115,9 @@ run_scenario() {
   local resolve_id
   resolve_id="$(curl -fsS -H "X-API-Key: $TOKEN" \
     "http://127.0.0.1:$OLD_PORT/v1/events?limit=1" | jq -r '.items[0].id')"
-  [ -n "$resolve_id" ] && [ "$resolve_id" != "null" ] || fail "could not read an event id from $FROM_TAG"
+  if [ -z "$resolve_id" ] || [ "$resolve_id" = "null" ]; then
+    fail "could not read an event id from $FROM_TAG"
+  fi
   curl -fsS -X POST -H "X-API-Key: $TOKEN" \
     "http://127.0.0.1:$OLD_PORT/v1/events/$resolve_id/resolve" >/dev/null \
     || fail "$FROM_TAG rejected the resolve action"

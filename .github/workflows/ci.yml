@@ -62,14 +62,19 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
-      - uses: golangci/golangci-lint-action@v6
+      # v8, not v6: the action's major version and the linter's are coupled.
+      # v6 runs golangci-lint v1 only, and .golangci.yml is a v2 config
+      # (`version: "2"`), so v6 failed on every run regardless of the code.
+      # Keep these two in step when bumping either.
+      - uses: golangci/golangci-lint-action@v8
         with:
           # Pinned, not `latest`. A new linter release adds checks, and with
           # `latest` it lands in CI on whatever day upstream ships it - which is
           # as likely as not the day you are trying to cut a release. Bump this
           # deliberately, in its own commit.
           version: v2.13.1
-          args: --timeout=5m
+          # No --timeout here: run.timeout lives in .golangci.yml, and one
+          # place to set it is enough.
 
   postgres:
     name: PostgreSQL integration tests
@@ -282,18 +287,32 @@ jobs:
           sudo install -m 0755 integrations/monit/examples/check-worker-heartbeat.sh /usr/local/bin/
           sudo install -m 0755 integrations/monit/examples/cron-wrapper.sh /usr/local/bin/
 
+          # The synthetic control file carries a mail server because
+          # alertloop.conf uses the bare `alert` action, and Monit refuses a
+          # configuration that alerts with nowhere to send. That is a property
+          # of this two-line harness, not of the rule being checked.
+          failed=0
           for f in integrations/monit/conf.d/*.conf; do
             name="$(basename "$f")"
-            printf 'set daemon 30\nset pidfile /run/monit-check.pid\n' | sudo tee /tmp/monitrc.$name >/dev/null
-            cat "$f" | sudo tee -a /tmp/monitrc.$name >/dev/null
-            sudo chmod 0600 /tmp/monitrc.$name
-            if sudo monit -t -c /tmp/monitrc.$name; then
+            rc="/tmp/monitrc.$name"
+            {
+              echo 'set daemon 30'
+              echo 'set pidfile /run/monit-check.pid'
+              echo 'set mailserver localhost'
+              echo 'set alert root@localhost'
+              cat "$f"
+            } | sudo tee "$rc" >/dev/null
+            sudo chmod 0600 "$rc"
+            if sudo monit -t -c "$rc"; then
               echo "  ok   $name"
             else
               echo "::error file=$f::monit -t rejected this rule file"
-              exit 1
+              failed=1
             fi
           done
+          # Report every broken file, not just the first: fixing them one CI
+          # run at a time is how a five-minute job becomes an afternoon.
+          [ "$failed" -eq 0 ] || exit 1
           echo "every example rule parses"
 
   admin-ui:
