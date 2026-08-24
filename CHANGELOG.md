@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.4.3 - 2026-08-24
+
+One fix: an example Monit rule did not parse. Nothing in AlertLoop itself
+changed.
+
+### Fixed
+
+- **`integrations/monit/conf.d/filesystem.conf` was rejected by `monit -t`.**
+  It used `if read-only then ...`, which is not Monit syntax. Monit reports a
+  filesystem being remounted read-only through `if changed fsflags`, which
+  detects a *change* of mount flags rather than a state — and therefore has no
+  `else if succeeded` counterpart. Anyone who enabled this example could not
+  reload Monit at all until they fixed the file themselves, because the
+  installer correctly refuses to reload on a configuration Monit rejects.
+
+  The corrected rule is documented in place, including the consequence: this is
+  the one incident in the integration that does not close by itself. Closing it
+  is a console action, or an `alertloop-send --status resolved` from whatever
+  fixes the mount. A `check program` writability probe is named as the
+  alternative for anyone who wants it to auto-resolve.
+
+  All eleven example rules now pass `monit -t` in CI — a step that had never
+  actually run before this release: the job died earlier, first on `shellcheck`
+  and then on the missing executable bit.
+
 ## 0.4.2 - 2026-08-24
 
 One fix: the integration's scripts were shipped without the executable bit.

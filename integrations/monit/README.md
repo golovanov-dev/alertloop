@@ -224,7 +224,7 @@ sudo systemctl start postgresql            # then the recovery
 | File | What it watches | The trap it avoids |
 |---|---|---|
 | `system.conf` | CPU, memory, swap, load | The load threshold is per machine: load 4 is idle on 16 cores and a crisis on one. |
-| `filesystem.conf` | Space, inodes, read-only | A filesystem with free space and no inodes fails identically to a full one — and reads as a mystery if you only watch space. |
+| `filesystem.conf` | Space, inodes, mount flags | A filesystem with free space and no inodes fails identically to a full one — and reads as a mystery if you only watch space. The mount-flags check catches a read-only remount, and is the one incident here that does not close by itself. |
 | `postgresql.conf` | Process, port, protocol, memory | A wedged PostgreSQL keeps its PID. Only the protocol check proves it is usable. |
 | `php-fpm.conf` | Master process, memory, CPU | PHP-FPM hangs with the master perfectly alive. Pair it with the HTTP check. |
 | `http-health.conf` | The app's own endpoint | Catches "running, listening, returning 500", which no process check can see. |
