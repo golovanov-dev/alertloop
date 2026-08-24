@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"log/slog"
 	"time"
 
 	"github.com/golovanov-dev/alertloop/internal/domain"
@@ -10,16 +11,19 @@ import (
 
 // EventService handles event queries and manual state transitions.
 type EventService struct {
-	store storage.Store
-	now   Clock
+	store    storage.Store
+	recovery *RecoveryNotifier
+	now      Clock
+	log      *slog.Logger
 }
 
-// NewEventService builds an EventService.
-func NewEventService(store storage.Store, now Clock) *EventService {
+// NewEventService builds an EventService. recovery may be nil, which disables
+// the recovery notice on the manual resolve action.
+func NewEventService(store storage.Store, recovery *RecoveryNotifier, now Clock) *EventService {
 	if now == nil {
 		now = time.Now
 	}
-	return &EventService{store: store, now: now}
+	return &EventService{store: store, recovery: recovery, now: now, log: slog.Default()}
 }
 
 // Get returns an event by ID.
@@ -47,5 +51,28 @@ func (s *EventService) Apply(ctx context.Context, id string, action domain.Event
 		// No-op transition (e.g. re-muting a muted event); return as-is.
 		return e, nil
 	}
-	return s.store.UpdateEventState(ctx, id, next, s.now().UTC())
+	at := s.now().UTC()
+	updated, err := s.store.UpdateEventState(ctx, id, next, at)
+	if err != nil {
+		return nil, err
+	}
+
+	// Closing an incident by hand notifies exactly as an ingested recovery
+	// does. The operator who clicked Resolve knows; the Telegram group that was
+	// told the database was down does not, and it is the same group either way.
+	// The guard is `next == resolved && e.State != resolved`, so re-resolving an
+	// already-closed incident stays silent.
+	//
+	// A MUTED incident is the exception. Mute means "stop telling me about
+	// this"; sending a channel the end of a story it was deliberately not told
+	// the beginning of is the opposite of what was asked for.
+	if next == domain.StateResolved {
+		if e.State == domain.StateMuted {
+			s.log.Info("incident resolved while muted; no recovery notice sent",
+				"event_id", id, "dedupe_key", updated.DedupeKey)
+		} else {
+			s.recovery.Notify(ctx, updated, at)
+		}
+	}
+	return updated, nil
 }

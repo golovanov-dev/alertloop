@@ -51,6 +51,34 @@ func ValidSeverity(s Severity) bool {
 	}
 }
 
+// IngestStatus is the lifecycle signal a monitoring source attaches to an
+// incoming event. It is a property of the *request*, not of the stored event:
+// `firing` asserts that a problem is happening now, `resolved` asserts that the
+// problem identified by the same DedupeKey is over. The stored event's own
+// lifecycle is EventState.
+//
+// Omitting it means `firing`, which is what every pre-0.4.0 client sends.
+type IngestStatus string
+
+const (
+	// StatusFiring reports a problem as active. A repeated firing for an open
+	// incident refreshes it rather than creating a second event.
+	StatusFiring IngestStatus = "firing"
+	// StatusResolved reports the problem as over and closes the open incident
+	// carrying the same DedupeKey.
+	StatusResolved IngestStatus = "resolved"
+)
+
+// ValidIngestStatus reports whether s is a known ingestion status.
+func ValidIngestStatus(s IngestStatus) bool {
+	switch s {
+	case StatusFiring, StatusResolved:
+		return true
+	default:
+		return false
+	}
+}
+
 // EventState is the lifecycle state of an event. It is intentionally separate
 // from delivery state: an event can be unresolved even when a channel delivery
 // has succeeded, and a delivery can fail while the event is stored correctly.
@@ -90,6 +118,13 @@ type Event struct {
 	Payload    json.RawMessage `json:"payload,omitempty"`
 	CreatedAt  time.Time       `json:"created_at"`
 	UpdatedAt  time.Time       `json:"updated_at"`
+	// LastSeenAt is when this incident was last reported as still firing. For
+	// an event ingested once it equals CreatedAt; a monitoring source that
+	// repeats the same DedupeKey moves it forward without creating a new event.
+	LastSeenAt time.Time `json:"last_seen_at"`
+	// ResolvedAt is when the incident was closed, by an ingested
+	// `status: resolved` or by the manual resolve action. Nil while open.
+	ResolvedAt *time.Time `json:"resolved_at,omitempty"`
 }
 
 // MaxPayloadBytes is the maximum accepted size of the event payload object.

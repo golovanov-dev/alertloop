@@ -27,7 +27,7 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	event, created, err := s.ingest.Ingest(r.Context(), in)
+	res, err := s.ingest.Ingest(r.Context(), in)
 	if err != nil {
 		// Ingestion is atomic: the event and its delivery jobs are stored
 		// together or not at all, so any error means nothing was persisted.
@@ -35,11 +35,20 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	status := http.StatusOK // dedupe hit: existing event returned
-	if created {
+	// A `resolved` report for a dedupe_key nothing was ever stored under is a
+	// success with nothing to return: the source may be reporting a recovery
+	// after retention removed the incident, or after its own restart. 204 says
+	// "accepted, no incident to show" without inventing an event.
+	if res.Event == nil {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	status := http.StatusOK // the incident already existed
+	if res.Created() {
 		status = http.StatusCreated
 	}
-	writeJSON(w, status, event)
+	writeJSON(w, status, res.Event)
 }
 
 // handleListEvents implements GET /v1/events.
@@ -92,6 +101,7 @@ func (s *Server) handleListDeliveries(w http.ResponseWriter, r *http.Request) {
 		Channel:     domain.ChannelType(q.Get("channel")),
 		ChannelName: q.Get("channel_name"),
 		EventID:     q.Get("event_id"),
+		Kind:        domain.DeliveryKind(q.Get("kind")),
 	}
 	page, err := s.deliveries.List(r.Context(), f, parseLimit(q.Get("limit")), q.Get("cursor"))
 	if err != nil {
@@ -188,12 +198,13 @@ func (s *Server) handleRoutingPreview(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, routingPreviewResponse{MatchedRule: decision.Rule, Channels: names})
 }
 
-// handleHealth implements GET /health (liveness).
+// handleHealth implements GET /health and its /health/live alias (liveness).
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// handleReady implements GET /ready (readiness). It verifies DB connectivity.
+// handleReady implements GET /ready and its /health/ready alias (readiness).
+// It verifies DB connectivity.
 func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()

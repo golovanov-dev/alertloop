@@ -117,10 +117,14 @@ const deliveriesHTML = `<!doctype html>
     <a href="/deliveries?token={{.Token}}&state=pending">Pending</a>
     <a href="/deliveries?token={{.Token}}&state=sent">Sent</a>
   </div>
+  <div class="filters">
+    <a href="/deliveries?token={{.Token}}&kind=alert{{if .State}}&state={{.State}}{{end}}">Alerts</a>
+    <a href="/deliveries?token={{.Token}}&kind=recovery{{if .State}}&state={{.State}}{{end}}">Recoveries</a>
+  </div>
   {{if .Deliveries}}
   <table>
     <thead><tr>
-      <th>Time (UTC)</th><th>Channel</th><th>Name</th><th>State</th><th>Attempts</th>
+      <th>Time (UTC)</th><th>Channel</th><th>Name</th><th>Kind</th><th>State</th><th>Attempts</th>
       <th>Last error</th><th>Event</th>
     </tr></thead>
     <tbody>
@@ -129,6 +133,7 @@ const deliveriesHTML = `<!doctype html>
         <td><code>{{.CreatedAt.Format "2006-01-02 15:04:05"}}</code></td>
         <td>{{.Channel}}</td>
         <td><code>{{.ChannelName}}</code></td>
+        <td>{{.Kind}}</td>
         <td class="dl-{{.State}}">{{.State}}</td>
         <td>{{.Attempts}} / {{.MaxAttempts}}</td>
         <td>{{if .LastError}}<code>{{.LastError}}</code>{{else}}—{{end}}</td>
@@ -172,6 +177,8 @@ const eventDetailHTML = `<!doctype html>
     {{if .Event.TraceID}}<dt>Trace</dt><dd><code>{{.Event.TraceID}}</code></dd>{{end}}
     {{if .Event.DedupeKey}}<dt>Dedupe key</dt><dd><code>{{.Event.DedupeKey}}</code></dd>{{end}}
     <dt>Created</dt><dd><code>{{.Event.CreatedAt.Format "2006-01-02 15:04:05 MST"}}</code></dd>
+    <dt>Last seen</dt><dd><code>{{.Event.LastSeenAt.Format "2006-01-02 15:04:05 MST"}}</code></dd>
+    {{if .Event.ResolvedAt}}<dt>Resolved</dt><dd><code>{{.Event.ResolvedAt.Format "2006-01-02 15:04:05 MST"}}</code></dd>{{end}}
     <dt>Updated</dt><dd><code>{{.Event.UpdatedAt.Format "2006-01-02 15:04:05 MST"}}</code></dd>
   </dl>
 
@@ -183,7 +190,7 @@ const eventDetailHTML = `<!doctype html>
   <table>
     <thead><tr>
       <th>Channel</th><th>Name</th><th>State</th><th>Attempts</th><th>Next retry (UTC)</th>
-      <th>Last error</th><th>Updated (UTC)</th>
+      <th>Kind</th><th>Last error</th><th>Updated (UTC)</th>
     </tr></thead>
     <tbody>
     {{range .Deliveries}}
@@ -193,6 +200,7 @@ const eventDetailHTML = `<!doctype html>
         <td class="dl-{{.State}}">{{.State}}</td>
         <td>{{.Attempts}} / {{.MaxAttempts}}</td>
         <td>{{if .NextRetryAt}}<code>{{.NextRetryAt.Format "15:04:05"}}</code>{{else}}—{{end}}</td>
+        <td>{{.Kind}}</td>
         <td>{{if .LastError}}<code>{{.LastError}}</code>{{else}}—{{end}}</td>
         <td><code>{{.UpdatedAt.Format "15:04:05"}}</code></td>
       </tr>

@@ -98,16 +98,80 @@ func applyMigration(ctx context.Context, db *sql.DB, d dialect, version, body st
 	return tx.Commit()
 }
 
-// splitStatements splits a migration file on `;` at end of line. It is a simple
-// splitter that suits the migrations shipped with AlertLoop (no procedural
-// blocks or embedded semicolons).
+// splitStatements splits a migration file into statements on `;`.
+//
+// Semicolons inside `--` line comments and inside single-quoted string literals
+// do not split. That is not hypothetical tidiness: a `;` in an explanatory
+// comment used to cut a migration in half and hand SQLite the English prose as
+// a statement, which failed at run time with a syntax error pointing at a
+// comment. Migrations are the one thing that runs against a customer's data on
+// upgrade, so the splitter must not depend on how a comment is punctuated.
+//
+// It remains a simple splitter: no procedural blocks, no dollar-quoted bodies.
+// AlertLoop ships neither, and adding one should mean revisiting this function
+// rather than discovering it in production.
 func splitStatements(body string) []string {
-	parts := strings.Split(body, ";")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		if s := strings.TrimSpace(p); s != "" {
-			out = append(out, s)
+	var (
+		out      []string
+		cur      strings.Builder
+		inLine   bool // inside a `--` comment, until end of line
+		inString bool // inside a '...' literal
+	)
+	runes := []rune(body)
+	for i := 0; i < len(runes); i++ {
+		c := runes[i]
+		switch {
+		case inLine:
+			if c == '\n' {
+				inLine = false
+			}
+		case inString:
+			// '' inside a literal is an escaped quote, not the end of it.
+			if c == '\'' {
+				if i+1 < len(runes) && runes[i+1] == '\'' {
+					cur.WriteRune(c)
+					i++
+					c = runes[i]
+				} else {
+					inString = false
+				}
+			}
+		case c == '-' && i+1 < len(runes) && runes[i+1] == '-':
+			inLine = true
+		case c == '\'':
+			inString = true
+		case c == ';':
+			out = appendStatement(out, cur.String())
+			cur.Reset()
+			continue
+		}
+		cur.WriteRune(c)
+	}
+	// A file that ends in a trailing comment leaves a chunk with no SQL in it.
+	out = appendStatement(out, cur.String())
+	return out
+}
+
+// appendStatement adds stmt to out unless it carries no SQL. A chunk of pure
+// comment or whitespace is not a statement: handing one to the driver is at
+// best a no-op and at worst an error, and it would happen only for whoever
+// wrote the trailing comment.
+func appendStatement(out []string, stmt string) []string {
+	trimmed := strings.TrimSpace(stmt)
+	if trimmed == "" || !hasSQL(trimmed) {
+		return out
+	}
+	return append(out, trimmed)
+}
+
+// hasSQL reports whether s contains anything besides `--` comments and
+// whitespace.
+func hasSQL(s string) bool {
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" && !strings.HasPrefix(line, "--") {
+			return true
 		}
 	}
-	return out
+	return false
 }

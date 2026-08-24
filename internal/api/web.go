@@ -86,6 +86,7 @@ func (s *Server) handleDeliveriesPage(w http.ResponseWriter, r *http.Request) {
 		State:       domain.DeliveryState(q.Get("state")),
 		Channel:     domain.ChannelType(q.Get("channel")),
 		ChannelName: q.Get("channel_name"),
+		Kind:        domain.DeliveryKind(q.Get("kind")),
 	}
 	page, err := s.deliveries.List(r.Context(), f, parseLimit(q.Get("limit")), q.Get("cursor"))
 	if err != nil {
@@ -95,6 +96,7 @@ func (s *Server) handleDeliveriesPage(w http.ResponseWriter, r *http.Request) {
 	data := deliveriesPageData{
 		Token:      extractAdminToken(r),
 		State:      q.Get("state"),
+		Kind:       q.Get("kind"),
 		Deliveries: page.Items,
 		NextCursor: page.NextCursor,
 	}
@@ -113,8 +115,11 @@ type eventsPageData struct {
 }
 
 type deliveriesPageData struct {
-	Token      string
-	State      string
+	Token string
+	State string
+	// Kind is the active alert/recovery filter, kept so the state links above
+	// do not silently drop it.
+	Kind       string
 	Deliveries []domain.DeliveryAttempt
 	NextCursor string
 }

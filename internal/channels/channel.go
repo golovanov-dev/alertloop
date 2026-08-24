@@ -22,9 +22,9 @@ type Channel interface {
 	Type() domain.ChannelType
 	// Name is the unique identifier of this configured channel instance.
 	Name() string
-	// Send delivers the event. A non-nil error means the attempt failed and is
-	// eligible for retry. Send must respect ctx cancellation/deadlines.
-	Send(ctx context.Context, e *domain.Event) error
+	// Send delivers the notification. A non-nil error means the attempt failed
+	// and is eligible for retry. Send must respect ctx cancellation/deadlines.
+	Send(ctx context.Context, n domain.Notification) error
 }
 
 // Registry holds the configured channels, keyed by their unique name. In

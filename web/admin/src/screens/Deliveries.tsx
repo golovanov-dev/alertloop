@@ -157,7 +157,7 @@ export function Deliveries() {
             <table style={{ width: "100%", minWidth: 920, fontSize: 13.5 }}>
               <thead>
                 <tr>
-                  {["Channel", "Event", "State", "Attempts", "Next retry (local)", "Last error", "Updated (local)", ""].map((h, i) => (
+                  {["Channel", "Kind", "Event", "State", "Attempts", "Next retry (local)", "Last error", "Updated (local)", ""].map((h, i) => (
                     <th key={i} style={th}>
                       {h}
                     </th>
@@ -170,6 +170,12 @@ export function Deliveries() {
                     <td style={{ ...td, color: c.text2, whiteSpace: "nowrap" }}>
                       {d.channel} <span style={{ color: c.muted }}>/</span>{" "}
                       <code style={{ fontFamily: mono, fontSize: 12.5 }}>{d.channel_name}</code>
+                    </td>
+                    {/* An alert and its recovery are two rows for the same event.
+                        Without this column they are indistinguishable, and a
+                        recovery reads as a duplicate notification. */}
+                    <td style={{ ...td, whiteSpace: "nowrap", color: d.kind === "recovery" ? c.text2 : c.muted }}>
+                      {d.kind === "recovery" ? "recovery" : "alert"}
                     </td>
                     <td style={tdMono}>{d.event_id.slice(0, 8)}</td>
                     <td style={td}>

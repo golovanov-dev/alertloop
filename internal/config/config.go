@@ -40,6 +40,20 @@ type Config struct {
 	// behavior: every event goes to every configured channel.
 	Routing *Routing `yaml:"routing"`
 
+	// NotifyOnResolve controls whether closing an incident sends a "resolved"
+	// notice to the channels that were told about it — whether it was closed by
+	// an ingested `status: resolved` or by the manual resolve action.
+	//
+	// It defaults to true. A product that tells you the database is down and
+	// never tells you it came back leaves the reader to guess, and guessing is
+	// what an alerting service exists to remove. Turn it off if your channel is
+	// a ticketing webhook that opens an issue per message.
+	//
+	// A pointer so an absent key can be told from an explicit `false`: with a
+	// plain bool the zero value would silently disable it for every config file
+	// written before 0.4.0.
+	NotifyOnResolve *bool `yaml:"notify_on_resolve"`
+
 	// RetentionDays is the event retention window in days: events older than
 	// this are pruned by the worker. Defaults to 30, with no upper bound.
 	// (Retention
@@ -71,6 +85,19 @@ type RateLimit struct {
 	// the whole process.
 	IngestPerSecond float64 `yaml:"ingest_per_second"`
 	IngestBurst     int     `yaml:"ingest_burst"`
+	// TrustedProxies are the addresses (IP or CIDR) whose X-Forwarded-For may
+	// be believed when identifying the client for the per-IP limit.
+	//
+	// Empty means trust nothing, which is right for a directly exposed
+	// instance. Behind the documented nginx setup it is WRONG to leave empty:
+	// every request then arrives from 127.0.0.1, the whole internet shares one
+	// bucket, brute-forcing the admin token is effectively unlimited, and one
+	// noisy client can exhaust the bucket and get everyone else a 429.
+	//
+	// Only set this for proxies you actually run. The header is trivially
+	// forged by anyone talking to AlertLoop directly, so trusting it
+	// unconditionally is worse than ignoring it.
+	TrustedProxies []string `yaml:"trusted_proxies"`
 }
 
 // Scope constants for API keys. Higher-privilege operations require a broader
@@ -236,6 +263,14 @@ func Default() Config {
 			IngestBurst:     200,
 		},
 	}
+}
+
+// ShouldNotifyOnResolve reports whether closing an incident sends a recovery
+// notice. An absent `notify_on_resolve` key means yes: it is the behaviour that
+// makes the lifecycle complete, and a config file written before 0.4.0 must get
+// it without being edited.
+func (c Config) ShouldNotifyOnResolve() bool {
+	return c.NotifyOnResolve == nil || *c.NotifyOnResolve
 }
 
 // channel field defaults applied per configured channel by normalizeChannels.

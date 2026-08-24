@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/golovanov-dev/alertloop/internal/domain"
 )
 
 // mustParse is the test spelling of a proxy URL that config validation already
@@ -56,7 +58,7 @@ func TestTelegramSendsThroughHTTPProxy(t *testing.T) {
 		Proxy:   mustParse(t, proxy.URL),
 		Timeout: 5 * time.Second,
 	})
-	if err := tg.Send(context.Background(), sampleEvent()); err != nil {
+	if err := tg.Send(context.Background(), domain.Alert(sampleEvent())); err != nil {
 		t.Fatalf("send through http proxy: %v", err)
 	}
 	if host := <-gotHost; host != telegramHost {
@@ -86,7 +88,7 @@ func TestTelegramSendsThroughSOCKS5Proxy(t *testing.T) {
 				Proxy:   mustParse(t, scheme+"://"+proxy.addr),
 				Timeout: 5 * time.Second,
 			})
-			if err := tg.Send(context.Background(), sampleEvent()); err != nil {
+			if err := tg.Send(context.Background(), domain.Alert(sampleEvent())); err != nil {
 				t.Fatalf("send through %s proxy: %v", scheme, err)
 			}
 			if got := <-proxy.requested; got != telegramHost+":80" {
@@ -109,7 +111,7 @@ func TestTelegramProxyPasswordNotInDeliveryError(t *testing.T) {
 		Proxy:   mustParse(t, "socks5://operator:hunter2@"+proxy.addr),
 		Timeout: 5 * time.Second,
 	})
-	err := tg.Send(context.Background(), sampleEvent())
+	err := tg.Send(context.Background(), domain.Alert(sampleEvent()))
 	if err == nil {
 		t.Fatal("expected the delivery to fail against a rejecting proxy")
 	}
@@ -139,7 +141,7 @@ func TestTelegramUsesEnvironmentProxyWhenProxyUnset(t *testing.T) {
 			APIBase: "http://" + telegramHost,
 			Timeout: 5 * time.Second,
 		})
-		if err := tg.Send(context.Background(), sampleEvent()); err != nil {
+		if err := tg.Send(context.Background(), domain.Alert(sampleEvent())); err != nil {
 			t.Fatalf("child send: %v", err)
 		}
 		return

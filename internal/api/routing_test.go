@@ -49,8 +49,8 @@ func newRoutedTestServer(t *testing.T, apiKeys map[string]string) (*httptest.Ser
 
 	srv := NewServer(Config{
 		Store:      store,
-		Ingest:     service.NewIngestService(store, router, 5, time.Now, nil),
-		Events:     service.NewEventService(store, time.Now),
+		Ingest:     service.NewIngestService(store, router, 5, nil, time.Now, nil),
+		Events:     service.NewEventService(store, nil, time.Now),
 		Deliveries: service.NewDeliveryService(store, time.Now),
 		Routing:    router,
 		APIKeys:    apiKeys,

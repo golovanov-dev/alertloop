@@ -31,9 +31,9 @@ func newTestServer(t *testing.T, apiKeys map[string]string) (*httptest.Server, s
 	targets := []domain.ChannelTarget{{Type: domain.ChannelWebhook, Name: "webhook"}}
 	srv := NewServer(Config{
 		Store:      store,
-		Ingest:     service.NewIngestService(store, routing.NewAllChannels(targets), 5, time.Now, nil),
+		Ingest:     service.NewIngestService(store, routing.NewAllChannels(targets), 5, nil, time.Now, nil),
 		Routing:    routing.NewAllChannels(targets),
-		Events:     service.NewEventService(store, time.Now),
+		Events:     service.NewEventService(store, nil, time.Now),
 		Deliveries: service.NewDeliveryService(store, time.Now),
 		APIKeys:    apiKeys,
 		AdminToken: "admintok",
@@ -254,8 +254,8 @@ func TestRateLimitPerIP(t *testing.T) {
 
 	srv := NewServer(Config{
 		Store:      store,
-		Ingest:     service.NewIngestService(store, nil, 5, time.Now, nil),
-		Events:     service.NewEventService(store, time.Now),
+		Ingest:     service.NewIngestService(store, nil, 5, nil, time.Now, nil),
+		Events:     service.NewEventService(store, nil, time.Now),
 		Deliveries: service.NewDeliveryService(store, time.Now),
 		// Tiny per-IP allowance to trip the limiter quickly.
 		RateLimit: config.RateLimit{Enabled: true, PerIPPerSecond: 1, PerIPBurst: 3,
@@ -264,9 +264,12 @@ func TestRateLimitPerIP(t *testing.T) {
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 
+	// An authenticated endpoint: this is what the limiter exists to protect,
+	// and repeated unauthenticated hits on it are exactly the brute-force it
+	// is supposed to bound.
 	var got429 bool
 	for i := 0; i < 10; i++ {
-		resp, err := http.Get(ts.URL + "/health")
+		resp, err := http.Get(ts.URL + "/v1/events")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -278,6 +281,23 @@ func TestRateLimitPerIP(t *testing.T) {
 	}
 	if !got429 {
 		t.Fatal("expected a 429 after exceeding the per-IP burst")
+	}
+
+	// Health probes are deliberately exempt. The Docker HEALTHCHECK, an
+	// orchestrator probe, and an external uptime check all come from the same
+	// address; throttling them would make "is it up?" stop answering during an
+	// incident, which is when the question is asked.
+	for i := 0; i < 10; i++ {
+		for _, path := range []string{"/health", "/health/live", "/ready", "/health/ready"} {
+			resp, err := http.Get(ts.URL + path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusTooManyRequests {
+				t.Fatalf("%s was rate limited; health probes must always answer", path)
+			}
+		}
 	}
 }
 

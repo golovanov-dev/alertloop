@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"math"
 	"math/rand/v2"
+	"sync"
 	"time"
 
 	"github.com/golovanov-dev/alertloop/internal/channels"
@@ -150,10 +151,25 @@ func (w *Worker) runReaper(ctx context.Context) {
 	}
 }
 
-// tick claims a batch of due attempts and processes them concurrently. It
-// returns the number of attempts processed.
+// batchFactor is how many attempts a tick claims per concurrent slot.
+//
+// Claiming exactly Concurrency rows made the semaphore meaningless and turned
+// the queue into a lockstep march: two rows out, wait for the slower of the
+// two, two more. A backlog of 10 000 became 5 000 sequential round trips - and
+// with one channel timing out at 30s, the whole product delivered two
+// notifications per half-minute while a healthy Telegram sat idle.
+//
+// A larger batch fixes both. The slow attempt occupies one slot; the rest of
+// the batch keeps flowing through the others, so a dead SMTP server no longer
+// delays alerts going somewhere that works. 10 is enough to keep the slots fed
+// without claiming so much that a worker dying strands a large batch until the
+// reaper returns it.
+const batchFactor = 10
+
+// tick claims a batch of due attempts and processes them, keeping every
+// concurrency slot busy. It returns the number of attempts processed.
 func (w *Worker) tick(ctx context.Context) (int, error) {
-	claimed, err := w.store.ClaimDue(ctx, w.now().UTC(), w.opts.Concurrency)
+	claimed, err := w.store.ClaimDue(ctx, w.now().UTC(), w.opts.Concurrency*batchFactor)
 	if err != nil {
 		return 0, err
 	}
@@ -161,19 +177,28 @@ func (w *Worker) tick(ctx context.Context) (int, error) {
 		return 0, nil
 	}
 
+	// The semaphore is what bounds concurrency now, and it is a real bound: a
+	// goroutine starts as soon as a slot frees, rather than waiting for the
+	// whole batch.
 	sem := make(chan struct{}, w.opts.Concurrency)
-	done := make(chan struct{}, len(claimed))
+	var wg sync.WaitGroup
 	for i := range claimed {
 		att := claimed[i]
-		sem <- struct{}{}
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			// Shutting down. Whatever is left stays `sending` and the reaper
+			// returns it to the queue; nothing is lost.
+			wg.Wait()
+			return i, nil
+		}
+		wg.Add(1)
 		go func() {
-			defer func() { <-sem; done <- struct{}{} }()
+			defer func() { <-sem; wg.Done() }()
 			w.process(ctx, att)
 		}()
 	}
-	for range claimed {
-		<-done
-	}
+	wg.Wait()
 	return len(claimed), nil
 }
 
@@ -191,7 +216,10 @@ func (w *Worker) process(ctx context.Context, att domain.DeliveryAttempt) {
 		return
 	}
 
-	att.LastError = truncate(sendErr.Error(), 1000)
+	// By runes. A byte-cut through a multi-byte character produces text
+	// PostgreSQL refuses to store, which used to leave the attempt stuck in
+	// `sending` and requeued by the reaper every five minutes, forever.
+	att.LastError = domain.TruncateRunes(sendErr.Error(), domain.MaxLastErrorRunes)
 	if att.Attempts >= att.MaxAttempts {
 		att.State = domain.DeliveryDeadLetter
 		att.NextRetryAt = nil
@@ -227,7 +255,11 @@ func (w *Worker) deliver(ctx context.Context, att domain.DeliveryAttempt) error 
 		sendCtx, cancel = context.WithTimeout(ctx, w.opts.SendTimeout)
 		defer cancel()
 	}
-	return ch.Send(sendCtx, event)
+	kind := att.Kind
+	if kind == "" {
+		kind = domain.KindAlert
+	}
+	return ch.Send(sendCtx, domain.Notification{Event: event, Kind: kind})
 }
 
 func (w *Worker) save(ctx context.Context, att *domain.DeliveryAttempt) {
@@ -235,29 +267,39 @@ func (w *Worker) save(ctx context.Context, att *domain.DeliveryAttempt) {
 	// outcome it just produced.
 	saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
-	if err := w.store.MarkResult(saveCtx, att); err != nil {
+	att.UpdatedAt = w.now().UTC()
+	err := w.store.MarkResult(saveCtx, att)
+	switch {
+	case err == nil:
+	case errors.Is(err, domain.ErrNotFound):
+		// The row is no longer `sending`: the reaper decided this attempt was
+		// stuck and put it back in the queue while we were still sending. Not
+		// an error - the delivery will simply be retried. Logged so a flood of
+		// these points at a SendTimeout too close to StaleAfter.
+		w.log.Warn("delivery result discarded: the attempt was requeued while it was in flight",
+			"id", att.ID, "channel", att.ChannelName)
+	default:
 		w.log.Error("failed to record delivery result", "id", att.ID, "error", err)
 	}
 }
 
 // backoff returns the retry delay for the given attempt number using capped
-// exponential growth with full jitter.
+// exponential growth with EQUAL jitter: the delay is drawn from [exp/2, exp].
+//
+// Equal, not full ([0, exp]). Full jitter spreads a thundering herd better, but
+// it also lets a retry fire almost immediately, which for a channel that is
+// down means burning an attempt for nothing. Half the interval is kept as a
+// floor deliberately. (The comment here used to say "full jitter" while the
+// code did this - the code was right.)
 func (w *Worker) backoff(attempt int) time.Duration {
 	exp := float64(w.opts.BaseBackoff) * math.Pow(2, float64(attempt-1))
 	if exp > float64(w.opts.MaxBackoff) {
 		exp = float64(w.opts.MaxBackoff)
 	}
-	// Full jitter in [exp/2, exp]. math/rand/v2's top-level Float64 is safe for
-	// concurrent use by multiple worker goroutines.
+	// math/rand/v2's top-level Float64 is safe for concurrent use by multiple
+	// worker goroutines.
 	half := exp / 2
 	return time.Duration(half + rand.Float64()*half)
-}
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n]
 }
 
 type errNoChannel struct{ name string }

@@ -14,16 +14,17 @@ import (
 
 // Server holds the HTTP handlers and their service dependencies.
 type Server struct {
-	store       storage.Store
-	ingest      *service.IngestService
-	events      *service.EventService
-	deliveries  *service.DeliveryService
-	routing     *routing.Router
-	apiKeys     map[string]string // key -> scope
-	adminToken  string
-	version     string
-	corsOrigins []string
-	log         *slog.Logger
+	store          storage.Store
+	ingest         *service.IngestService
+	events         *service.EventService
+	deliveries     *service.DeliveryService
+	routing        *routing.Router
+	apiKeys        map[string]string // key -> scope
+	adminToken     string
+	version        string
+	corsOrigins    []string
+	trustedProxies *TrustedProxies
+	log            *slog.Logger
 
 	// Rate limiters (nil when disabled).
 	ipLimiter     *keyedLimiter
@@ -45,6 +46,9 @@ type Config struct {
 	RateLimit   config.RateLimit
 	CORSOrigins []string
 	Logger      *slog.Logger
+	// TrustedProxies decides whose X-Forwarded-For is believed when the per-IP
+	// limiter identifies a client. Nil trusts nothing.
+	TrustedProxies *TrustedProxies
 }
 
 // NewServer builds a Server from its dependencies.
@@ -58,16 +62,17 @@ func NewServer(c Config) *Server {
 		router = routing.NewAllChannels(nil)
 	}
 	s := &Server{
-		store:       c.Store,
-		ingest:      c.Ingest,
-		events:      c.Events,
-		deliveries:  c.Deliveries,
-		routing:     router,
-		apiKeys:     c.APIKeys,
-		adminToken:  c.AdminToken,
-		version:     c.Version,
-		corsOrigins: c.CORSOrigins,
-		log:         log,
+		store:          c.Store,
+		ingest:         c.Ingest,
+		events:         c.Events,
+		deliveries:     c.Deliveries,
+		routing:        router,
+		apiKeys:        c.APIKeys,
+		adminToken:     c.AdminToken,
+		version:        c.Version,
+		corsOrigins:    c.CORSOrigins,
+		trustedProxies: c.TrustedProxies,
+		log:            log,
 	}
 	if c.RateLimit.Enabled {
 		s.ipLimiter = newKeyedLimiter(c.RateLimit.PerIPPerSecond, c.RateLimit.PerIPBurst)
@@ -106,6 +111,12 @@ func (s *Server) Handler() http.Handler {
 	// Health/readiness (unguarded).
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("GET /ready", s.handleReady)
+	// Sub-path aliases. Monitoring tools and orchestrators are overwhelmingly
+	// configured against /health/live and /health/ready, and two names for the
+	// same check cost less than an integration guide explaining why ours differ.
+	// The original paths are part of the compatibility contract and stay.
+	mux.HandleFunc("GET /health/live", s.handleHealth)
+	mux.HandleFunc("GET /health/ready", s.handleReady)
 
 	// OpenAPI spec and Swagger UI (unguarded; the spec is public contract).
 	mux.HandleFunc("GET /openapi.yaml", s.handleOpenAPISpec)
@@ -126,7 +137,7 @@ func (s *Server) Handler() http.Handler {
 
 	var h http.Handler = mux
 	if s.ipLimiter != nil {
-		h = perIPLimit(s.ipLimiter, h)
+		h = perIPLimit(s.ipLimiter, s.trustedProxies, h)
 	}
 	if len(s.corsOrigins) > 0 {
 		h = cors(s.corsOrigins, h)

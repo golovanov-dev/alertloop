@@ -39,7 +39,7 @@ func TestWebhookSignsAndPosts(t *testing.T) {
 	if wh.Name() != "siem" || wh.Type() != domain.ChannelWebhook {
 		t.Fatalf("unexpected name/type: %s/%s", wh.Name(), wh.Type())
 	}
-	if err := wh.Send(context.Background(), sampleEvent()); err != nil {
+	if err := wh.Send(context.Background(), domain.Alert(sampleEvent())); err != nil {
 		t.Fatalf("send: %v", err)
 	}
 	if !Verify("topsecret", gotBody, gotSig) {
@@ -56,7 +56,7 @@ func TestWebhookNon2xxIsError(t *testing.T) {
 	}))
 	defer srv.Close()
 	wh := NewWebhook("wh", srv.URL, "s", time.Second)
-	if err := wh.Send(context.Background(), sampleEvent()); err == nil {
+	if err := wh.Send(context.Background(), domain.Alert(sampleEvent())); err == nil {
 		t.Fatal("expected error on 500 response")
 	}
 }
@@ -73,7 +73,7 @@ func TestTelegramSend(t *testing.T) {
 	defer srv.Close()
 
 	tg := NewTelegram(TelegramConfig{Name: "tg-main", BotToken: "BOT123", ChatID: "-100999", APIBase: srv.URL, Timeout: time.Second})
-	if err := tg.Send(context.Background(), sampleEvent()); err != nil {
+	if err := tg.Send(context.Background(), domain.Alert(sampleEvent())); err != nil {
 		t.Fatalf("send: %v", err)
 	}
 	if gotPath != "/botBOT123/sendMessage" {
@@ -100,7 +100,7 @@ func TestTelegramAPIErrorIsError(t *testing.T) {
 	}))
 	defer srv.Close()
 	tg := NewTelegram(TelegramConfig{Name: "tg", BotToken: "t", ChatID: "c", APIBase: srv.URL, Timeout: time.Second})
-	if err := tg.Send(context.Background(), sampleEvent()); err == nil {
+	if err := tg.Send(context.Background(), domain.Alert(sampleEvent())); err == nil {
 		t.Fatal("expected error from telegram API failure")
 	}
 }
@@ -121,7 +121,7 @@ func (f *fakeMailer) send(_ context.Context, from string, to []string, msg []byt
 func TestEmailBuildsMessage(t *testing.T) {
 	fm := &fakeMailer{}
 	e := newEmailWithSender("ops", "alerts@example.com", []string{"ops@example.com"}, fm)
-	if err := e.Send(context.Background(), sampleEvent()); err != nil {
+	if err := e.Send(context.Background(), domain.Alert(sampleEvent())); err != nil {
 		t.Fatalf("send: %v", err)
 	}
 	msg := string(fm.msg)
@@ -149,7 +149,7 @@ func TestEmailBuildsMessage(t *testing.T) {
 
 func TestPlainBodyOmitsMessage(t *testing.T) {
 	e := sampleEvent()
-	body := plainBody(e)
+	body := plainBody(domain.Alert(e))
 	if contains(body, e.Message) {
 		t.Fatalf("plainBody must not repeat the event message (it is in subjectLine):\n%s", body)
 	}
@@ -171,7 +171,7 @@ func TestEmailHeaderInjectionSanitized(t *testing.T) {
 	ev := sampleEvent()
 	// Attempt to inject an extra header via the message (CRLF).
 	ev.Message = "pwned\r\nBcc: attacker@evil.com"
-	if err := e.Send(context.Background(), ev); err != nil {
+	if err := e.Send(context.Background(), domain.Alert(ev)); err != nil {
 		t.Fatalf("send: %v", err)
 	}
 	msg := string(fm.msg)
@@ -190,7 +190,7 @@ func TestTelegramRedactsTokenOnNetworkError(t *testing.T) {
 	// Point at a closed local port so client.Do fails with a *url.Error whose
 	// text embeds the request URL (which contains the bot token).
 	tg := NewTelegram(TelegramConfig{Name: "tg", BotToken: "SUPERSECRETTOKEN", ChatID: "chat", APIBase: "http://127.0.0.1:1", Timeout: 500 * time.Millisecond})
-	err := tg.Send(context.Background(), sampleEvent())
+	err := tg.Send(context.Background(), domain.Alert(sampleEvent()))
 	if err == nil {
 		t.Fatal("expected a network error")
 	}

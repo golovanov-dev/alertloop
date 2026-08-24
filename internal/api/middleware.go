@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"log/slog"
 	"net/http"
@@ -31,7 +32,7 @@ func apiKeyAuth(keyScopes map[string]string, adminToken string, next http.Handle
 			writeError(w, http.StatusUnauthorized, "unauthorized", "missing API key or admin token")
 			return
 		}
-		if scope, ok := keyScopes[presented]; ok {
+		if scope, ok := lookupKey(keyScopes, presented); ok {
 			next.ServeHTTP(w, withScope(r, scope))
 			return
 		}
@@ -42,6 +43,36 @@ func apiKeyAuth(keyScopes map[string]string, adminToken string, next http.Handle
 		}
 		writeError(w, http.StatusUnauthorized, "unauthorized", "invalid API key or admin token")
 	})
+}
+
+// lookupKey resolves a presented API key to its scope without leaking, through
+// timing, how much of a key was guessed.
+//
+// A plain `map[string]string` lookup compares byte by byte and stops at the
+// first difference. That is a far weaker signal than a prefix comparison on a
+// raw string, and on its own it would be an acceptable risk - but the admin
+// token three lines below is compared with subtle.ConstantTimeCompare, so the
+// file contradicted itself, and the per-IP limiter that was supposed to bound
+// guessing did not work behind a reverse proxy at all (fixed separately).
+//
+// Comparing SHA-256 digests removes the question: every candidate costs the
+// same, and the loop deliberately does not break early.
+func lookupKey(keyScopes map[string]string, presented string) (string, bool) {
+	if len(keyScopes) == 0 || presented == "" {
+		return "", false
+	}
+	sum := sha256.Sum256([]byte(presented))
+	var (
+		scope string
+		found bool
+	)
+	for key, s := range keyScopes {
+		candidate := sha256.Sum256([]byte(key))
+		if subtle.ConstantTimeCompare(sum[:], candidate[:]) == 1 {
+			scope, found = s, true
+		}
+	}
+	return scope, found
 }
 
 func withScope(r *http.Request, scope string) *http.Request {

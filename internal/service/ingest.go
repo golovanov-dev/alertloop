@@ -6,6 +6,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -28,13 +29,14 @@ type IngestService struct {
 	store       storage.Store
 	router      *routing.Router
 	maxAttempts int
+	recovery    *RecoveryNotifier
 	now         Clock
 	log         *slog.Logger
 }
 
 // NewIngestService builds an IngestService. router decides which channels each
 // event is delivered to; a nil logger falls back to slog.Default().
-func NewIngestService(store storage.Store, router *routing.Router, maxAttempts int, now Clock, log *slog.Logger) *IngestService {
+func NewIngestService(store storage.Store, router *routing.Router, maxAttempts int, recovery *RecoveryNotifier, now Clock, log *slog.Logger) *IngestService {
 	if maxAttempts <= 0 {
 		maxAttempts = domain.DefaultMaxAttempts
 	}
@@ -47,32 +49,81 @@ func NewIngestService(store storage.Store, router *routing.Router, maxAttempts i
 	if log == nil {
 		log = slog.Default()
 	}
-	return &IngestService{store: store, router: router, maxAttempts: maxAttempts, now: now, log: log}
+	return &IngestService{store: store, router: router, maxAttempts: maxAttempts, recovery: recovery, now: now, log: log}
 }
+
+// IngestOutcome describes what an ingestion request did to the incident it
+// identifies. It exists so the HTTP layer can pick a status code without
+// re-deriving the decision the service already made.
+type IngestOutcome string
+
+const (
+	// OutcomeCreated: a new event was stored and its deliveries queued.
+	OutcomeCreated IngestOutcome = "created"
+	// OutcomeDeduplicated: an open incident with the same dedupe_key already
+	// existed and was returned untouched. This is the pre-0.4.0 behaviour, kept
+	// for requests that send no status.
+	OutcomeDeduplicated IngestOutcome = "deduplicated"
+	// OutcomeRefreshed: an open incident was updated with the newest report.
+	OutcomeRefreshed IngestOutcome = "refreshed"
+	// OutcomeResolved: this request closed the open incident.
+	OutcomeResolved IngestOutcome = "resolved"
+	// OutcomeAlreadyResolved: the incident was already closed; nothing changed.
+	OutcomeAlreadyResolved IngestOutcome = "already_resolved"
+	// OutcomeNothingToResolve: no event has ever carried this dedupe_key. Not an
+	// error — a monitoring source may report a recovery after retention removed
+	// the incident, or after being restarted.
+	OutcomeNothingToResolve IngestOutcome = "nothing_to_resolve"
+)
+
+// IngestResult is the outcome of one ingestion request. Event is nil only for
+// OutcomeNothingToResolve.
+type IngestResult struct {
+	Event   *domain.Event
+	Outcome IngestOutcome
+}
+
+// Created reports whether a new event row was stored.
+func (r IngestResult) Created() bool { return r.Outcome == OutcomeCreated }
 
 // EventInput is the validated, transport-neutral shape of an ingestion request.
 type EventInput struct {
-	Type       domain.EventType `json:"type"`
-	Severity   domain.Severity  `json:"severity"`
-	Source     string           `json:"source"`
-	Category   string           `json:"category"`
-	Message    string           `json:"message"`
-	EntityType string           `json:"entity_type"`
-	EntityID   string           `json:"entity_id"`
-	TraceID    string           `json:"trace_id"`
-	DedupeKey  string           `json:"dedupe_key"`
-	Payload    json.RawMessage  `json:"payload"`
+	// Status selects the ingestion semantics and is the opt-in to the incident
+	// lifecycle.
+	//
+	// Omitted, dedupe_key is an *idempotency* key and behaves exactly as it did
+	// before 0.4.0: a repeat returns the stored event untouched. Present, it is
+	// an *incident identity*: `firing` refreshes the open incident with the
+	// newest report, `resolved` closes it. The same field has always served both
+	// intents; making the intent explicit is what lets each keep its own
+	// semantics.
+	Status     domain.IngestStatus `json:"status"`
+	Type       domain.EventType    `json:"type"`
+	Severity   domain.Severity     `json:"severity"`
+	Source     string              `json:"source"`
+	Category   string              `json:"category"`
+	Message    string              `json:"message"`
+	EntityType string              `json:"entity_type"`
+	EntityID   string              `json:"entity_id"`
+	TraceID    string              `json:"trace_id"`
+	DedupeKey  string              `json:"dedupe_key"`
+	Payload    json.RawMessage     `json:"payload"`
 }
 
 // Ingest validates and stores an event. When the event is newly created it also
-// enqueues delivery attempts. If a matching dedupe_key already exists, the
-// existing event is returned and no new deliveries are created.
-func (s *IngestService) Ingest(ctx context.Context, in EventInput) (event *domain.Event, created bool, err error) {
+// enqueues delivery attempts. What happens when the dedupe_key is already known
+// depends on in.Status — see EventInput.Status and IngestOutcome.
+func (s *IngestService) Ingest(ctx context.Context, in EventInput) (IngestResult, error) {
 	if err := validateInput(&in); err != nil {
-		return nil, false, err
+		return IngestResult{}, err
 	}
 
 	now := s.now().UTC()
+
+	if in.Status == domain.StatusResolved {
+		return s.resolve(ctx, strings.TrimSpace(in.DedupeKey), now)
+	}
+
 	e := &domain.Event{
 		ID:         uuid.NewString(),
 		Type:       in.Type,
@@ -88,6 +139,7 @@ func (s *IngestService) Ingest(ctx context.Context, in EventInput) (event *domai
 		Payload:    normalizePayload(in.Payload),
 		CreatedAt:  now,
 		UpdatedAt:  now,
+		LastSeenAt: now,
 	}
 
 	// Routing runs once, here at ingestion: a repeated dedupe_key returns the
@@ -99,12 +151,82 @@ func (s *IngestService) Ingest(ctx context.Context, in EventInput) (event *domai
 	deliveries := s.buildDeliveries(e.ID, decision.Channels, now)
 	stored, created, err := s.store.CreateEventWithDeliveries(ctx, e, deliveries)
 	if err != nil {
-		return nil, false, err
+		return IngestResult{}, err
 	}
 	if created {
 		s.logRouting(e, decision)
+		return IngestResult{Event: stored, Outcome: OutcomeCreated}, nil
 	}
-	return stored, created, nil
+
+	// The key matched an incident that is still open. Without an explicit
+	// status the caller is using dedupe_key as an idempotency key, and a repeat
+	// must stay a no-op.
+	if in.Status != domain.StatusFiring {
+		return IngestResult{Event: stored, Outcome: OutcomeDeduplicated}, nil
+	}
+
+	// A repeated `firing`: the problem is still happening. Refresh the incident
+	// in place. No new deliveries — a check that fails every minute must not
+	// notify anyone every minute.
+	refreshed, err := s.store.RefreshOpenEvent(ctx, stored.ID, storage.EventUpdate{
+		Severity:   e.Severity,
+		Message:    e.Message,
+		Payload:    e.Payload,
+		LastSeenAt: now,
+	})
+	if err == nil {
+		s.log.Debug("open incident refreshed", "event_id", refreshed.ID, "dedupe_key", refreshed.DedupeKey)
+		return IngestResult{Event: refreshed, Outcome: OutcomeRefreshed}, nil
+	}
+	if !errors.Is(err, domain.ErrNotFound) {
+		return IngestResult{}, err
+	}
+
+	// The incident was resolved between the lookup and the update, so its key is
+	// free again. Retry the create: the source is telling us the problem is
+	// STILL HAPPENING, and returning "deduplicated" against a closed incident
+	// would drop that report on the floor - no update, no new incident, no
+	// notification - until the next check cycle.
+	//
+	// Once, not in a loop. If a second resolve lands in the same instant, the
+	// next report will open the incident; retrying forever to win a race
+	// against a source that is flapping that fast would be worse.
+	retry := *e
+	retry.ID = uuid.NewString()
+	stored, created, err = s.store.CreateEventWithDeliveries(ctx, &retry,
+		s.buildDeliveries(retry.ID, decision.Channels, now))
+	if err != nil {
+		return IngestResult{}, err
+	}
+	if created {
+		s.logRouting(&retry, decision)
+		return IngestResult{Event: stored, Outcome: OutcomeCreated}, nil
+	}
+	return IngestResult{Event: stored, Outcome: OutcomeDeduplicated}, nil
+}
+
+// resolve closes the open incident carrying key. It is deliberately forgiving:
+// a monitoring source that reports a recovery twice, or reports one for an
+// incident that retention already removed, has done nothing wrong and must not
+// receive an error it would log as a delivery failure.
+func (s *IngestService) resolve(ctx context.Context, key string, now time.Time) (IngestResult, error) {
+	event, closed, err := s.store.ResolveByDedupe(ctx, key, now)
+	if err != nil {
+		if errors.Is(err, domain.ErrNotFound) {
+			s.log.Debug("resolve for an unknown dedupe_key; nothing to close", "dedupe_key", key)
+			return IngestResult{Outcome: OutcomeNothingToResolve}, nil
+		}
+		return IngestResult{}, err
+	}
+	if !closed {
+		// Already closed. Notifying again would tell the same people the same
+		// good news twice, which is how a monitoring source that repeats itself
+		// becomes noise.
+		return IngestResult{Event: event, Outcome: OutcomeAlreadyResolved}, nil
+	}
+	s.log.Info("incident resolved by the reporting source", "event_id", event.ID, "dedupe_key", key)
+	s.recovery.Notify(ctx, event, now)
+	return IngestResult{Event: event, Outcome: OutcomeResolved}, nil
 }
 
 // logRouting records where a newly stored event went. An event that matched
@@ -140,6 +262,22 @@ func (s *IngestService) buildDeliveries(eventID string, targets []domain.Channel
 }
 
 func validateInput(in *EventInput) error {
+	if in.Status != "" && !domain.ValidIngestStatus(in.Status) {
+		return fmt.Errorf("%w: invalid status, expected \"firing\" or \"resolved\"", domain.ErrValidation)
+	}
+	// A recovery report identifies an incident and asserts it is over; it does
+	// not describe an event to store. Requiring a full event body for it would
+	// force every caller to repeat fields that are already recorded on the
+	// incident being closed.
+	if in.Status == domain.StatusResolved {
+		if strings.TrimSpace(in.DedupeKey) == "" {
+			return fmt.Errorf("%w: dedupe_key is required with status=resolved; it is what identifies the incident to close", domain.ErrValidation)
+		}
+		return nil
+	}
+	if in.Status == domain.StatusFiring && strings.TrimSpace(in.DedupeKey) == "" {
+		return fmt.Errorf("%w: dedupe_key is required with status=firing; without it every report would create a new incident", domain.ErrValidation)
+	}
 	if !domain.ValidEventType(in.Type) {
 		return fmt.Errorf("%w: invalid or missing type", domain.ErrValidation)
 	}

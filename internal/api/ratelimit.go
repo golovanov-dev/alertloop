@@ -1,7 +1,6 @@
 package api
 
 import (
-	"net"
 	"net/http"
 	"strconv"
 	"sync"
@@ -93,11 +92,30 @@ func (k *keyedLimiter) allow(key string, now time.Time) bool {
 	return e.bucket.allow(now)
 }
 
+// healthPaths are exempt from the per-IP limit.
+//
+// The Docker HEALTHCHECK fires every 30 seconds, an orchestrator probe more
+// often, and an external uptime check on top of that - all from the same
+// address, all spending tokens from the bucket that real clients need. Worse,
+// they would be the first thing throttled during an incident, which is exactly
+// when "is it up?" has to keep answering. They touch no database beyond a ping
+// and return a fixed body, so there is nothing here to abuse.
+var healthPaths = map[string]bool{
+	"/health":       true,
+	"/health/live":  true,
+	"/health/ready": true,
+	"/ready":        true,
+}
+
 // perIPLimit rejects requests from a client IP that exceeds the limiter's rate,
 // bounding brute-force of API keys / admin token and general abuse.
-func perIPLimit(k *keyedLimiter, next http.Handler) http.Handler {
+func perIPLimit(k *keyedLimiter, trusted *TrustedProxies, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !k.allow(clientIP(r), time.Now()) {
+		if healthPaths[r.URL.Path] {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if !k.allow(trusted.ClientIP(r), time.Now()) {
 			tooManyRequests(w)
 			return
 		}
@@ -120,15 +138,4 @@ func globalLimit(b *tokenBucket, next http.Handler) http.Handler {
 func tooManyRequests(w http.ResponseWriter) {
 	w.Header().Set("Retry-After", strconv.Itoa(1))
 	writeError(w, http.StatusTooManyRequests, "rate_limited", "too many requests")
-}
-
-// clientIP extracts the client's IP from RemoteAddr. When AlertLoop runs behind
-// a reverse proxy, the proxy is expected to enforce its own limits; app-level
-// per-IP limiting is a defense-in-depth for direct exposure.
-func clientIP(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
 }

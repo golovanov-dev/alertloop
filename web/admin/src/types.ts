@@ -28,6 +28,10 @@ export interface AlertEvent {
   payload?: unknown;
   created_at: string;
   updated_at: string;
+  /** When the incident was last reported as still firing. */
+  last_seen_at: string;
+  /** When the incident was closed. Absent while it is open. */
+  resolved_at?: string | null;
 }
 
 export interface DeliveryAttempt {
@@ -35,6 +39,8 @@ export interface DeliveryAttempt {
   event_id: string;
   channel: "email" | "telegram" | "webhook";
   channel_name: string;
+  /** "alert" announces the incident; "recovery" announces that it is over. */
+  kind: "alert" | "recovery";
   state: DeliveryState;
   attempts: number;
   max_attempts: number;

@@ -186,6 +186,14 @@ export function EventDetail() {
           <Meta label="Created">
             <span style={{ fontFamily: mono }}>{fullTime(event.created_at)}</span>
           </Meta>
+          <Meta label="Last seen">
+            <span style={{ fontFamily: mono }}>{event.last_seen_at ? fullTime(event.last_seen_at) : fullTime(event.created_at)}</span>
+          </Meta>
+          {event.resolved_at ? (
+            <Meta label="Resolved">
+              <span style={{ fontFamily: mono }}>{fullTime(event.resolved_at)}</span>
+            </Meta>
+          ) : null}
           <Meta label="Updated">
             <span style={{ fontFamily: mono }}>{fullTime(event.updated_at)}</span>
           </Meta>
@@ -223,7 +231,7 @@ export function EventDetail() {
             <table style={{ width: "100%", minWidth: 640, fontSize: 13.5 }}>
               <thead>
                 <tr>
-                  {["Channel", "State", "Attempts", "Next retry (local)", "Last error", "Updated (local)", ""].map((h, i) => (
+                  {["Channel", "Kind", "State", "Attempts", "Next retry (local)", "Last error", "Updated (local)", ""].map((h, i) => (
                     <th key={i} style={th}>
                       {h}
                     </th>
@@ -236,6 +244,10 @@ export function EventDetail() {
                     <td style={{ ...td, color: c.text2, whiteSpace: "nowrap" }}>
                       {d.channel} <span style={{ color: c.muted }}>/</span>{" "}
                       <code style={{ fontFamily: mono, fontSize: 12.5 }}>{d.channel_name}</code>
+                    </td>
+                    {/* One event can have both an alert and a recovery row. */}
+                    <td style={{ ...td, whiteSpace: "nowrap", color: d.kind === "recovery" ? c.text2 : c.muted }}>
+                      {d.kind === "recovery" ? "recovery" : "alert"}
                     </td>
                     <td style={td}>
                       <Badge kind="delivery" value={d.state} />

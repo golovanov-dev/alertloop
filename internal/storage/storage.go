@@ -5,6 +5,7 @@ package storage
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
 	"github.com/golovanov-dev/alertloop/internal/domain"
@@ -18,12 +19,23 @@ type EventFilter struct {
 	Source   string
 }
 
+// EventUpdate carries the fields a repeated `firing` refreshes on an incident
+// that is already open. State is not among them: an incident an operator has
+// acknowledged stays acknowledged while the underlying problem persists.
+type EventUpdate struct {
+	Severity   domain.Severity
+	Message    string
+	Payload    json.RawMessage
+	LastSeenAt time.Time
+}
+
 // DeliveryFilter narrows a delivery-attempt listing.
 type DeliveryFilter struct {
 	State       domain.DeliveryState
 	Channel     domain.ChannelType
 	ChannelName string
 	EventID     string
+	Kind        domain.DeliveryKind
 }
 
 // Page is a cursor-paginated result set.
@@ -39,9 +51,20 @@ type EventStore interface {
 	// to false and no new row is inserted.
 	CreateEvent(ctx context.Context, e *domain.Event) (stored *domain.Event, created bool, err error)
 	// CreateEventWithDeliveries inserts e together with its delivery attempts in
-	// a single transaction. On a dedupe hit the existing event is returned with
-	// created=false and no deliveries are inserted.
+	// a single transaction. On a dedupe hit the existing OPEN incident is
+	// returned with created=false and no deliveries are inserted; a resolved
+	// event never blocks a new one, so the same failure can recur.
 	CreateEventWithDeliveries(ctx context.Context, e *domain.Event, deliveries []*domain.DeliveryAttempt) (stored *domain.Event, created bool, err error)
+	// RefreshOpenEvent applies a repeated `firing` to the open incident id:
+	// last_seen_at moves forward and severity, message, and payload adopt the
+	// newest report. No delivery attempts are created. Returns
+	// domain.ErrNotFound if the incident was resolved in the meantime.
+	RefreshOpenEvent(ctx context.Context, id string, u EventUpdate) (*domain.Event, error)
+	// ResolveByDedupe closes the open incident carrying key. closed reports
+	// whether this call is what closed it — a repeated `resolved` returns the
+	// already-closed event with closed=false. A key that has never been seen
+	// returns domain.ErrNotFound.
+	ResolveByDedupe(ctx context.Context, key string, at time.Time) (event *domain.Event, closed bool, err error)
 	GetEvent(ctx context.Context, id string) (*domain.Event, error)
 	ListEvents(ctx context.Context, f EventFilter, limit int, cursor string) (Page[domain.Event], error)
 	// UpdateEventState sets the event's state and updated_at, returning the
@@ -58,6 +81,11 @@ type EventStore interface {
 // queue.
 type DeliveryStore interface {
 	CreateDeliveryAttempt(ctx context.Context, d *domain.DeliveryAttempt) error
+	// AlertedChannels lists the channels that received, or are still going to
+	// receive, the alert for eventID. Dead-lettered attempts are excluded: that
+	// channel never saw the problem, so it has no recovery to be told about.
+	// This is the audience for a recovery notice.
+	AlertedChannels(ctx context.Context, eventID string) ([]domain.ChannelTarget, error)
 	GetDeliveryAttempt(ctx context.Context, id string) (*domain.DeliveryAttempt, error)
 	ListDeliveryAttempts(ctx context.Context, f DeliveryFilter, limit int, cursor string) (Page[domain.DeliveryAttempt], error)
 	// ClaimDue atomically claims up to limit deliverable attempts (pending or

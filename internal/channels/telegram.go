@@ -104,8 +104,8 @@ type telegramResponse struct {
 // telegramMaxText is the Telegram Bot API hard limit for a message body.
 const telegramMaxText = 4096
 
-func (t *Telegram) Send(ctx context.Context, e *domain.Event) error {
-	text := truncateRunes(subjectLine(e)+"\n\n"+plainBody(e), telegramMaxText)
+func (t *Telegram) Send(ctx context.Context, n domain.Notification) error {
+	text := truncateRunes(subjectLine(n)+"\n\n"+plainBody(n), telegramMaxText)
 	body, err := json.Marshal(telegramRequest{ChatID: t.chatID, Text: text})
 	if err != nil {
 		return fmt.Errorf("marshal telegram request: %w", err)

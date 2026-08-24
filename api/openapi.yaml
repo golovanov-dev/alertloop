@@ -33,8 +33,27 @@ paths:
       summary: Ingest an event
       description: >
         Creates an event and enqueues one delivery attempt per configured
-        channel. When `dedupe_key` matches an existing event, the existing event
-        is returned with HTTP 200 and no new deliveries are created (idempotency).
+        channel.
+
+
+        What a repeated `dedupe_key` does depends on `status`. **Without
+        `status`** the key is an idempotency key and behaves as it always has:
+        the existing open event is returned with HTTP 200, untouched, and no
+        new deliveries are created. **With `status`** the key identifies an
+        incident: `firing` refreshes the open incident with the newest severity,
+        message, and payload (HTTP 200, still no new deliveries — a check that
+        fails every minute must not notify every minute), and `resolved` closes
+        it.
+
+
+        Closing an incident sends a **recovery notice** to the channels that
+        received the alert — and to no others. Repeating a recovery does not
+        notify twice. Turn it off with `notify_on_resolve: false` in the config
+        file.
+
+
+        Resolving an incident frees its `dedupe_key`, so the same failure
+        recurring afterwards opens a new incident and notifies again.
       security:
         - ApiKeyAuth: []
         - BearerAuth: []
@@ -43,9 +62,34 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/EventInput'
+              oneOf:
+                - $ref: '#/components/schemas/EventInput'
+                - $ref: '#/components/schemas/EventResolveInput'
             examples:
+              monit_firing:
+                summary: A monitoring source reports a problem
+                value:
+                  status: firing
+                  type: incident
+                  severity: critical
+                  source: monit
+                  category: availability
+                  message: PostgreSQL does not respond on port 5432
+                  dedupe_key: server-01:postgresql:availability
+                  payload:
+                    host: server-01
+                    service: postgresql
+                    monit_event: Connection failed
+              monit_resolved:
+                summary: The same source reports the recovery
+                description: >
+                  A recovery identifies an incident rather than describing a new
+                  event, so `dedupe_key` is the only required field.
+                value:
+                  status: resolved
+                  dedupe_key: server-01:postgresql:availability
               incident:
+                summary: A one-off application event (no lifecycle)
                 value:
                   type: incident
                   severity: critical
@@ -67,11 +111,21 @@ paths:
               schema:
                 $ref: '#/components/schemas/Event'
         "200":
-          description: Existing event returned (dedupe_key already seen).
+          description: >
+            The incident already existed. Without `status` it is returned
+            untouched; with `status: firing` it was refreshed with the newest
+            report; with `status: resolved` it is now closed (or was already).
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Event'
+        "204":
+          description: >
+            Accepted, with no incident to return: `status: resolved` for a
+            `dedupe_key` no event has ever carried. This is a success, not an
+            error — a monitoring source may report a recovery after retention
+            removed the incident, or after restarting without having seen the
+            failure.
         "400":
           $ref: '#/components/responses/BadRequest'
         "401":
@@ -138,6 +192,7 @@ paths:
         - { name: channel, in: query, schema: { $ref: '#/components/schemas/ChannelType' } }
         - { name: channel_name, in: query, schema: { type: string }, description: Filter by a specific configured channel name. }
         - { name: event_id, in: query, schema: { type: string } }
+        - { name: kind, in: query, schema: { $ref: '#/components/schemas/DeliveryKind' }, description: Filter alerts from recovery notices. }
         - $ref: '#/components/parameters/Limit'
         - $ref: '#/components/parameters/Cursor'
       responses:
@@ -314,6 +369,17 @@ paths:
     get:
       tags: [system]
       summary: Liveness probe
+      description: Alias of `/health/live`. Both paths are supported and equivalent.
+      responses:
+        "200":
+          description: Process is alive.
+  /health/live:
+    get:
+      tags: [system]
+      summary: Liveness probe (sub-path alias)
+      description: >
+        Identical to `/health`. Monitoring tools and orchestrators are
+        overwhelmingly configured against the sub-path form.
       responses:
         "200":
           description: Process is alive.
@@ -321,6 +387,17 @@ paths:
     get:
       tags: [system]
       summary: Readiness probe
+      description: Alias of `/health/ready`. Both paths are supported and equivalent.
+      responses:
+        "200":
+          description: Ready (database reachable).
+        "503":
+          description: Not ready.
+  /health/ready:
+    get:
+      tags: [system]
+      summary: Readiness probe (sub-path alias)
+      description: Identical to `/ready`.
       responses:
         "200":
           description: Ready (database reachable).
@@ -429,10 +506,53 @@ components:
     DeliveryState:
       type: string
       enum: [pending, sending, sent, failed, dead_letter]
+    DeliveryKind:
+      type: string
+      enum: [alert, recovery]
+      description: >
+        What a delivery attempt announces. `alert` — something happened.
+        `recovery` — the incident is over; created when an incident closes, and
+        only for the channels that were told about it. Attempts created before
+        0.4.0 read as `alert`.
+    IngestStatus:
+      type: string
+      enum: [firing, resolved]
+      description: >
+        The lifecycle signal attached to an incoming report. Omitting it keeps
+        the pre-0.4.0 idempotent-create semantics.
+    EventResolveInput:
+      type: object
+      required: [status, dedupe_key]
+      description: >
+        A recovery report. It identifies an incident and asserts that it is
+        over; it does not describe an event to store, so it carries none of the
+        event fields. Closing the open incident with this `dedupe_key` records
+        `resolved_at` and frees the key for the next occurrence.
+      properties:
+        status:
+          type: string
+          enum: [resolved]
+        dedupe_key:
+          type: string
+          description: The incident to close.
+      additionalProperties: false
     EventInput:
       type: object
       required: [type, source, message]
+      description: >
+        A report that something happened. With `status: firing` it opens or
+        refreshes an incident; without `status` it is an idempotent create.
+        To close an incident, send an EventResolveInput instead.
       properties:
+        status:
+          allOf:
+            - $ref: '#/components/schemas/IngestStatus'
+          description: >
+            `firing` — the problem is happening now; repeats refresh the open
+            incident. `resolved` — the problem is over; closes the open incident
+            carrying the same `dedupe_key`. Requires `dedupe_key` either way.
+            Omit it to keep the pre-0.4.0 behaviour, where a repeated
+            `dedupe_key` is a no-op.
         type: { $ref: '#/components/schemas/EventType' }
         severity: { $ref: '#/components/schemas/Severity' }
         source: { type: string }
@@ -443,7 +563,12 @@ components:
         trace_id: { type: string }
         dedupe_key:
           type: string
-          description: Idempotency key. Repeated values return the existing event.
+          description: >
+            Without `status`, an idempotency key: repeated values return the
+            existing event. With `status`, the identity of an incident — it must
+            be stable for one logical check and must not contain a timestamp, a
+            random id, a measured value, or error text that varies between
+            reports. Required whenever `status` is present.
         payload:
           type: object
           additionalProperties: true
@@ -465,6 +590,19 @@ components:
         payload: { type: object, additionalProperties: true }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
+        last_seen_at:
+          type: string
+          format: date-time
+          description: >
+            When the incident was last reported as still firing. Equal to
+            `created_at` for an event reported once.
+        resolved_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: >
+            When the incident was closed, by an ingested `status: resolved` or by
+            the manual resolve action. Absent while the incident is open.
     DeliveryAttempt:
       type: object
       properties:
@@ -474,6 +612,10 @@ components:
         channel_name:
           type: string
           description: The specific configured channel instance this attempt targets.
+        kind:
+          allOf:
+            - $ref: '#/components/schemas/DeliveryKind'
+          description: Whether this attempt announces the incident or its recovery.
         state: { $ref: '#/components/schemas/DeliveryState' }
         attempts: { type: integer }
         max_attempts: { type: integer }

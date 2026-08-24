@@ -34,10 +34,10 @@ func TestIngestCreatesEventAndFansOut(t *testing.T) {
 		{Type: domain.ChannelWebhook, Name: "siem"},
 		{Type: domain.ChannelEmail, Name: "ops"},
 	}
-	svc := NewIngestService(s, routing.NewAllChannels(targets), 5, time.Now, nil)
+	svc := NewIngestService(s, routing.NewAllChannels(targets), 5, nil, time.Now, nil)
 	ctx := context.Background()
 
-	ev, created, err := svc.Ingest(ctx, EventInput{
+	ev, created, err := svc.ingestLegacy(ctx, EventInput{
 		Type: domain.EventIncident, Severity: domain.SeverityCritical,
 		Source: "feeds", Message: "failed", DedupeKey: "k1",
 	})
@@ -63,10 +63,10 @@ func TestIngestFansOutToMultipleChannelsOfSameType(t *testing.T) {
 		{Type: domain.ChannelTelegram, Name: "tg-en"},
 		{Type: domain.ChannelWebhook, Name: "siem"},
 	}
-	svc := NewIngestService(s, routing.NewAllChannels(targets), 5, time.Now, nil)
+	svc := NewIngestService(s, routing.NewAllChannels(targets), 5, nil, time.Now, nil)
 	ctx := context.Background()
 
-	ev, _, err := svc.Ingest(ctx, EventInput{Type: domain.EventIncident, Source: "s", Message: "m"})
+	ev, _, err := svc.ingestLegacy(ctx, EventInput{Type: domain.EventIncident, Source: "s", Message: "m"})
 	if err != nil {
 		t.Fatalf("ingest: %v", err)
 	}
@@ -135,7 +135,7 @@ func TestIngestRoutesEventsToDifferentAudiences(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build router: %v", err)
 	}
-	svc := NewIngestService(s, router, 5, time.Now, nil)
+	svc := NewIngestService(s, router, 5, nil, time.Now, nil)
 	ctx := context.Background()
 
 	cases := []struct {
@@ -158,7 +158,7 @@ func TestIngestRoutesEventsToDifferentAudiences(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			ev, created, err := svc.Ingest(ctx, c.in)
+			ev, created, err := svc.ingestLegacy(ctx, c.in)
 			if err != nil || !created {
 				t.Fatalf("ingest: created=%v err=%v", created, err)
 			}
@@ -179,9 +179,9 @@ func TestIngestRoutesEventsToDifferentAudiences(t *testing.T) {
 // every configured channel.
 func TestIngestWithoutRoutingDeliversToAllChannels(t *testing.T) {
 	s := newStore(t)
-	svc := NewIngestService(s, routing.NewAllChannels(routingTargets()), 5, time.Now, nil)
+	svc := NewIngestService(s, routing.NewAllChannels(routingTargets()), 5, nil, time.Now, nil)
 
-	ev, _, err := svc.Ingest(context.Background(), EventInput{
+	ev, _, err := svc.ingestLegacy(context.Background(), EventInput{
 		Type: domain.EventBusiness, Source: "shop", Category: "order.created", Message: "m",
 	})
 	if err != nil {
@@ -206,19 +206,19 @@ func TestIngestWarnsWhenNothingMatchesAndNoDefault(t *testing.T) {
 		t.Fatalf("build router: %v", err)
 	}
 	var logged bytes.Buffer
-	svc := NewIngestService(s, router, 5, time.Now,
+	svc := NewIngestService(s, router, 5, nil, time.Now,
 		slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	ctx := context.Background()
 
 	// A routed event is not warned about.
-	if _, _, err := svc.Ingest(ctx, EventInput{Type: domain.EventIncident, Source: "s", Message: "m"}); err != nil {
+	if _, _, err := svc.ingestLegacy(ctx, EventInput{Type: domain.EventIncident, Source: "s", Message: "m"}); err != nil {
 		t.Fatalf("ingest incident: %v", err)
 	}
 	if strings.Contains(logged.String(), "level=WARN") {
 		t.Fatalf("a routed event produced a warning:\n%s", logged.String())
 	}
 
-	ev, _, err := svc.Ingest(ctx, EventInput{
+	ev, _, err := svc.ingestLegacy(ctx, EventInput{
 		Type: domain.EventAudit, Severity: domain.SeverityWarning,
 		Source: "admin", Category: "login", Message: "m", DedupeKey: "dup",
 	})
@@ -237,7 +237,7 @@ func TestIngestWarnsWhenNothingMatchesAndNoDefault(t *testing.T) {
 
 	// A dedupe hit is not a new undelivered event and must not warn again.
 	before := strings.Count(out, "level=WARN")
-	if _, created, err := svc.Ingest(ctx, EventInput{
+	if _, created, err := svc.ingestLegacy(ctx, EventInput{
 		Type: domain.EventAudit, Source: "admin", Message: "m2", DedupeKey: "dup",
 	}); err != nil || created {
 		t.Fatalf("second ingest: created=%v err=%v", created, err)
@@ -256,10 +256,10 @@ func TestIngestSuppressedEventIsStillStoredAndListed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build router: %v", err)
 	}
-	svc := NewIngestService(s, router, 5, time.Now, nil)
+	svc := NewIngestService(s, router, 5, nil, time.Now, nil)
 	ctx := context.Background()
 
-	ev, created, err := svc.Ingest(ctx, EventInput{Type: domain.EventIncident, Source: "s", Message: "m"})
+	ev, created, err := svc.ingestLegacy(ctx, EventInput{Type: domain.EventIncident, Source: "s", Message: "m"})
 	if err != nil || !created {
 		t.Fatalf("ingest: created=%v err=%v", created, err)
 	}
@@ -274,11 +274,11 @@ func TestIngestSuppressedEventIsStillStoredAndListed(t *testing.T) {
 
 func TestIngestDedupeCreatesNoNewDeliveries(t *testing.T) {
 	s := newStore(t)
-	svc := NewIngestService(s, routing.NewAllChannels([]domain.ChannelTarget{{Type: domain.ChannelWebhook, Name: "wh"}}), 5, time.Now, nil)
+	svc := NewIngestService(s, routing.NewAllChannels([]domain.ChannelTarget{{Type: domain.ChannelWebhook, Name: "wh"}}), 5, nil, time.Now, nil)
 	ctx := context.Background()
 
-	first, _, _ := svc.Ingest(ctx, EventInput{Type: domain.EventIncident, Source: "s", Message: "m", DedupeKey: "dup"})
-	second, created, err := svc.Ingest(ctx, EventInput{Type: domain.EventIncident, Source: "s", Message: "m2", DedupeKey: "dup"})
+	first, _, _ := svc.ingestLegacy(ctx, EventInput{Type: domain.EventIncident, Source: "s", Message: "m", DedupeKey: "dup"})
+	second, created, err := svc.ingestLegacy(ctx, EventInput{Type: domain.EventIncident, Source: "s", Message: "m2", DedupeKey: "dup"})
 	if err != nil {
 		t.Fatalf("second ingest: %v", err)
 	}
@@ -296,7 +296,7 @@ func TestIngestDedupeCreatesNoNewDeliveries(t *testing.T) {
 
 func TestIngestValidation(t *testing.T) {
 	s := newStore(t)
-	svc := NewIngestService(s, nil, 5, time.Now, nil)
+	svc := NewIngestService(s, nil, 5, nil, time.Now, nil)
 	ctx := context.Background()
 
 	cases := []EventInput{
@@ -306,7 +306,7 @@ func TestIngestValidation(t *testing.T) {
 		{Type: domain.EventIncident, Source: "s", Message: "m", Payload: []byte(`{bad json`)},
 	}
 	for i, c := range cases {
-		if _, _, err := svc.Ingest(ctx, c); err == nil {
+		if _, _, err := svc.ingestLegacy(ctx, c); err == nil {
 			t.Errorf("case %d: expected validation error", i)
 		}
 	}
@@ -314,8 +314,8 @@ func TestIngestValidation(t *testing.T) {
 
 func TestIngestDefaultsSeverity(t *testing.T) {
 	s := newStore(t)
-	svc := NewIngestService(s, nil, 5, time.Now, nil)
-	ev, _, err := svc.Ingest(context.Background(), EventInput{
+	svc := NewIngestService(s, nil, 5, nil, time.Now, nil)
+	ev, _, err := svc.ingestLegacy(context.Background(), EventInput{
 		Type: domain.EventBusiness, Source: "s", Message: "m",
 	})
 	if err != nil {
@@ -324,4 +324,14 @@ func TestIngestDefaultsSeverity(t *testing.T) {
 	if ev.Severity != domain.SeverityInfo {
 		t.Fatalf("expected default severity info, got %q", ev.Severity)
 	}
+}
+
+// ingestLegacy is the pre-0.4.0 three-value shape of Ingest: event, created,
+// error. The tests above were written against it, and keeping them on it is
+// deliberate — they are now the regression suite proving that a client which
+// sends no `status` still sees exactly the 0.3.x behaviour. Lifecycle tests use
+// the real Ingest and read the outcome.
+func (s *IngestService) ingestLegacy(ctx context.Context, in EventInput) (*domain.Event, bool, error) {
+	res, err := s.Ingest(ctx, in)
+	return res.Event, res.Created(), err
 }

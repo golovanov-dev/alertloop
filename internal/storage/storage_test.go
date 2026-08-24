@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"testing"
@@ -225,9 +226,18 @@ func TestReplayOnlyDeadLetter(t *testing.T) {
 		t.Fatalf("expected ErrNotReplayable for pending, got %v", err)
 	}
 
+	// Claim it first. MarkResult only writes to a row that is still `sending`,
+	// which is the state the worker put it in - a result arriving for a row
+	// nobody claimed would be stamping an outcome on somebody else's job.
+	claimed, err := s.ClaimDue(ctx, time.Now(), 10)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claim: got %d attempts, err=%v", len(claimed), err)
+	}
 	d.State = domain.DeliveryDeadLetter
 	d.Attempts = 5
-	_ = s.MarkResult(ctx, d)
+	if err := s.MarkResult(ctx, d); err != nil {
+		t.Fatalf("mark dead-letter: %v", err)
+	}
 	replayed, err := s.Replay(ctx, "d1", time.Now())
 	if err != nil {
 		t.Fatalf("replay: %v", err)
@@ -296,5 +306,41 @@ func TestRetentionDelete(t *testing.T) {
 	}
 	if _, err := s.GetEvent(ctx, "new"); err != nil {
 		t.Fatal("new event should remain")
+	}
+}
+
+// Payload text goes through the store as a raw JSON string, so the characters
+// that break naive quoting have to survive it. This runs on SQLite; the same
+// assertion against PostgreSQL, where payload is JSONB rather than TEXT, is in
+// TestPostgresEventRoundTrip.
+func TestPayloadSurvivesStorage(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 22, 9, 0, 0, 0, time.UTC)
+
+	e := sampleEvent("payload-1", "payload:key", now)
+	e.Payload = []byte(`{"quote":"it's","dquote":"say \"hi\"","newline":"a\nb","unicode":"привет — ok","brace":"a}b","nested":{"n":1.5,"list":[1,"two",null]}}`)
+	if _, _, err := s.CreateEvent(ctx, e); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	got, err := s.GetEvent(ctx, "payload-1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	var back map[string]any
+	if err := json.Unmarshal(got.Payload, &back); err != nil {
+		t.Fatalf("payload is not valid JSON after the round trip: %v (%s)", err, got.Payload)
+	}
+	for k, want := range map[string]string{
+		"quote":   "it's",
+		"dquote":  `say "hi"`,
+		"newline": "a\nb",
+		"unicode": "привет — ok",
+		"brace":   "a}b",
+	} {
+		if back[k] != want {
+			t.Errorf("payload[%q] = %v, want %q", k, back[k], want)
+		}
 	}
 }

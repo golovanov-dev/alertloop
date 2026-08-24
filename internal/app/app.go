@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/golovanov-dev/alertloop/internal/api"
@@ -56,6 +57,10 @@ func New(ctx context.Context, cfg config.Config, version string, log *slog.Logge
 		return nil, err
 	}
 
+	// nil when notify_on_resolve is off, which makes "do not notify" a nil
+	// pointer rather than a flag every call site has to remember.
+	recovery := service.NewRecoveryNotifier(store, cfg.ShouldNotifyOnResolve(), cfg.Worker.MaxAttempts, log)
+
 	router, err := buildRouter(cfg.Routing, registry.Targets())
 	if err != nil {
 		_ = store.Close()
@@ -69,8 +74,8 @@ func New(ctx context.Context, cfg config.Config, version string, log *slog.Logge
 		store:    store,
 		registry: registry,
 		router:   router,
-		ingest:   service.NewIngestService(store, router, cfg.Worker.MaxAttempts, time.Now, log),
-		events:   service.NewEventService(store, time.Now),
+		ingest:   service.NewIngestService(store, router, cfg.Worker.MaxAttempts, recovery, time.Now, log),
+		events:   service.NewEventService(store, recovery, time.Now),
 		delivery: service.NewDeliveryService(store, time.Now),
 	}
 
@@ -81,7 +86,12 @@ func New(ctx context.Context, cfg config.Config, version string, log *slog.Logge
 	for _, w := range cfg.Warnings {
 		log.Warn(w)
 	}
-	if len(cfg.APIKeys) == 0 {
+	// Both empty, not either: apiKeyAuth opens the API only when there is
+	// neither a key nor an admin token. Warning about a configuration that has
+	// an admin token - which is what the image ships and what the systemd
+	// installer generates - trains operators to ignore the message, and then
+	// they ignore the real one.
+	if len(cfg.APIKeys) == 0 && cfg.AdminToken == "" {
 		log.Warn("no API keys configured — the JSON API is open to anyone who can reach it")
 	}
 	if registry.Len() == 0 {
@@ -230,18 +240,28 @@ func (a *App) RunServer(ctx context.Context) error {
 	for _, k := range a.cfg.APIKeys {
 		keyScopes[k.Key] = k.Scope
 	}
+	trusted, err := api.NewTrustedProxies(a.cfg.RateLimit.TrustedProxies)
+	if err != nil {
+		return fmt.Errorf("rate_limit.trusted_proxies: %w", err)
+	}
+	if trusted.Configured() {
+		a.log.Info("trusting X-Forwarded-For from configured proxies",
+			"proxies", a.cfg.RateLimit.TrustedProxies)
+	}
+
 	srv := api.NewServer(api.Config{
-		Store:       a.store,
-		Ingest:      a.ingest,
-		Events:      a.events,
-		Deliveries:  a.delivery,
-		Routing:     a.router,
-		APIKeys:     keyScopes,
-		AdminToken:  a.cfg.AdminToken,
-		Version:     a.version,
-		RateLimit:   a.cfg.RateLimit,
-		CORSOrigins: a.cfg.CORSOrigins,
-		Logger:      a.log,
+		Store:          a.store,
+		Ingest:         a.ingest,
+		Events:         a.events,
+		Deliveries:     a.delivery,
+		Routing:        a.router,
+		APIKeys:        keyScopes,
+		AdminToken:     a.cfg.AdminToken,
+		Version:        a.version,
+		RateLimit:      a.cfg.RateLimit,
+		CORSOrigins:    a.cfg.CORSOrigins,
+		TrustedProxies: trusted,
+		Logger:         a.log,
 	})
 	httpSrv := &http.Server{
 		Addr:              a.cfg.Addr,
@@ -281,18 +301,56 @@ func (a *App) RunWorker(ctx context.Context) error {
 		BaseBackoff:  a.cfg.Worker.BaseBackoff,
 		MaxBackoff:   a.cfg.Worker.MaxBackoff,
 	}, a.log)
-	go a.runRetention(ctx)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		a.runRetention(ctx)
+	}()
 	w.Run(ctx)
+	// Wait for retention too: main closes the database as soon as this returns,
+	// and a sweep still deleting rows would find its connection pulled.
+	wg.Wait()
 	return nil
 }
 
 // RunAll runs the HTTP server and the worker (which includes retention cleanup)
 // together in one process.
+//
+// It waits for BOTH to finish. Returning on the first one to exit let main's
+// `defer a.Close()` shut the database while the HTTP server was still inside
+// its ten-second graceful shutdown, so requests in flight during a restart
+// failed on a closed pool instead of completing - the one thing graceful
+// shutdown exists to prevent.
 func (a *App) RunAll(ctx context.Context) error {
+	// A failure in either half should bring the other down rather than leaving
+	// a half-running process: a server with no worker delivers nothing.
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	errCh := make(chan error, 2)
-	go func() { errCh <- a.RunServer(ctx) }()
-	go func() { errCh <- a.RunWorker(ctx) }()
-	return <-errCh
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		defer cancel()
+		errCh <- a.RunServer(runCtx)
+	}()
+	go func() {
+		defer wg.Done()
+		defer cancel()
+		errCh <- a.RunWorker(runCtx)
+	}()
+	wg.Wait()
+	close(errCh)
+
+	// Report the first real failure, if there was one.
+	for err := range errCh {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // runRetention periodically deletes events (and their delivery attempts) older

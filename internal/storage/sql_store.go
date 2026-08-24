@@ -67,29 +67,43 @@ type execer interface {
 }
 
 const insertEventSQL = `INSERT INTO events
-	(id, type, severity, state, source, category, message, entity_type, entity_id, trace_id, dedupe_key, payload, created_at, updated_at)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	(id, type, severity, state, source, category, message, entity_type, entity_id, trace_id, dedupe_key, payload, created_at, updated_at, last_seen_at, resolved_at)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 func (s *sqlStore) insertEvent(ctx context.Context, ex execer, e *domain.Event) error {
 	payload := e.Payload
 	if len(payload) == 0 {
 		payload = []byte("{}")
 	}
+	lastSeen := e.LastSeenAt
+	if lastSeen.IsZero() {
+		// An event stored without an explicit sighting was seen once, when it
+		// was created. The column is never left empty: age and ordering
+		// queries treat it as a timestamp.
+		lastSeen = e.CreatedAt
+	}
 	_, err := ex.ExecContext(ctx, s.d.rebind(insertEventSQL),
 		e.ID, e.Type, e.Severity, e.State, e.Source, e.Category, e.Message,
 		e.EntityType, e.EntityID, e.TraceID, e.DedupeKey, string(payload),
 		formatTime(e.CreatedAt), formatTime(e.UpdatedAt),
+		formatTime(lastSeen), nullableTime(e.ResolvedAt),
 	)
 	return err
 }
 
 const insertDeliverySQL = `INSERT INTO delivery_attempts
-	(id, event_id, channel, channel_name, state, attempts, max_attempts, next_retry_at, last_error, created_at, updated_at)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	(id, event_id, channel, channel_name, kind, state, attempts, max_attempts, next_retry_at, last_error, created_at, updated_at)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 func (s *sqlStore) insertDelivery(ctx context.Context, ex execer, d *domain.DeliveryAttempt) error {
+	kind := d.Kind
+	if kind == "" {
+		// A caller that does not say is announcing an event, which is what every
+		// delivery was before recovery notices existed.
+		kind = domain.KindAlert
+	}
 	_, err := ex.ExecContext(ctx, s.d.rebind(insertDeliverySQL),
-		d.ID, d.EventID, d.Channel, d.ChannelName, d.State, d.Attempts, d.MaxAttempts,
+		d.ID, d.EventID, d.Channel, d.ChannelName, kind, d.State, d.Attempts, d.MaxAttempts,
 		nullableTime(d.NextRetryAt), d.LastError, formatTime(d.CreatedAt), formatTime(d.UpdatedAt),
 	)
 	return err
@@ -144,21 +158,31 @@ func (s *sqlStore) CreateEventWithDeliveries(ctx context.Context, e *domain.Even
 	return e, true, nil
 }
 
-const eventColumns = `id, type, severity, state, source, category, message, entity_type, entity_id, trace_id, dedupe_key, payload, created_at, updated_at`
+const eventColumns = `id, type, severity, state, source, category, message, entity_type, entity_id, trace_id, dedupe_key, payload, created_at, updated_at, last_seen_at, resolved_at`
 
 func scanEvent(sc interface{ Scan(...any) error }) (*domain.Event, error) {
 	var e domain.Event
 	var payload []byte
-	var created, updated string
+	var created, updated, lastSeen string
+	var resolved sql.NullString
 	if err := sc.Scan(
 		&e.ID, &e.Type, &e.Severity, &e.State, &e.Source, &e.Category, &e.Message,
 		&e.EntityType, &e.EntityID, &e.TraceID, &e.DedupeKey, &payload, &created, &updated,
+		&lastSeen, &resolved,
 	); err != nil {
 		return nil, err
 	}
 	e.Payload = payload
 	e.CreatedAt = parseTime(created)
 	e.UpdatedAt = parseTime(updated)
+	e.LastSeenAt = parseTime(lastSeen)
+	if e.LastSeenAt.IsZero() {
+		e.LastSeenAt = e.CreatedAt
+	}
+	if resolved.Valid && resolved.String != "" {
+		t := parseTime(resolved.String)
+		e.ResolvedAt = &t
+	}
 	return &e, nil
 }
 
@@ -171,8 +195,26 @@ func (s *sqlStore) GetEvent(ctx context.Context, id string) (*domain.Event, erro
 	return e, err
 }
 
+// eventByDedupe returns the OPEN incident carrying key. Resolved events are
+// excluded on purpose: closing an incident frees its key, so a failure that
+// recurs after being fixed becomes a new event instead of being swallowed as a
+// duplicate of the closed one. The partial unique index guarantees at most one
+// open row per key.
 func (s *sqlStore) eventByDedupe(ctx context.Context, key string) (*domain.Event, error) {
-	q := s.d.rebind(`SELECT ` + eventColumns + ` FROM events WHERE dedupe_key = ?`)
+	q := s.d.rebind(`SELECT ` + eventColumns + ` FROM events WHERE dedupe_key = ? AND state <> ?`)
+	e, err := scanEvent(s.db.QueryRowContext(ctx, q, key, domain.StateResolved))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, domain.ErrNotFound
+	}
+	return e, err
+}
+
+// latestEventByDedupe returns the most recent event carrying key regardless of
+// state. It answers a repeated `resolved` idempotently: the incident is already
+// closed, and the caller should see the event that closed it rather than an
+// error about there being nothing to resolve.
+func (s *sqlStore) latestEventByDedupe(ctx context.Context, key string) (*domain.Event, error) {
+	q := s.d.rebind(`SELECT ` + eventColumns + ` FROM events WHERE dedupe_key = ? ORDER BY created_at DESC, id DESC LIMIT 1`)
 	e, err := scanEvent(s.db.QueryRowContext(ctx, q, key))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, domain.ErrNotFound
@@ -245,8 +287,21 @@ func (s *sqlStore) ListEvents(ctx context.Context, f EventFilter, limit int, cur
 }
 
 func (s *sqlStore) UpdateEventState(ctx context.Context, id string, state domain.EventState, at time.Time) (*domain.Event, error) {
-	q := s.d.rebind(`UPDATE events SET state = ?, updated_at = ? WHERE id = ?`)
-	res, err := s.db.ExecContext(ctx, q, state, formatTime(at), id)
+	// Closing an incident by hand stamps resolved_at exactly as an ingested
+	// `status: resolved` does; otherwise the two paths would disagree about
+	// when the same incident ended. Leaving the resolved state clears it again.
+	var (
+		q    string
+		args []any
+	)
+	if state == domain.StateResolved {
+		q = s.d.rebind(`UPDATE events SET state = ?, updated_at = ?, resolved_at = ? WHERE id = ?`)
+		args = []any{state, formatTime(at), formatTime(at), id}
+	} else {
+		q = s.d.rebind(`UPDATE events SET state = ?, updated_at = ?, resolved_at = NULL WHERE id = ?`)
+		args = []any{state, formatTime(at), id}
+	}
+	res, err := s.db.ExecContext(ctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("update event state: %w", err)
 	}
@@ -256,22 +311,128 @@ func (s *sqlStore) UpdateEventState(ctx context.Context, id string, state domain
 	return s.GetEvent(ctx, id)
 }
 
+// RefreshOpenEvent applies a repeated `firing` to an already-open incident: it
+// moves last_seen_at forward and adopts the newest severity, message, and
+// payload. It deliberately does NOT touch state — an incident an operator has
+// acknowledged stays acknowledged while the problem keeps firing — and it
+// creates no delivery attempts, so a check that fails every minute does not
+// notify anyone every minute.
+func (s *sqlStore) RefreshOpenEvent(ctx context.Context, id string, u EventUpdate) (*domain.Event, error) {
+	payload := u.Payload
+	if len(payload) == 0 {
+		payload = []byte("{}")
+	}
+	q := s.d.rebind(`UPDATE events SET severity = ?, message = ?, payload = ?, last_seen_at = ?, updated_at = ?
+		WHERE id = ? AND state <> ?`)
+	res, err := s.db.ExecContext(ctx, q,
+		u.Severity, u.Message, string(payload), formatTime(u.LastSeenAt), formatTime(u.LastSeenAt),
+		id, domain.StateResolved,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("refresh event: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		// The incident was resolved between the lookup and this update.
+		return nil, domain.ErrNotFound
+	}
+	return s.GetEvent(ctx, id)
+}
+
+// ResolveByDedupe closes the open incident carrying key. closed reports whether
+// this call is what closed it: a repeated `resolved` returns the already-closed
+// event with closed=false, and a key that has never been seen returns
+// domain.ErrNotFound.
+func (s *sqlStore) ResolveByDedupe(ctx context.Context, key string, at time.Time) (event *domain.Event, closed bool, err error) {
+	if key == "" {
+		return nil, false, domain.ErrNotFound
+	}
+	// RETURNING, not UPDATE-then-SELECT. Closing an incident FREES its key -
+	// that is the whole point of the partial unique index - so a `firing` for
+	// the same key arriving between the two statements would be read back as
+	// "the event we just resolved". The recovery notice would then go to that
+	// new incident's channels, announcing that a problem which started a second
+	// ago is over, with a duration computed from the wrong start time.
+	//
+	// Both engines support RETURNING (SQLite since 3.35, and the pure-Go driver
+	// is newer than that), so the read cannot be separated from the write.
+	q := s.d.rebind(`UPDATE events SET state = ?, resolved_at = ?, updated_at = ?
+		WHERE dedupe_key = ? AND state <> ?
+		RETURNING ` + eventColumns)
+	closedEvent, err := scanEvent(s.db.QueryRowContext(ctx, q,
+		domain.StateResolved, formatTime(at), formatTime(at), key, domain.StateResolved))
+	if err == nil {
+		return closedEvent, true, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return nil, false, fmt.Errorf("resolve event by dedupe_key: %w", err)
+	}
+
+	// Nothing was open. Either it is already closed - a source repeating a
+	// recovery - or the key has never been seen.
+	e, err := s.latestEventByDedupe(ctx, key)
+	if err != nil {
+		return nil, false, err
+	}
+	return e, false, nil
+}
+
+// DeleteEventsBefore removes events that stopped mattering before cutoff.
+//
+// The age of an event is NOT its creation time. A resolved incident ages from
+// when it was resolved; an incident still open ages from when it was last
+// reported. Before 0.4.0 the two were the same thing, because every report was
+// a separate row - but a repeated `firing` now moves last_seen_at and leaves
+// created_at where it was, so ageing by creation would delete precisely the
+// incident that has been burning longest, while it is still burning.
+//
+// What that cost, concretely: the incident vanishes from the API while the
+// problem continues; the eventual `status: resolved` then finds nothing to
+// close and notifies nobody; and the next report opens a fresh incident and
+// wakes everyone again.
+//
+// COALESCE gives one rule for both cases and keeps pre-0.4.0 behaviour intact:
+// for an event reported once and never resolved, last_seen_at IS created_at.
 func (s *sqlStore) DeleteEventsBefore(ctx context.Context, cutoff time.Time) (int64, error) {
-	return s.deleteBefore(ctx, "events", cutoff)
+	return s.deleteBatched(ctx, "events",
+		"COALESCE(resolved_at, last_seen_at) < ?", formatTime(cutoff))
 }
 
 // deleteBefore removes rows created before cutoff in bounded batches so a large
 // retention sweep never holds a single long lock (which on SQLite would stall
 // the whole API, and on Postgres would bloat WAL/locks). table is an internal
 // constant, never user input.
-func (s *sqlStore) deleteBefore(ctx context.Context, table string, cutoff time.Time) (int64, error) {
-	const batch = 1000
-	cut := formatTime(cutoff)
+// deleteBatched removes rows matching where in bounded batches. table and where
+// are internal constants, never user input.
+//
+// It yields between batches. On SQLite there is exactly ONE connection by
+// design, so a sweep that loops without pausing holds it for the whole run and
+// every API request and every delivery queues behind garbage collection. It
+// also checks ctx: a shutdown during a long sweep should stop, not finish
+// deleting a million rows first.
+func (s *sqlStore) deleteBatched(ctx context.Context, table, where string, args ...any) (int64, error) {
+	const (
+		batch = 1000
+		// Long enough for a waiting query to be served between batches, short
+		// enough that a large sweep still finishes in one retention run.
+		pause = 50 * time.Millisecond
+	)
 	q := s.d.rebind(fmt.Sprintf(
-		`DELETE FROM %s WHERE id IN (SELECT id FROM %s WHERE created_at < ? LIMIT ?)`, table, table))
+		`DELETE FROM %s WHERE id IN (SELECT id FROM %s WHERE %s LIMIT ?)`, table, table, where))
+	params := make([]any, 0, len(args)+1)
+	params = append(params, args...)
+	params = append(params, batch)
+
 	var total int64
 	for {
-		res, err := s.db.ExecContext(ctx, q, cut, batch)
+		// A cancelled context means shutdown, not failure: report how much was
+		// deleted and stop. Surfacing it as an error would log a scary line
+		// every time the service restarts during a sweep.
+		select {
+		case <-ctx.Done():
+			return total, nil
+		default:
+		}
+		res, err := s.db.ExecContext(ctx, q, params...)
 		if err != nil {
 			return total, fmt.Errorf("delete from %s: %w", table, err)
 		}
@@ -280,22 +441,30 @@ func (s *sqlStore) deleteBefore(ctx context.Context, table string, cutoff time.T
 		if n < batch {
 			return total, nil
 		}
+		select {
+		case <-ctx.Done():
+			return total, nil
+		case <-time.After(pause):
+		}
 	}
 }
 
 // --- Delivery attempts ----------------------------------------------------
 
-const deliveryColumns = `id, event_id, channel, channel_name, state, attempts, max_attempts, next_retry_at, last_error, created_at, updated_at`
+const deliveryColumns = `id, event_id, channel, channel_name, kind, state, attempts, max_attempts, next_retry_at, last_error, created_at, updated_at`
 
 func scanDelivery(sc interface{ Scan(...any) error }) (*domain.DeliveryAttempt, error) {
 	var d domain.DeliveryAttempt
 	var nextRetry sql.NullString
 	var created, updated string
 	if err := sc.Scan(
-		&d.ID, &d.EventID, &d.Channel, &d.ChannelName, &d.State, &d.Attempts, &d.MaxAttempts,
+		&d.ID, &d.EventID, &d.Channel, &d.ChannelName, &d.Kind, &d.State, &d.Attempts, &d.MaxAttempts,
 		&nextRetry, &d.LastError, &created, &updated,
 	); err != nil {
 		return nil, err
+	}
+	if d.Kind == "" {
+		d.Kind = domain.KindAlert
 	}
 	if nextRetry.Valid && nextRetry.String != "" {
 		t := parseTime(nextRetry.String)
@@ -304,6 +473,35 @@ func scanDelivery(sc interface{ Scan(...any) error }) (*domain.DeliveryAttempt, 
 	d.CreatedAt = parseTime(created)
 	d.UpdatedAt = parseTime(updated)
 	return &d, nil
+}
+
+// AlertedChannels lists the channels that were told, or are still going to be
+// told, about eventID. It is who a recovery notice goes to: exactly the
+// recipients of the alert, and nobody else.
+//
+// A dead-lettered attempt is excluded — that channel never received the alert
+// and never will, so a bare "resolved" would be the only thing it ever saw. An
+// attempt still pending, sending, or retrying IS included: it will be delivered,
+// and the recipient would otherwise be left with a problem that never ended.
+func (s *sqlStore) AlertedChannels(ctx context.Context, eventID string) ([]domain.ChannelTarget, error) {
+	q := s.d.rebind(`SELECT DISTINCT channel, channel_name FROM delivery_attempts
+		WHERE event_id = ? AND kind = ? AND state <> ?
+		ORDER BY channel_name`)
+	rows, err := s.db.QueryContext(ctx, q, eventID, domain.KindAlert, domain.DeliveryDeadLetter)
+	if err != nil {
+		return nil, fmt.Errorf("list alerted channels: %w", err)
+	}
+	defer rows.Close()
+
+	var out []domain.ChannelTarget
+	for rows.Next() {
+		var t domain.ChannelTarget
+		if err := rows.Scan(&t.Type, &t.Name); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
 }
 
 func (s *sqlStore) CreateDeliveryAttempt(ctx context.Context, d *domain.DeliveryAttempt) error {
@@ -341,6 +539,10 @@ func (s *sqlStore) ListDeliveryAttempts(ctx context.Context, f DeliveryFilter, l
 	if f.EventID != "" {
 		where = append(where, "event_id = ?")
 		args = append(args, f.EventID)
+	}
+	if f.Kind != "" {
+		where = append(where, "kind = ?")
+		args = append(args, f.Kind)
 	}
 	if cursor != "" {
 		ct, cid, err := decodeCursor(cursor)
@@ -385,12 +587,30 @@ func (s *sqlStore) ListDeliveryAttempts(ctx context.Context, f DeliveryFilter, l
 	return page, nil
 }
 
+// MarkResult records the outcome of an attempt the caller claimed.
+//
+// `AND state = 'sending'` is the important part. If saving the result failed
+// once (a too-long error text used to do it) the reaper eventually returns the
+// row to `pending`, and a late-arriving write would otherwise stamp a stale
+// outcome over a job already queued for another try. The row is only ours while
+// it is still `sending`; anything else means someone took it back, and
+// ErrNotFound says so.
+//
+// last_error is truncated by runes, not bytes: a cut through a multi-byte
+// character produces text PostgreSQL refuses to store, which is what made the
+// requeue loop above more than theoretical.
 func (s *sqlStore) MarkResult(ctx context.Context, d *domain.DeliveryAttempt) error {
+	at := d.UpdatedAt
+	if at.IsZero() {
+		at = time.Now()
+	}
 	q := s.d.rebind(`UPDATE delivery_attempts
 		SET state = ?, attempts = ?, next_retry_at = ?, last_error = ?, updated_at = ?
-		WHERE id = ?`)
+		WHERE id = ? AND state = ?`)
 	res, err := s.db.ExecContext(ctx, q,
-		d.State, d.Attempts, nullableTime(d.NextRetryAt), d.LastError, formatTime(time.Now()), d.ID,
+		d.State, d.Attempts, nullableTime(d.NextRetryAt),
+		domain.TruncateRunes(d.LastError, domain.MaxLastErrorRunes),
+		formatTime(at), d.ID, domain.DeliverySending,
 	)
 	if err != nil {
 		return fmt.Errorf("mark delivery result: %w", err)
@@ -438,8 +658,17 @@ func (s *sqlStore) RequeueStuckSending(ctx context.Context, staleBefore time.Tim
 	return res.RowsAffected()
 }
 
+// DeleteDeliveryAttemptsBefore removes ORPHANED delivery attempts older than
+// cutoff - ones whose event is already gone.
+//
+// Deleting an event cascades to its attempts, so this sweep exists only for
+// rows the cascade missed. It deliberately does not touch attempts whose event
+// is still retained: the delivery history of a live incident is exactly what an
+// operator opens when asking why a notification never arrived.
 func (s *sqlStore) DeleteDeliveryAttemptsBefore(ctx context.Context, cutoff time.Time) (int64, error) {
-	return s.deleteBefore(ctx, "delivery_attempts", cutoff)
+	return s.deleteBatched(ctx, "delivery_attempts",
+		`created_at < ? AND NOT EXISTS (SELECT 1 FROM events e WHERE e.id = delivery_attempts.event_id)`,
+		formatTime(cutoff))
 }
 
 func (s *sqlStore) CountEventsByState(ctx context.Context) (map[string]int64, error) {

@@ -51,16 +51,26 @@ func NewWebhook(name, url, secret string, timeout time.Duration) *Webhook {
 func (w *Webhook) Name() string { return w.name }
 
 // webhookPayload is the JSON body posted to the receiver.
+//
+// `kind` was added in 0.4.0 and is always present. A receiver that ignores it
+// keeps working exactly as before; one that reads it can close its own ticket
+// when an incident recovers instead of opening a second one.
 type webhookPayload struct {
-	Event     *domain.Event `json:"event"`
-	Timestamp string        `json:"timestamp"`
+	Event     *domain.Event       `json:"event"`
+	Kind      domain.DeliveryKind `json:"kind"`
+	Timestamp string              `json:"timestamp"`
 }
 
 func (w *Webhook) Type() domain.ChannelType { return domain.ChannelWebhook }
 
-func (w *Webhook) Send(ctx context.Context, e *domain.Event) error {
+func (w *Webhook) Send(ctx context.Context, n domain.Notification) error {
+	kind := n.Kind
+	if kind == "" {
+		kind = domain.KindAlert
+	}
 	body, err := json.Marshal(webhookPayload{
-		Event:     e,
+		Event:     n.Event,
+		Kind:      kind,
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 	})
 	if err != nil {

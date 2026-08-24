@@ -74,8 +74,8 @@ func newEmailWithSender(name, from string, to []string, s mailSender) *Email {
 func (e *Email) Type() domain.ChannelType { return domain.ChannelEmail }
 func (e *Email) Name() string             { return e.name }
 
-func (e *Email) Send(ctx context.Context, ev *domain.Event) error {
-	msg := buildMessage(e.from, e.to, subjectLine(ev), plainBody(ev))
+func (e *Email) Send(ctx context.Context, n domain.Notification) error {
+	msg := buildMessage(e.from, e.to, subjectLine(n), plainBody(n), messageID(n, e.from), time.Now())
 	if err := e.sender.send(ctx, e.from, e.to, msg); err != nil {
 		return fmt.Errorf("smtp send: %w", err)
 	}
@@ -85,7 +85,7 @@ func (e *Email) Send(ctx context.Context, ev *domain.Event) error {
 // buildMessage renders an RFC 5322 plain-text message. Header values are
 // sanitized against CR/LF (header injection) and the subject is RFC 2047
 // encoded so non-ASCII and any residual special characters are safe.
-func buildMessage(from string, to []string, subject, body string) []byte {
+func buildMessage(from string, to []string, subject, body, msgID string, sentAt time.Time) []byte {
 	sanitizedTo := make([]string, len(to))
 	for i, addr := range to {
 		sanitizedTo[i] = sanitizeHeader(addr)
@@ -95,6 +95,17 @@ func buildMessage(from string, to []string, subject, body string) []byte {
 	fmt.Fprintf(&b, "From: %s\r\n", sanitizeHeader(from))
 	fmt.Fprintf(&b, "To: %s\r\n", strings.Join(sanitizedTo, ", "))
 	fmt.Fprintf(&b, "Subject: %s\r\n", mime.QEncoding.Encode("utf-8", sanitizeHeader(subject)))
+	// Date and Message-ID are not optional in practice. RFC 5322 requires both
+	// on an originated message, and Gmail and Microsoft 365 both treat their
+	// absence as a spam signal. For a product whose entire job is getting a
+	// notification in front of a person, landing in the spam folder is total
+	// failure, and it would look like "email does not work" rather than like a
+	// missing header.
+	fmt.Fprintf(&b, "Date: %s\r\n", sentAt.Format(time.RFC1123Z))
+	fmt.Fprintf(&b, "Message-ID: %s\r\n", sanitizeHeader(msgID))
+	// Tells mailing lists and out-of-office responders not to reply. Without it
+	// an autoresponder on the receiving side can answer every alert.
+	b.WriteString("Auto-Submitted: auto-generated\r\n")
 	b.WriteString("MIME-Version: 1.0\r\n")
 	b.WriteString("Content-Type: text/plain; charset=UTF-8\r\n")
 	b.WriteString("\r\n")
@@ -102,8 +113,36 @@ func buildMessage(from string, to []string, subject, body string) []byte {
 	return []byte(b.String())
 }
 
+// messageID builds a stable, unique Message-ID for one notification.
+//
+// The event id plus the kind: an alert and its recovery are two messages about
+// the same incident and must not share an id, or a client threading by
+// Message-ID would treat the second as a duplicate of the first and hide it.
+// Retries of the SAME notification deliberately reuse the id, so a delivery
+// that succeeds on the second attempt does not arrive twice.
+func messageID(n domain.Notification, from string) string {
+	domainPart := "alertloop.local"
+	if at := strings.LastIndex(from, "@"); at >= 0 && at+1 < len(from) {
+		domainPart = from[at+1:]
+	}
+	kind := n.Kind
+	if kind == "" {
+		kind = domain.KindAlert
+	}
+	id := "unknown"
+	if n.Event != nil && n.Event.ID != "" {
+		id = n.Event.ID
+	}
+	return fmt.Sprintf("<%s.%s@%s>", id, kind, domainPart)
+}
+
 // sanitizeHeader strips CR/LF (and other control characters) from a header
-// value to prevent SMTP header injection, and caps its length.
+// value to prevent SMTP header injection, and caps its length in RUNES.
+//
+// Bytes would cut a Cyrillic or CJK subject through the middle of a character;
+// mime.QEncoding then encodes the broken tail and the recipient sees a
+// replacement glyph in the one line of the message they are most likely to
+// read.
 func sanitizeHeader(v string) string {
 	v = strings.Map(func(r rune) rune {
 		if r == '\r' || r == '\n' || r < 0x20 {
@@ -111,11 +150,7 @@ func sanitizeHeader(v string) string {
 		}
 		return r
 	}, v)
-	const maxHeaderLen = 200
-	if len(v) > maxHeaderLen {
-		v = v[:maxHeaderLen]
-	}
-	return strings.TrimSpace(v)
+	return strings.TrimSpace(domain.TruncateRunes(v, domain.MaxHeaderRunes))
 }
 
 // smtpMailer is the production SMTP transport. It dials the server, optionally
@@ -137,6 +172,11 @@ func (m *smtpMailer) send(ctx context.Context, from string, to []string, msg []b
 	var err error
 	if m.implicit {
 		// SMTPS: TLS handshake before any SMTP command (typically port 465).
+		//nolint:noctx // The dial is bounded by dialer.Timeout, which is what
+		// stops a worker wedging on an unresponsive SMTP server. Switching to
+		// (*tls.Dialer).DialContext would additionally make it cancellable, but
+		// net/smtp gives the rest of the session no context either, so the
+		// change buys nothing until the whole SMTP path is rewritten.
 		conn, err = tls.DialWithDialer(dialer, "tcp", m.addr, &tls.Config{ServerName: m.host})
 	} else {
 		conn, err = dialer.DialContext(ctx, "tcp", m.addr)

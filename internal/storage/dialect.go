@@ -3,6 +3,7 @@ package storage
 import (
 	"database/sql"
 	"fmt"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -54,6 +55,8 @@ func open(driver, dsn string) (*sql.DB, dialect, error) {
 		// SQLite tolerates only a single writer; keep one connection to avoid
 		// "database is locked" errors under the DB-backed queue.
 		db.SetMaxOpenConns(1)
+		//nolint:noctx // Runs once while opening the database, before any
+		// request context exists to attach it to.
 		if _, err := db.Exec("PRAGMA journal_mode=WAL;"); err != nil {
 			// Non-fatal for :memory: databases.
 			_ = err
@@ -77,9 +80,57 @@ func open(driver, dsn string) (*sql.DB, dialect, error) {
 
 // sqliteDSN enables foreign keys and busy-timeout on file-based SQLite while
 // leaving in-memory DSNs untouched.
+// requiredPragmas are the SQLite settings AlertLoop depends on. They are MERGED
+// into whatever the operator wrote, never replaced wholesale.
+//
+// The old implementation bailed out entirely when the DSN already contained a
+// `?`, which meant that tuning one setting silently dropped the others. Somebody
+// raising busy_timeout lost foreign_keys, and with it ON DELETE CASCADE: the
+// delivery attempts of a deleted event stayed behind as orphans, each retrying
+// five times against an event that no longer exists before dead-lettering.
+// Nothing reported that, because nothing was broken enough to notice.
+var requiredPragmas = map[string]string{
+	"busy_timeout": "busy_timeout(5000)",
+	"foreign_keys": "foreign_keys(1)",
+}
+
+// sqliteDSN returns dsn with AlertLoop's required pragmas present, preserving
+// everything the operator set - including their own value for a pragma we also
+// care about.
 func sqliteDSN(dsn string) string {
-	if strings.Contains(dsn, "?") || strings.Contains(dsn, ":memory:") {
+	if dsn == "" || strings.Contains(dsn, ":memory:") {
 		return dsn
 	}
-	return dsn + "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"
+
+	base, query, hasQuery := strings.Cut(dsn, "?")
+	values, err := url.ParseQuery(query)
+	if err != nil {
+		// Unparsable query string: leave it exactly as given rather than
+		// mangling a DSN we do not understand. Opening will fail loudly.
+		return dsn
+	}
+
+	existing := values["_pragma"]
+	present := map[string]bool{}
+	for _, p := range existing {
+		// A pragma is written as `name(value)`; compare on the name so an
+		// operator's own busy_timeout(10000) counts as set.
+		name, _, _ := strings.Cut(p, "(")
+		present[strings.TrimSpace(name)] = true
+	}
+	// Deterministic order so the DSN is stable across runs (tests, logs).
+	for _, name := range []string{"busy_timeout", "foreign_keys"} {
+		if !present[name] {
+			values.Add("_pragma", requiredPragmas[name])
+		}
+	}
+
+	encoded := values.Encode()
+	if encoded == "" {
+		if hasQuery {
+			return base + "?"
+		}
+		return base
+	}
+	return base + "?" + encoded
 }
