@@ -85,7 +85,7 @@ fi
 
 # --- scripts ---------------------------------------------------------------
 echo "==> Removing scripts from $BIN_DIR"
-for f in alertloop-send alertloop-monit check-worker-heartbeat.sh cron-wrapper.sh; do
+for f in alertloop-send alertloop-monit check-worker-heartbeat.sh cron-wrapper.sh check-pm2.sh; do
   if [ -e "$BIN_DIR/$f" ]; then
     rm -f "$BIN_DIR/$f"
     echo "    removed $BIN_DIR/$f"

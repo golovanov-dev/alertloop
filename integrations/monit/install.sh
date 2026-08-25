@@ -8,6 +8,7 @@
 #   /usr/local/bin/alertloop-send             the adapter
 #   /usr/local/bin/alertloop-monit            the Monit glue
 #   /usr/local/bin/check-worker-heartbeat.sh  helper for worker checks
+#   /usr/local/bin/check-pm2.sh               helper for PM2 checks
 #   /usr/local/bin/cron-wrapper.sh            helper for cron jobs
 #   /etc/alertloop/monit.env                  configuration (0600, root)
 #   /etc/monit/conf.d/alertloop-*.conf        Monit rules, ONLY if you ask
@@ -80,6 +81,7 @@ install -m 0755 "$SRC/alertloop-send"  "$BIN_DIR/alertloop-send"
 install -m 0755 "$SRC/alertloop-monit" "$BIN_DIR/alertloop-monit"
 install -m 0755 "$SRC/examples/check-worker-heartbeat.sh" "$BIN_DIR/check-worker-heartbeat.sh"
 install -m 0755 "$SRC/examples/cron-wrapper.sh"           "$BIN_DIR/cron-wrapper.sh"
+install -m 0755 "$SRC/examples/check-pm2.sh"               "$BIN_DIR/check-pm2.sh"
 
 # --- configuration ---------------------------------------------------------
 install -d -m 0755 "$CONF_DIR"

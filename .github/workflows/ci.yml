@@ -247,6 +247,7 @@ jobs:
           integrations/monit/uninstall.sh
           integrations/monit/examples/check-worker-heartbeat.sh
           integrations/monit/examples/cron-wrapper.sh
+          integrations/monit/examples/check-pm2.sh
           integrations/monit/test/run-tests.sh
           scripts/upgrade-test.sh
           scripts/build-release.sh
@@ -321,6 +322,7 @@ jobs:
           # helpers go in first.
           sudo install -m 0755 integrations/monit/examples/check-worker-heartbeat.sh /usr/local/bin/
           sudo install -m 0755 integrations/monit/examples/cron-wrapper.sh /usr/local/bin/
+          sudo install -m 0755 integrations/monit/examples/check-pm2.sh /usr/local/bin/
 
           # The synthetic control file carries a mail server because
           # alertloop.conf uses the bare `alert` action, and Monit refuses a
