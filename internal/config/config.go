@@ -121,9 +121,23 @@ type Logging struct {
 	// Format is "text" (human-readable) or "json" (for log processors such as
 	// Loki, Elasticsearch, or Vector).
 	Format string `yaml:"format"`
-	// File is the path to write logs to. Empty means stdout. When set, logs are
-	// appended so external tools (tail, journald, log shippers) can read them.
+	// File is the path to write logs to, IN ADDITION to stdout. Empty means
+	// stdout only. When set, logs are appended so external tools (tail,
+	// journald, log shippers) can read them, and the directory is created if it
+	// does not exist.
+	//
+	// stdout is never given up for a file: under Docker that would silence
+	// `docker compose logs` and every log shipper reading the container's
+	// output, and under systemd it would empty the journal.
 	File string `yaml:"file"`
+	// MaxSizeMB is the size at which the log file is rotated to "<file>.1".
+	// Defaults to 50. Zero disables rotation, for installations that rotate
+	// externally (logrotate, a shipping agent).
+	MaxSizeMB int `yaml:"max_size_mb"`
+	// MaxFiles is how many rotated files are kept besides the active one.
+	// Defaults to 5; zero keeps none. Total disk use is bounded by
+	// max_size_mb * (max_files + 1).
+	MaxFiles int `yaml:"max_files"`
 }
 
 // Database configures the backing store.
@@ -242,7 +256,7 @@ func Default() Config {
 	return Config{
 		Addr:          ":8080",
 		RetentionDays: 30,
-		Log:           Logging{Level: "info", Format: "text"},
+		Log:           Logging{Level: "info", Format: "text", MaxSizeMB: 50, MaxFiles: 5},
 		Database: Database{
 			Driver: "sqlite",
 			DSN:    "alertloop.db",
@@ -419,6 +433,16 @@ func (c Config) Validate() error {
 	}
 	if c.Database.DSN == "" {
 		return fmt.Errorf("database dsn is required")
+	}
+
+	// A negative rotation setting is a typo, not an intent. Accepting it would
+	// mean deciding on the operator's behalf whether it meant "unlimited" or
+	// "off", and both readings lose data or fill a disk.
+	if c.Log.MaxSizeMB < 0 {
+		return fmt.Errorf("log.max_size_mb must not be negative (got %d; use 0 to disable rotation)", c.Log.MaxSizeMB)
+	}
+	if c.Log.MaxFiles < 0 {
+		return fmt.Errorf("log.max_files must not be negative (got %d; use 0 to keep no rotated files)", c.Log.MaxFiles)
 	}
 
 	for _, k := range c.APIKeys {

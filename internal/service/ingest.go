@@ -117,6 +117,7 @@ func (s *IngestService) Ingest(ctx context.Context, in EventInput) (IngestResult
 	if err := validateInput(&in); err != nil {
 		return IngestResult{}, err
 	}
+	s.warnLifecycleOnNonIncident(in)
 
 	now := s.now().UTC()
 
@@ -227,6 +228,40 @@ func (s *IngestService) resolve(ctx context.Context, key string, now time.Time) 
 	s.log.Info("incident resolved by the reporting source", "event_id", event.ID, "dedupe_key", key)
 	s.recovery.Notify(ctx, event, now)
 	return IngestResult{Event: event, Outcome: OutcomeResolved}, nil
+}
+
+// warnLifecycleOnNonIncident flags `status: firing` on an event family that has
+// no lifecycle: `business_event` and `audit`.
+//
+// It is not rejected — the request is valid and the event is stored — but it is
+// almost always a misunderstanding with a silent consequence. The firing/
+// resolved lifecycle is built for incidents: a stable dedupe_key means "this is
+// the same problem, still happening", so every repeat REFRESHES the open event
+// and creates no deliveries. Applied to a stream of business events (form
+// submissions, orders) under one key such as "contact-form", the first report
+// notifies and every later one quietly does not. Nothing fails, nothing is
+// logged as an error, and the operator finds out weeks later that requests
+// stopped arriving.
+//
+// `audit` is in the same position and for the same reason: an audit entry
+// records something that already happened, so a stable key over a stream of
+// them (one per login) loses every entry after the first in exactly this way.
+//
+// Warned at the moment the mistake is made rather than left to the reader of
+// the documentation, because the symptom appears far from the cause. Such
+// events are sent without `status`, or with a dedupe_key unique per report.
+// Per request, not once per key: this is the same class of quiet loss that
+// logRouting warns about on every event, and the repeat is where the loss
+// actually happens.
+func (s *IngestService) warnLifecycleOnNonIncident(in EventInput) {
+	if in.Status != domain.StatusFiring || in.Type == domain.EventIncident {
+		return
+	}
+	s.log.Warn("status=firing on a non-incident event type: repeats of this dedupe_key will refresh the open event and "+
+		"deliver nothing, so only the first report notifies anyone. The firing/resolved lifecycle is for incidents — send "+
+		"business_event and audit without status, or give each report its own dedupe_key",
+		"type", in.Type, "source", strings.TrimSpace(in.Source),
+		"category", strings.TrimSpace(in.Category), "dedupe_key", strings.TrimSpace(in.DedupeKey))
 }
 
 // logRouting records where a newly stored event went. An event that matched

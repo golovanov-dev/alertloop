@@ -35,6 +35,18 @@ name: alertloop
 # pull`, which is precisely what you do not want from an alerting service.
 x-image: &image ${ALERTLOOP_IMAGE:-ghcr.io/golovanov-dev/alertloop:latest}
 
+# Container log rotation. Without it the json-file driver grows without bound
+# until the disk fills — the failure OPERATIONS.md already carries a runbook
+# for, and one an alerting service must not cause itself. 10 MB x 3 per
+# container is enough to look back over an incident and small enough to forget
+# about. Change the driver here if your host ships logs elsewhere (journald,
+# local, a collector); max-size/max-file apply to json-file and local only.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 # Hardening shared by every AlertLoop container: no privilege escalation, no
 # Linux capabilities (it binds 8080 and writes only to its volume), a read-only
 # root filesystem, and a writable tmpfs for scratch files.
@@ -46,7 +58,29 @@ x-hardening: &hardening
   read_only: true
   tmpfs:
     - /tmp
+  logging: *logging
   restart: unless-stopped
+
+# Environment shared by the api and the worker. They run the same config file
+# and must see the same secrets; only the log file differs, per service.
+x-pg-env: &pg-env
+  # Empty when unset, on purpose. AlertLoop treats empty as unset, and
+  # alertloop.example.yaml references ${ALERTLOOP_ADMIN_TOKEN} with no
+  # fallback — so a missing token stops the container with a message naming
+  # it, instead of starting on a placeholder published in this repository.
+  #
+  # The guard lives in the config file rather than as a Compose `:?` because
+  # Compose interpolates the WHOLE file before it filters by profile: a `:?`
+  # here would also block `docker compose --profile demo up`, which needs
+  # none of these secrets.
+  ALERTLOOP_ADMIN_TOKEN: ${ALERTLOOP_ADMIN_TOKEN:-}
+  # The same example config serves the binary and both profiles: it reads
+  # the driver and DSN from these references, defaulting to SQLite when they
+  # are absent. Referencing them from the config is the supported way to
+  # inject a secret — a *leftover* one that the file does not reference is
+  # what AlertLoop refuses to start on.
+  ALERTLOOP_DB_DRIVER: postgres
+  ALERTLOOP_DB_DSN: postgres://alertloop:${POSTGRES_PASSWORD}@postgres:5432/alertloop?sslmode=disable
 
 services:
   # --- demo profile ------------------------------------------------------
@@ -96,30 +130,19 @@ services:
     # drop from root to the postgres user, so it gets only no-new-privileges.
     security_opt:
       - no-new-privileges:true
+    logging: *logging
     restart: unless-stopped
 
   api:
     profiles: ["postgres"]
     image: *image
     command: ["--config", "/etc/alertloop/alertloop.yaml", "server"]
-    environment: &pg-env
-      # Empty when unset, on purpose. AlertLoop treats empty as unset, and
-      # alertloop.example.yaml references ${ALERTLOOP_ADMIN_TOKEN} with no
-      # fallback — so a missing token stops the container with a message naming
-      # it, instead of starting on a placeholder published in this repository.
-      #
-      # The guard lives in the config file rather than as a Compose `:?` because
-      # Compose interpolates the WHOLE file before it filters by profile: a `:?`
-      # here would also block `docker compose --profile demo up`, which needs
-      # none of these secrets.
-      ALERTLOOP_ADMIN_TOKEN: ${ALERTLOOP_ADMIN_TOKEN:-}
-      # The same example config serves the binary and both profiles: it reads
-      # the driver and DSN from these references, defaulting to SQLite when they
-      # are absent. Referencing them from the config is the supported way to
-      # inject a secret — a *leftover* one that the file does not reference is
-      # what AlertLoop refuses to start on.
-      ALERTLOOP_DB_DRIVER: postgres
-      ALERTLOOP_DB_DSN: postgres://alertloop:${POSTGRES_PASSWORD}@postgres:5432/alertloop?sslmode=disable
+    environment:
+      <<: *pg-env
+      # This service writes its log to this file IN ADDITION to stdout, so
+      # `docker compose logs api` keeps working. Empty by default — see the
+      # ./logs mount below before turning it on.
+      ALERTLOOP_LOG_FILE: ${ALERTLOOP_LOG_FILE_API:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -130,13 +153,29 @@ services:
       # Both containers mount the SAME file, so channels and routing are defined
       # once and cannot drift between the API and the worker.
       - ./alertloop.yaml:/etc/alertloop/alertloop.yaml:ro
+      # Where log.file can land. The root filesystem is read-only, so this bind
+      # mount is the only writable place for logs — and being a bind mount, what
+      # lands there are ordinary host files that tail, grep and less can read.
+      #
+      # It stays unused until ALERTLOOP_LOG_FILE_API / ALERTLOOP_LOG_FILE_WORKER
+      # are set in .env. Before setting them:
+      #   mkdir -p logs && sudo chown 10001:10001 logs
+      # Compose creates a missing source directory as root, and the container
+      # runs as uid 10001 — it would stop at startup on "permission denied".
+      - ./logs:/var/log/alertloop
     <<: *hardening
 
   worker:
     profiles: ["postgres"]
     image: *image
     command: ["--config", "/etc/alertloop/alertloop.yaml", "worker"]
-    environment: *pg-env
+    environment:
+      <<: *pg-env
+      # A separate file from the one the api writes: the two share a config file
+      # on purpose, but two processes appending to and rotating one log would
+      # cut each other's history short. Most of what an incident needs —
+      # deliveries, retries, dead-letter, retention — is written here.
+      ALERTLOOP_LOG_FILE: ${ALERTLOOP_LOG_FILE_WORKER:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -144,6 +183,7 @@ services:
         condition: service_started
     volumes:
       - ./alertloop.yaml:/etc/alertloop/alertloop.yaml:ro
+      - ./logs:/var/log/alertloop
     <<: *hardening
 
   # The admin console is served by the api container at /admin, on the same

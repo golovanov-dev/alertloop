@@ -24,6 +24,7 @@ import (
 
 	"github.com/golovanov-dev/alertloop/internal/app"
 	"github.com/golovanov-dev/alertloop/internal/config"
+	"github.com/golovanov-dev/alertloop/internal/logging"
 )
 
 // version is overridden at build time via -ldflags "-X main.version=...".
@@ -98,10 +99,17 @@ func run() error {
 
 // setupLogger builds the application logger from config: log level, output
 // format (text or json), and an optional log file. Timestamps are always UTC,
-// matching stored event times. When a file is configured,
-// logs are appended so external tools (tail, log shippers, journald) can read
-// them; otherwise output goes to stdout. The returned io.Closer, when non-nil,
-// must be closed on shutdown to flush and release the log file.
+// matching stored event times.
+//
+// A configured file is written IN ADDITION to stdout, never instead of it.
+// Earlier versions let a file replace stdout, which under Docker silenced
+// `docker compose logs` and every shipper reading the container's output — so
+// the setting meant to make logs easier to read made them harder. The file
+// itself is created (with its directory) and rotated by size; see
+// internal/logging.
+//
+// The returned io.Closer, when non-nil, must be closed on shutdown to release
+// the log file.
 func setupLogger(c config.Logging) (*slog.Logger, io.Closer, error) {
 	var level slog.Level
 	switch strings.ToLower(c.Level) {
@@ -118,11 +126,11 @@ func setupLogger(c config.Logging) (*slog.Logger, io.Closer, error) {
 	var out io.Writer = os.Stdout
 	var closer io.Closer
 	if c.File != "" {
-		f, err := os.OpenFile(c.File, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o640)
+		f, err := logging.Open(c.File, c.MaxSizeMB, c.MaxFiles)
 		if err != nil {
-			return nil, nil, fmt.Errorf("open log file %q: %w", c.File, err)
+			return nil, nil, err
 		}
-		out = f
+		out = io.MultiWriter(os.Stdout, f)
 		closer = f
 	}
 

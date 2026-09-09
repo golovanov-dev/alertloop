@@ -53,7 +53,8 @@ until the core product and market positioning are validated.
   (`/events`), event detail (`/events/{id}`), and deliveries (`/deliveries`) —
   next to the richer React admin console at `/admin`.
 - Cursor-paginated list endpoints.
-- Structured logs (text or JSON), to stdout or a file.
+- Structured logs (text or JSON) to stdout, optionally copied to a size-rotated
+  file at the same time.
 - Event retention with automatic cleanup (30 days by default, configurable via
   `retention_days`).
 - Health probes under both names: `/health` and `/health/live`, `/ready` and
@@ -245,6 +246,39 @@ Rules worth knowing:
 a plain idempotency key: a repeat returns the stored event untouched. The two
 readings of that field are now explicit rather than conflated.
 
+### Event state is not delivery state
+
+Two separate things, kept apart on purpose:
+
+- **Delivery state** — `sent`, `failed`, `dead_letter` — answers *was the
+  message delivered*. Visible per channel in `/deliveries` and in
+  `GET /v1/delivery-attempts`.
+- **Event state** — `new`, `acknowledged`, `resolved`, `muted`, `escalated` —
+  answers *has anyone dealt with this*. Visible on the event itself.
+
+An event delivered to every channel stays `new`. That is not a stuck job:
+nothing moves an event's state by itself. It moves when a person acts on it
+(the buttons in `/admin`, or `POST /v1/events/{id}/ack|resolve|…`), or when a
+monitoring source closes an incident with `status: resolved` and the same
+`dedupe_key`.
+
+**For a `business_event` or an `audit` entry, `new` is a normal resting state.**
+A submitted form, a completed order or an admin action is a fact, not a problem
+with an end; there is nothing to resolve. Use the state as a reading mark
+("taken care of") if it helps, or leave it — such events are removed by
+`retention_days` (30 by default, counted from the last time the event was seen)
+either way. The `firing → resolved` cycle exists for `incident`.
+
+One consequence worth knowing before you build on it: **do not send
+`status: firing` for a stream of business events under one stable
+`dedupe_key`** such as `contact-form`. The first submission opens an event and
+notifies; every later one refreshes that same open event and creates no
+delivery, so notifications stop with no error anywhere. That behaviour is
+correct for a check that fails every minute and wrong for a queue of requests.
+Send business events without `status`, or give each one its own `dedupe_key`
+(the request id). The same applies to `audit` entries. AlertLoop logs a warning
+whenever `firing` arrives on a `business_event` or an `audit` event.
+
 ### Monitoring a Linux server
 
 The [Monit integration](integrations/monit/) connects AlertLoop to Monit, which
@@ -406,15 +440,35 @@ is not carried over.
 
 ## Logs
 
-AlertLoop writes structured logs. By default they go to **stdout**; set a file
-path to also persist them for external tools.
+AlertLoop writes structured logs to **stdout**. Set `log.file` to write them to
+a file as well — stdout keeps working either way, so `docker compose logs`,
+journald and log shippers are never silenced by turning a file on.
 
 ```yaml
 log:
   level: "info"     # debug | info | warn | error
   format: "text"    # text (human-readable) | json (for Loki/Elasticsearch/Vector)
-  file: ""          # empty = stdout; e.g. /var/log/alertloop/alertloop.log
+  file: ${ALERTLOOP_LOG_FILE:-}   # empty = stdout only; a path adds a copy on disk
+  max_size_mb: 50   # rotate the file to <file>.1 at this size; 0 disables rotation
+  max_files: 5      # rotated files kept besides the active one
 ```
+
+`file` is written as a reference, exactly as in `alertloop.example.yaml`, and
+that form matters under Compose: the api and the worker share one config file,
+so the only way to give them separate logs is for the path to come from the
+environment (`ALERTLOOP_LOG_FILE_API` / `ALERTLOOP_LOG_FILE_WORKER`). With the
+variable unset it is the same as `file: ""`. A plain `file: "/path/to.log"`
+works fine for a single process — but then the variable configures nothing, and
+AlertLoop says so at startup rather than pretending otherwise.
+
+The file is rotated by AlertLoop itself: at `max_size_mb` the active file
+becomes `<file>.1`, older generations shift up, and anything past `max_files` is
+deleted. Disk use is bounded by `max_size_mb × (max_files + 1)` — 300 MB with
+the values above. Set `max_size_mb: 0` if logrotate or a shipping agent handles
+the file instead. The directory is created if it does not exist; AlertLoop must
+be able to write to it, and fails at startup saying so if it cannot. If a
+rotation fails later, logging continues and the reason is printed once on
+stderr.
 
 How to read logs by deployment:
 
@@ -423,7 +477,14 @@ How to read logs by deployment:
   `tail -f /var/log/alertloop/alertloop.log`.
 - **systemd**: logs go to the journal — `journalctl -u alertloop -f`. Set
   `format: json` for machine-readable output that log shippers can parse.
-- **Docker**: `docker compose logs -f alertloop` (or `docker logs`).
+- **Docker**: `docker compose logs -f alertloop` (or `docker logs`). To get
+  ordinary files on the host instead, see
+  [Reading AlertLoop's own logs](OPERATIONS.md#reading-alertloops-own-logs) in
+  OPERATIONS.md — the Compose file has a `./logs` mount and a per-service
+  `ALERTLOOP_LOG_FILE_*` variable for it.
+
+Give each process its own file when you run `server` and `worker` separately:
+two processes appending to and rotating one file cut each other's history short.
 
 For centralized logging, set `format: json` and point your log collector at the
 file or the container's stdout.

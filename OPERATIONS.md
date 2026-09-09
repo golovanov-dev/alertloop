@@ -8,6 +8,7 @@ monitor AlertLoop itself, and every runbook below says explicitly what you lose
 while the failure lasts.
 
 - [Monitoring AlertLoop itself](#monitoring-alertloop-itself)
+- [Reading AlertLoop's own logs](#reading-alertloops-own-logs)
 - [Backup and restore](#backup-and-restore)
 - [Upgrades and downgrades](#upgrades-and-downgrades)
 - [Runbooks](#runbooks)
@@ -56,6 +57,10 @@ curl -s -H "X-API-Key: $KEY" http://127.0.0.1:8080/v1/stats
   down.
 - **`events.new` growing without bound** — nobody is acknowledging or resolving
   anything. That is an operational signal about your team, not about AlertLoop.
+  Read it against what you ingest: for business events and audit entries `new`
+  is the normal resting state (see "Event state is not delivery state" in the
+  README), so a steady climb there is expected and only incidents sitting in
+  `new` mean nobody looked.
 
 ### The failure that AlertLoop cannot report
 
@@ -71,6 +76,150 @@ Cover it from **outside** the AlertLoop host:
   provider, a phone, a person;
 - `Restart=on-failure` in the systemd unit and `restart: unless-stopped` in
   Compose, both already configured, which cover a crash but not a wedged host.
+
+---
+
+## Reading AlertLoop's own logs
+
+When AlertLoop is the thing behaving strangely, its log is the evidence. This is
+how to get at it in each deployment, and how to get **ordinary files** under
+Docker, where the container log is a JSON file named after a container hash.
+
+AlertLoop always writes to stdout. `log.file` adds a copy on disk; it never
+replaces stdout, so `docker compose logs` and any log shipper keep working
+alongside it.
+
+```yaml
+log:
+  level: "info"
+  format: "text"     # json if a collector reads it
+  file: ""           # empty = stdout only
+  max_size_mb: 50    # rotate to <file>.1 at this size; 0 = no rotation
+  max_files: 5       # rotated files kept besides the active one
+```
+
+Rotation is built in because nothing else rotates that file: at `max_size_mb`
+the active file becomes `<file>.1`, older generations shift up, and everything
+past `max_files` is deleted. Disk use is bounded by
+`max_size_mb × (max_files + 1)`.
+
+### Binary and systemd
+
+```bash
+journalctl -u alertloop -f                       # stdout goes to the journal
+sudo tail -f /var/log/alertloop/alertloop.log    # if log.file is set
+```
+
+`sudo` is not decoration. The unit runs with `UMask=0077`, so the log file ends
+up owned by the `alertloop` user and readable by nobody else — which is the
+point of that hardening, since log lines carry event messages. Read it as root,
+or add yourself to a group that can, rather than loosening the mode.
+
+The shipped unit has `LogsDirectory=alertloop`, so systemd creates
+`/var/log/alertloop` owned by the service user and makes it writable despite
+`ProtectSystem=strict`. Nothing else is needed for
+`log.file: /var/log/alertloop/alertloop.log`. On a unit of your own, either add
+that line or create the directory yourself:
+
+```bash
+sudo install -d -o alertloop -g alertloop -m 750 /var/log/alertloop
+```
+
+AlertLoop creates a missing log directory when it can, and an unwritable path
+stops the process at startup naming the path — deliberately: a service that
+silently logs nowhere is worse than one that refuses to start.
+
+A rotation that fails later — a full disk, a directory sitting where
+`<file>.1` belongs — does **not** stop logging. AlertLoop prints one line to
+stderr (visible in the journal and in `docker compose logs`), keeps writing to
+the file it has open, and retries the rotation after the file has grown by
+another `max_size_mb`. What is given up is the size limit, not the log; the
+stderr line says so, and it is worth alerting on.
+
+### Docker: what you get by default
+
+```bash
+docker compose logs -f worker        # follow one service
+docker compose logs --since 1h       # everything, last hour
+docker compose logs --no-color > alertloop.log   # to a file for grep/less
+```
+
+The container log itself is a JSON-wrapped file whose path contains the
+container id:
+
+```bash
+docker inspect --format '{{.LogPath}}' alertloop-worker-1
+```
+
+It is readable, but it is not what you want to work with: the path changes
+whenever the container is recreated, reading it needs root, and every line is
+wrapped in JSON. The Compose file caps it at 10 MB × 3 per container
+(`x-logging`), so it cannot fill the disk. Point the driver elsewhere — journald,
+or a collector — by editing that anchor; `max-size`/`max-file` apply to the
+`json-file` and `local` drivers only.
+
+### Docker: plain log files on the host
+
+The postgres profile mounts `./logs` into both containers and passes a
+per-service log path. Three steps:
+
+```bash
+mkdir -p logs
+sudo chown 10001:10001 logs          # the container runs as uid 10001
+```
+
+```dotenv
+# .env
+ALERTLOOP_LOG_FILE_API=/var/log/alertloop/api.log
+ALERTLOOP_LOG_FILE_WORKER=/var/log/alertloop/worker.log
+```
+
+```bash
+docker compose up -d
+sudo tail -f logs/worker.log        # the files belong to uid 10001
+```
+
+Then `tail`, `grep` and `less` work on `logs/api.log` and `logs/worker.log` as
+on any other file owned by the service — the files belong to uid 10001, so
+reading them from the host means `sudo` unless your user happens to be that uid.
+`docker compose logs` still shows the same lines.
+
+Things that bite here, all of them real:
+
+- **Ownership.** Compose creates a missing bind-mount source as `root`, and the
+  container runs as uid 10001 with no capabilities. Without the `chown` the
+  container stops at startup with `permission denied` on the log file. Fix it
+  the same way and restart.
+- **`read_only: true` stays.** The root filesystem remains read-only; the bind
+  mount is the writable exception. Do not point `log.file` anywhere else — a
+  path outside `/var/log/alertloop` (or `/data`, or `/tmp`) fails with
+  `read-only file system`, which is the container doing its job.
+- **One file per service.** `api` and `worker` share one config file on purpose,
+  so the path comes from the environment rather than from the file. Do not give
+  them the same file: both would append to it and both would rotate it, cutting
+  each other's history short. Most of what an incident needs — deliveries,
+  retries, dead-letter, retention — is written by the **worker**.
+- **The demo profile is stdout-only.** It runs the config baked into the image,
+  which has no `log:` section and does not read `ALERTLOOP_LOG_FILE`. Use
+  `docker compose logs`, or mount your own config file to get a log file — and
+  if you do, give it a path on a writable mount: the demo container has
+  `read_only: true` as well, so only `/data` (the named volume) and `/tmp`
+  accept writes.
+- **`./logs` is gitignored**, along with `*.log` and the rotated `*.log.N`.
+  Nothing from it is committed.
+
+### What to grep for
+
+| Looking for | Grep |
+|---|---|
+| A delivery that never arrived | `grep "delivery " logs/worker.log` |
+| Exhausted retries | `grep "dead-lettered" logs/worker.log` |
+| Events stored but delivered nowhere | `grep "matched no routing rule"` |
+| Misuse of the incident lifecycle | `grep "status=firing on a non-incident"` |
+| Startup configuration decisions | first ~20 lines after a restart |
+
+Set `format: json` when a collector reads the file, and keep `level: info`
+unless you are chasing something specific — `debug` logs every routed event.
 
 ---
 
@@ -179,6 +328,38 @@ with a backup.
 Split deployments (`server` and `worker` as separate processes) must run the
 **same version**. Upgrade them together.
 
+### Upgrading to 0.5.0: `ALERTLOOP_LOG_FILE` needs a line in your config
+
+The Compose file now passes `ALERTLOOP_LOG_FILE` to the api and the worker, and
+`alertloop.example.yaml` reads it as `file: ${ALERTLOOP_LOG_FILE:-}`. **Your
+existing `alertloop.yaml` does not**, because it was copied from an older
+example — so setting `ALERTLOOP_LOG_FILE_API` / `ALERTLOOP_LOG_FILE_WORKER` in
+`.env` would do nothing on its own.
+
+The environment is not a second configuration layer (0.3.0), and no exception is
+made here: a variable only takes effect where the config file asks for it by
+name. Add one line to your `alertloop.yaml`:
+
+```yaml
+log:
+  file: ${ALERTLOOP_LOG_FILE:-}
+  max_size_mb: 50
+  max_files: 5
+```
+
+Until you do, one of two things happens, and neither is silent:
+
+- your file **sets `log.file` itself** (even to `""`) — startup warns that
+  `ALERTLOOP_LOG_FILE` is set but configures nothing, and the value in the file
+  is what runs;
+- your file **does not mention `log.file`** — startup is refused, naming the
+  variable and printing the line to write. That refusal is deliberate (0.3.0): a
+  variable the operator believes is in effect must never be quietly ignored.
+
+Nothing else about the upgrade needs attention: `max_size_mb` and `max_files`
+default to 50 and 5 for configs that never heard of them, and logging to stdout
+is unchanged.
+
 ---
 
 ## Runbooks
@@ -248,7 +429,11 @@ side for what it tried to send.
    - the `-wal` file, if a long-running reader kept it from checkpointing;
    - the events table, if `retention_days` is very high or ingestion is far
      heavier than expected;
-   - the log file, if `log.file` is set and nothing rotates it.
+   - the log file, if `log.file` is set with `max_size_mb: 0` and nothing else
+     rotates it (with the default 50 MB × 5 it cannot grow past ~300 MB);
+   - the container log, on a Docker host older than this Compose file, where
+     the `json-file` driver had no `max-size`. `docker system prune -f` and the
+     `x-logging` anchor in `docker-compose.yml` deal with it.
 
 3. **Shrink the data if you must.** Lower `retention_days` and restart; the
    cleanup runs on start and then every 6 hours. On SQLite, reclaim the freed
@@ -260,8 +445,9 @@ side for what it tried to send.
    systemctl start alertloop
    ```
 
-4. **Then fix the cause.** Rotate the log file, set a retention window that
-   matches the disk, and alert on disk usage.
+4. **Then fix the cause.** Leave `log.max_size_mb` at a non-zero value (or hand
+   the file to logrotate), set a retention window that matches the disk, and
+   alert on disk usage.
 
 ### The database is unreachable
 

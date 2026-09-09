@@ -206,3 +206,40 @@ func TestAdjacentReferencesAreLeftAlone(t *testing.T) {
 		t.Fatalf("admin_token = %q, want the value left verbatim", cfg.AdminToken)
 	}
 }
+
+// The 0.5.0 upgrade path, as a test. The Compose file now passes
+// ALERTLOOP_LOG_FILE, but an alertloop.yaml copied from an older example does
+// not reference it — and the environment is not a second configuration layer.
+// OPERATIONS.md tells operators exactly what happens in each case; this is that
+// promise, checked.
+func TestLogFileVariableNeedsAReferenceInTheConfigFile(t *testing.T) {
+	t.Setenv("ALERTLOOP_LOG_FILE", "/var/log/alertloop/api.log")
+
+	// The file references it: the supported way to inject the path.
+	cfg := loadYAML(t, "log:\n  file: ${ALERTLOOP_LOG_FILE:-}\n")
+	if cfg.Log.File != "/var/log/alertloop/api.log" {
+		t.Fatalf("log.file = %q, want the value from the environment", cfg.Log.File)
+	}
+	if len(cfg.Warnings) != 0 {
+		t.Fatalf("a referenced variable must not warn: %v", cfg.Warnings)
+	}
+
+	// The file sets log.file itself: the file wins, and the operator is told
+	// that the variable is doing nothing.
+	cfg = loadYAML(t, "log:\n  file: \"/opt/alertloop.log\"\n")
+	if cfg.Log.File != "/opt/alertloop.log" {
+		t.Fatalf("log.file = %q, want the value from the file", cfg.Log.File)
+	}
+	if len(cfg.Warnings) == 0 || !strings.Contains(strings.Join(cfg.Warnings, "\n"), "ALERTLOOP_LOG_FILE") {
+		t.Fatalf("no warning naming the shadowed variable: %v", cfg.Warnings)
+	}
+
+	// The file says nothing about log.file: startup is refused, naming it.
+	_, err := loadYAMLErr(t, "addr: \":8080\"\n")
+	if err == nil {
+		t.Fatal("a leftover ALERTLOOP_LOG_FILE was accepted")
+	}
+	if !strings.Contains(err.Error(), "ALERTLOOP_LOG_FILE") || !strings.Contains(err.Error(), "${ALERTLOOP_LOG_FILE:-}") {
+		t.Fatalf("the error does not name the variable and the line to write: %v", err)
+	}
+}

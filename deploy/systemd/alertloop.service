@@ -22,6 +22,13 @@ RestartSec=5s
 StateDirectory=alertloop
 WorkingDirectory=/var/lib/alertloop
 
+# Log directory. systemd creates /var/log/alertloop owned by the service user
+# and adds it to the writable paths, so `log.file:
+# /var/log/alertloop/alertloop.log` works despite ProtectSystem=strict — which
+# otherwise makes /var/log read-only and stops the process at startup. Unused
+# unless log.file is set; stdout goes to the journal either way.
+LogsDirectory=alertloop
+
 # Hardening. The container runs with no capabilities, a read-only root, and no
 # privilege escalation; a binary install had none of that, so the same service
 # was materially less contained depending on how it was installed.

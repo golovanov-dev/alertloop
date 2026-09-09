@@ -4,6 +4,10 @@
 !.env.example
 .DS_Store
 *.log
+*.log.[0-9]*
+# Logs written by the Compose profiles: ./logs is bind-mounted into the api and
+# worker containers, and rotation adds alertloop.log.1 and up next to the file.
+/logs/
 bin/
 /dist/
 coverage/

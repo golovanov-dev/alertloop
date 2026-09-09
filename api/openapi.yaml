@@ -500,6 +500,21 @@ components:
     EventState:
       type: string
       enum: [new, acknowledged, resolved, muted, escalated]
+      description: >
+        Where the event stands in **triage** — who has looked at it. It is not
+        the delivery state: an event whose notifications were all sent stays
+        `new` until somebody acknowledges or resolves it. `GET
+        /v1/delivery-attempts?event_id=...` answers "was it sent"; this field
+        answers "has anyone dealt with it".
+
+
+        Nothing changes it automatically. It moves through the actions on
+        `/v1/events/{id}` (ack, resolve, mute, unmute, escalate) or, for
+        incidents, through an ingested `status: resolved` carrying the same
+        `dedupe_key`. For a `business_event` or an `audit` entry — a submitted
+        form, a completed order, an admin action — `new` is therefore a normal
+        resting state, not a sign that delivery failed: such events record
+        something that already happened and have nothing to close.
     ChannelType:
       type: string
       enum: [email, telegram, webhook]
@@ -520,6 +535,13 @@ components:
       description: >
         The lifecycle signal attached to an incoming report. Omitting it keeps
         the pre-0.4.0 idempotent-create semantics.
+
+
+        It is meant for `incident` events — a condition that starts, persists,
+        and ends. Business events and audit entries record something that has
+        already happened and are normally sent without it; sending `firing` for
+        them is accepted but logged as a warning, because of the trap described
+        under `dedupe_key`.
     EventResolveInput:
       type: object
       required: [status, dedupe_key]
@@ -553,6 +575,13 @@ components:
             carrying the same `dedupe_key`. Requires `dedupe_key` either way.
             Omit it to keep the pre-0.4.0 behaviour, where a repeated
             `dedupe_key` is a no-op.
+
+
+            **Do not send `firing` for a stream of business events** (form
+            submissions, orders) under one stable key: after the first report
+            every repeat refreshes the same open event and creates no
+            deliveries, so the notifications stop without any error. See
+            `dedupe_key`.
         type: { $ref: '#/components/schemas/EventType' }
         severity: { $ref: '#/components/schemas/Severity' }
         source: { type: string }
@@ -569,6 +598,17 @@ components:
             be stable for one logical check and must not contain a timestamp, a
             random id, a measured value, or error text that varies between
             reports. Required whenever `status` is present.
+
+
+            **A stable key over a stream of business events silently stops the
+            notifications.** `{"status":"firing","type":"business_event",
+            "dedupe_key":"contact-form"}` is right for a monitoring check and
+            wrong for a contact form: the first submission opens an event and
+            notifies, and every later one refreshes that same open event and
+            creates no delivery at all. Nothing fails and nothing is rejected,
+            so the loss is only noticed when someone asks why the requests
+            stopped arriving. For business events either omit `dedupe_key`
+            entirely or make it unique per report (the request id).
         payload:
           type: object
           additionalProperties: true

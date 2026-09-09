@@ -96,7 +96,7 @@ var legacyEnvVars = map[string]legacyVar{
 	"ALERTLOOP_RETENTION_DAYS":      {"retention_days", `retention_days: 30`},
 	"ALERTLOOP_LOG_LEVEL":           {"log.level", `log.level: "info"`},
 	"ALERTLOOP_LOG_FORMAT":          {"log.format", `log.format: "text"`},
-	"ALERTLOOP_LOG_FILE":            {"log.file", `log.file: "..."`},
+	"ALERTLOOP_LOG_FILE":            {"log.file", "log.file: ${ALERTLOOP_LOG_FILE:-}"},
 	"ALERTLOOP_CORS_ORIGINS":        {"cors_origins", `cors_origins: ["..."]`},
 	"ALERTLOOP_WORKER_CONCURRENCY":  {"worker.concurrency", `worker.concurrency: 2`},
 	"ALERTLOOP_WORKER_MAX_ATTEMPTS": {"worker.max_attempts", `worker.max_attempts: 5`},

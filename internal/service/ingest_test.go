@@ -335,3 +335,117 @@ func (s *IngestService) ingestLegacy(ctx context.Context, in EventInput) (*domai
 	res, err := s.Ingest(ctx, in)
 	return res.Event, res.Created(), err
 }
+
+// The 2026-08-24 confusion, caught where it is created. `status: firing` on a
+// business event is accepted — nothing about the request is invalid — but under
+// one stable dedupe_key only the FIRST report ever notifies: every repeat
+// refreshes the open event and creates no deliveries. That failure is silent
+// and shows up weeks later as "requests stopped arriving", so it is logged at
+// warn the moment it happens. The same holds for `audit`, which is covered by
+// TestIngestWarnsOnFiringAuditEvent.
+func TestIngestWarnsOnFiringBusinessEvent(t *testing.T) {
+	s := newStore(t)
+	var logged bytes.Buffer
+	svc := NewIngestService(s, routing.NewAllChannels([]domain.ChannelTarget{
+		{Type: domain.ChannelWebhook, Name: "siem"},
+	}), 5, nil, time.Now, slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	ctx := context.Background()
+
+	res, err := svc.Ingest(ctx, EventInput{
+		Status: domain.StatusFiring, Type: domain.EventBusiness,
+		Source: "website", Category: "contact-form", Message: "new request",
+		DedupeKey: "contact-form",
+	})
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	// Warned, not refused: the event is stored and delivered as asked.
+	if res.Outcome != OutcomeCreated {
+		t.Fatalf("outcome = %q, want created; the warning must not change behaviour", res.Outcome)
+	}
+	out := logged.String()
+	if !strings.Contains(out, "level=WARN") {
+		t.Fatalf("no warning for status=firing on a business_event:\n%s", out)
+	}
+	for _, want := range []string{"status=firing on a non-incident", "type=business_event", "source=website", "dedupe_key=contact-form"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("warning is missing %q:\n%s", want, out)
+		}
+	}
+
+	// The repeat is the actual trap: it delivers nothing. It must be warned
+	// about too, since that is the report the operator is missing.
+	logged.Reset()
+	res, err = svc.Ingest(ctx, EventInput{
+		Status: domain.StatusFiring, Type: domain.EventBusiness,
+		Source: "website", Category: "contact-form", Message: "another request",
+		DedupeKey: "contact-form",
+	})
+	if err != nil {
+		t.Fatalf("second ingest: %v", err)
+	}
+	if res.Outcome != OutcomeRefreshed {
+		t.Fatalf("outcome = %q, want refreshed", res.Outcome)
+	}
+	page, _ := s.ListDeliveryAttempts(ctx, storage.DeliveryFilter{EventID: res.Event.ID}, 50, "")
+	if len(page.Items) != 1 {
+		t.Fatalf("%d delivery attempts after a refresh, want the 1 from the first report", len(page.Items))
+	}
+	if !strings.Contains(logged.String(), "level=WARN") {
+		t.Fatalf("the repeat that delivered nothing produced no warning:\n%s", logged.String())
+	}
+}
+
+// The warning is narrow on purpose: incidents are what the lifecycle is for,
+// and a business event without `status` is the ordinary, correct case.
+func TestIngestDoesNotWarnOnLegitimateLifecycleUse(t *testing.T) {
+	s := newStore(t)
+	var logged bytes.Buffer
+	svc := NewIngestService(s, routing.NewAllChannels([]domain.ChannelTarget{
+		{Type: domain.ChannelWebhook, Name: "siem"},
+	}), 5, nil, time.Now, slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	ctx := context.Background()
+
+	cases := []EventInput{
+		{Status: domain.StatusFiring, Type: domain.EventIncident, Source: "monit",
+			Message: "postgres down", DedupeKey: "server-01:postgres"},
+		{Type: domain.EventBusiness, Source: "website", Message: "new request", DedupeKey: "req-1"},
+		{Type: domain.EventBusiness, Source: "website", Message: "new request"},
+	}
+	for i, in := range cases {
+		if _, err := svc.Ingest(ctx, in); err != nil {
+			t.Fatalf("case %d: %v", i, err)
+		}
+	}
+	if strings.Contains(logged.String(), "level=WARN") {
+		t.Fatalf("a legitimate ingestion was warned about:\n%s", logged.String())
+	}
+}
+
+// `audit` is the other family with no lifecycle, and the OpenAPI description
+// promises the warning for it too. An audit stream under one stable key (one
+// entry per login) loses everything after the first entry in exactly the same
+// way.
+func TestIngestWarnsOnFiringAuditEvent(t *testing.T) {
+	s := newStore(t)
+	var logged bytes.Buffer
+	svc := NewIngestService(s, routing.NewAllChannels([]domain.ChannelTarget{
+		{Type: domain.ChannelWebhook, Name: "siem"},
+	}), 5, nil, time.Now, slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelDebug})))
+
+	res, err := svc.Ingest(context.Background(), EventInput{
+		Status: domain.StatusFiring, Type: domain.EventAudit,
+		Source: "admin", Category: "login", Message: "admin signed in",
+		DedupeKey: "admin-login",
+	})
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if res.Outcome != OutcomeCreated {
+		t.Fatalf("outcome = %q, want created; the warning must not change behaviour", res.Outcome)
+	}
+	out := logged.String()
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "status=firing on a non-incident") || !strings.Contains(out, "type=audit") {
+		t.Fatalf("no warning for status=firing on an audit event:\n%s", out)
+	}
+}

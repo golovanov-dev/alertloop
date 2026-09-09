@@ -1,5 +1,61 @@
 # Changelog
 
+## 0.5.0 - 2026-09-09
+
+What the first real installation turned up: logs you can actually read, and an
+example `.env` that no longer hands out a working admin token.
+
+**Upgrading a Compose deployment:** to use the new per-service log files, add
+`file: ${ALERTLOOP_LOG_FILE:-}` under `log:` in your own `alertloop.yaml`. A
+config copied from an older example does not reference the variable, and the
+environment configures nothing the file does not ask for (0.3.0) — AlertLoop
+says so at startup rather than ignoring it. Details in `OPERATIONS.md`.
+
+### Added
+
+- `log.max_size_mb` (default 50) and `log.max_files` (default 5): the log file
+  is rotated by size, oldest generations dropped. Set `max_size_mb: 0` to leave
+  rotation to logrotate.
+- The directory for `log.file` is created if it does not exist.
+- Per-service log files on the host under Compose, from `ALERTLOOP_LOG_FILE_API`
+  and `ALERTLOOP_LOG_FILE_WORKER` into the mounted `./logs`. Off unless set.
+- `LogsDirectory=alertloop` in the systemd unit, so `log.file` under
+  `/var/log/alertloop` works with no extra setup.
+- A warning when `status: firing` arrives on a `business_event` or an `audit`
+  event: repeats of that `dedupe_key` refresh the open event and deliver
+  nothing, so only the first report ever notifies.
+- `OPERATIONS.md`: "Reading AlertLoop's own logs" — how to get at the logs in
+  each deployment, and the ownership traps under Docker and systemd.
+
+### Changed
+
+- **`log.file` now writes to the file *and* stdout, instead of the file only.**
+  If you have it set, stdout starts carrying the same lines again — which is
+  what makes `docker compose logs`, the journal, and log shippers work while a
+  file is configured.
+- Container logs are capped at 10 MB x 3 files per service in
+  `docker-compose.yml`; nothing bounded them before.
+- A rotation that fails no longer stops logging: the reason is printed once on
+  stderr and writing continues to the open file.
+
+### Security
+
+- **`.env.example` ships `ALERTLOOP_ADMIN_TOKEN=` and `POSTGRES_PASSWORD=`
+  empty.** The documented `cp .env.example .env` used to supply a placeholder
+  published in this repository, which satisfied the "refuses to start without a
+  token" guard and left production running on a known credential. **If you
+  copied `.env.example` before this release, generate real values now**
+  (`openssl rand -hex 32`). The loopback-only demo profile is unaffected.
+- The example config no longer ships a working `api_keys` entry; the block is
+  commented out.
+
+### Fixed
+
+- Documented that event state is not delivery state: an event delivered to every
+  channel stays `new` until someone acts on it, and for `business_event` and
+  `audit` that is a normal resting state. In the README and in the OpenAPI
+  descriptions of the event state, `status` and `dedupe_key`.
+
 ## 0.4.3 - 2026-08-24
 
 One fix: an example Monit rule did not parse. Nothing in AlertLoop itself

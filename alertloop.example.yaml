@@ -49,11 +49,18 @@ admin_token: ${ALERTLOOP_ADMIN_TOKEN}
 #   full   - full access incl. state actions and replay  → for trusted tools
 # Omitted scope defaults to full. The admin token already has full access, so
 # keys are optional (e.g. only needed for least-privilege service credentials).
-api_keys:
-  - key: "change-me-ingest-key"
-    scope: ingest
-  # - key: "change-me-read-key"
-  #   scope: read
+#
+# Commented out on purpose: an example that ships a WORKING key hands a live
+# ingest credential to everyone who copies this file, and whoever holds one can
+# create events and through them wake every configured channel. Uncomment and
+# generate your own (openssl rand -hex 32), or keep them in .env and reference
+# them here as ${VAR}.
+#
+# api_keys:
+#   - key: ${ALERTLOOP_INGEST_KEY}
+#     scope: ingest
+#   - key: ${ALERTLOOP_READ_KEY}
+#     scope: read
 
 # Event retention window in days: events older than this are pruned automatically
 # by the worker. No upper bound.
@@ -73,12 +80,34 @@ retention_days: 30
 # read the `kind` field ("alert" or "recovery") in the webhook body instead.
 notify_on_resolve: true
 
-# Logging. Output goes to stdout by default; set `file` to also persist logs to
-# disk so external tools (tail, Loki, Vector, journald) can read them.
+# Logging. Output ALWAYS goes to stdout; `file` adds a copy on disk. Setting a
+# file never silences stdout, so `docker compose logs`, journald and any log
+# shipper keep working alongside it.
 log:
   level: "info"     # debug | info | warn | error
   format: "text"    # text (human-readable) | json (for log processors)
-  file: ""          # empty = stdout; e.g. "/var/log/alertloop/alertloop.log"
+
+  # Path of the log file. Empty (the default) means stdout only.
+  #
+  # Written as a reference so the Compose file can give the api and the worker
+  # SEPARATE files without a second copy of this config: both containers mount
+  # this one file on purpose, and two processes appending to one log would
+  # rotate it out from under each other.
+  #
+  # AlertLoop creates the directory if it is missing, but it must be able to
+  # write there. Under Docker the containers run as uid 10001 with a read-only
+  # root filesystem, so a path such as /var/log/alertloop/alertloop.log works
+  # only if that directory is a mounted volume owned by that uid — see the
+  # "Reading AlertLoop's own logs" section of OPERATIONS.md. Under systemd the
+  # shipped unit declares LogsDirectory=alertloop, so /var/log/alertloop is
+  # created for the service user and this path just works.
+  file: ${ALERTLOOP_LOG_FILE:-}
+
+  # Rotation of that file, by size — nothing else rotates it. Disk use is
+  # bounded by max_size_mb * (max_files + 1): 300 MB with the values below.
+  # Set max_size_mb to 0 if logrotate or a shipping agent handles the file.
+  max_size_mb: 50   # rotate to <file>.1 at this size; older ones shift up
+  max_files: 5      # rotated files kept besides the active one
 
 # In-process rate limiting.
 rate_limit:
