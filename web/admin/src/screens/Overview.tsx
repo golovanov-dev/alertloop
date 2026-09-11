@@ -2,7 +2,7 @@ import { useNavigate } from "react-router-dom";
 import { api } from "../api";
 import { Badge, Card, ErrorState, Loading } from "../ui";
 import { useAsync } from "../hooks";
-import { timeOfDay } from "../format";
+import { dateTime } from "../format";
 import { c, mono } from "../theme";
 import type { AlertEvent, Stats } from "../types";
 
@@ -66,7 +66,8 @@ export function Overview() {
             letterSpacing: ".04em",
           }}
         >
-          Recent critical events
+          Recent critical events{" "}
+          <span style={{ textTransform: "none", letterSpacing: 0, fontWeight: 400 }}>(local time)</span>
         </h2>
         {loading ? (
           <Loading />
@@ -87,8 +88,8 @@ export function Overview() {
                   cursor: "pointer",
                 }}
               >
-                <span style={{ fontFamily: mono, fontSize: 12.5, color: c.muted, width: 70, flexShrink: 0 }}>
-                  {timeOfDay(ev.created_at)}
+                <span style={{ fontFamily: mono, fontSize: 12.5, color: c.muted, width: 150, flexShrink: 0, whiteSpace: "nowrap" }}>
+                  {dateTime(ev.created_at)}
                 </span>
                 <Badge kind="severity" value={ev.severity} />
                 <span

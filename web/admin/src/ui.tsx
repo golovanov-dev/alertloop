@@ -85,7 +85,9 @@ export const td: CSSProperties = {
   borderBottom: `1px solid ${c.rowBorder}`,
 };
 
-export const tdMono: CSSProperties = { ...td, fontFamily: mono, color: c.muted };
+// nowrap: a "2026-09-10 14:32:07" cell must not break at its space and turn
+// every row into two lines. Tables sit in horizontally scrolling containers.
+export const tdMono: CSSProperties = { ...td, fontFamily: mono, color: c.muted, whiteSpace: "nowrap" };
 
 export function Loading() {
   return (

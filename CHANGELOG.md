@@ -1,5 +1,72 @@
 # Changelog
 
+## 0.5.1 - Unreleased
+
+A database password with `/` in it no longer takes the Compose deployment down,
+and the documented way to start the stack now fails when AlertLoop does not come
+up.
+
+**Upgrading a Compose deployment:** the postgres profile now hands the password
+to AlertLoop exactly as written in `.env`. If you percent-encoded
+`POSTGRES_PASSWORD` to get the old URL working (`%2F` for `/`), write the
+decoded password there before upgrading, or authentication fails. A password
+that begins with a single quote no longer parses. Details in `OPERATIONS.md`,
+"Upgrading to 0.5.1".
+
+### Added
+
+- `alertloop check-db`: loads the config, pings the database, exits non-zero if
+  it does not answer. It is the worker container's health check.
+- `ALERTLOOP_PORT` in `.env` sets the host port both Compose profiles publish
+  on `127.0.0.1` (default 8080).
+- When PostgreSQL refuses a password that contains `%XX`, the error says the
+  keyword/value DSN sends it as written and points to the upgrade notes.
+
+### Changed
+
+- Before 1.0.0 only the latest minor line is supported: 0.4.x no longer
+  receives fixes. See `SECURITY.md`.
+- **The Compose postgres profile passes the database password in a
+  keyword/value DSN instead of a `postgres://` URL**, which a password
+  containing `/`, `?` or `#` broke. A password that worked before keeps
+  working, except one percent-encoded for the URL or one beginning with a
+  single quote — see the upgrade note above.
+- `docker compose up -d --wait --wait-timeout 120` is the documented way to
+  start: it fails when a container does not become healthy, where plain `up -d`
+  reports success as soon as the containers exist.
+- The api and demo containers run their `/health/ready` check every 10 seconds
+  instead of 30, declared in `docker-compose.yml`.
+- A URL DSN with an unencoded `@` in the database name, the fragment, or a query
+  parameter name is refused at startup — it is what a misplaced password looks
+  like. Write it as `%40`.
+- The docs and `.env.example` generate the database password with
+  `openssl rand -hex 32` instead of `-base64`.
+
+### Fixed
+
+- A `POSTGRES_PASSWORD` containing `/` — which the previously documented
+  `openssl rand -base64 32` produces about half the time — made the api and
+  the worker restart in a loop while `docker compose up -d` reported success.
+- An unparsable PostgreSQL DSN now stops startup with the likely cause and the
+  keyword/value alternative, instead of failing later inside the migrations.
+- Under Compose the worker was permanently `unhealthy`: it inherited the image's
+  HTTP health check and serves no HTTP.
+- `/health/live` and `/health/ready` were written to the access log at info on
+  every probe; like `/health` and `/ready`, they are logged at debug now.
+- Lists in the admin console and the delivery table on `/events/{id}` showed the
+  time of day without the date. They show `YYYY-MM-DD HH:MM:SS` now, in the zone
+  their column header names.
+- `.env.example` suggested pinning the image to `v0.4.0`, a version with a known
+  vulnerability; it names the current release now.
+
+### Security
+
+- A DSN error no longer carries part of the password. The driver's parse error
+  quoted the text around the break — for a URL password containing `/`, the part
+  before it — and a URL that parsed wrongly put the rest of the password into the
+  connection error as the database name. AlertLoop now reports DSN problems
+  without quoting the DSN.
+
 ## 0.5.0 - 2026-09-09
 
 What the first real installation turned up: logs you can actually read, and an

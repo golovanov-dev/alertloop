@@ -199,10 +199,10 @@ const eventDetailHTML = `<!doctype html>
         <td><code>{{.ChannelName}}</code></td>
         <td class="dl-{{.State}}">{{.State}}</td>
         <td>{{.Attempts}} / {{.MaxAttempts}}</td>
-        <td>{{if .NextRetryAt}}<code>{{.NextRetryAt.Format "15:04:05"}}</code>{{else}}—{{end}}</td>
+        <td>{{if .NextRetryAt}}<code>{{.NextRetryAt.Format "2006-01-02 15:04:05"}}</code>{{else}}—{{end}}</td>
         <td>{{.Kind}}</td>
         <td>{{if .LastError}}<code>{{.LastError}}</code>{{else}}—{{end}}</td>
-        <td><code>{{.UpdatedAt.Format "15:04:05"}}</code></td>
+        <td><code>{{.UpdatedAt.Format "2006-01-02 15:04:05"}}</code></td>
       </tr>
     {{end}}
     </tbody>

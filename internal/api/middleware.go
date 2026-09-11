@@ -185,6 +185,17 @@ func securityHeaders(next http.Handler) http.Handler {
 	})
 }
 
+// probePaths are the health and readiness endpoints under both of their names.
+// The Compose health check polls /health/ready every ten seconds; logged at
+// info, that is a line every ten seconds in stdout and in the log file, around
+// the lines anyone actually needs.
+var probePaths = map[string]bool{
+	"/health":       true,
+	"/health/live":  true,
+	"/ready":        true,
+	"/health/ready": true,
+}
+
 // logging is a minimal structured access log middleware. Health and readiness
 // probes (hit every few seconds by Docker/orchestrators) are logged at debug so
 // they do not drown the access log.
@@ -194,7 +205,7 @@ func logging(log *slog.Logger, next http.Handler) http.Handler {
 		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(sw, r)
 		level := slog.LevelInfo
-		if r.URL.Path == "/health" || r.URL.Path == "/ready" {
+		if probePaths[r.URL.Path] {
 			level = slog.LevelDebug
 		}
 		log.Log(r.Context(), level, "http",

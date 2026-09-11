@@ -63,6 +63,12 @@ func open(driver, dsn string) (*sql.DB, dialect, error) {
 		}
 		return db, dialect{name: "sqlite"}, nil
 	case "postgres":
+		// sql.Open does not parse the DSN; the driver does, on the first
+		// connection. Parse it here so a bad one fails at startup with an
+		// explanation that does not quote the password.
+		if err := checkPostgresDSN(dsn); err != nil {
+			return nil, dialect{}, err
+		}
 		db, err := sql.Open("pgx", dsn)
 		if err != nil {
 			return nil, dialect{}, err

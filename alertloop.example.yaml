@@ -155,7 +155,15 @@ database:
   # file to be self-contained.
   driver: ${ALERTLOOP_DB_DRIVER:-sqlite}
   # SQLite: a file path or ":memory:".
-  # PostgreSQL: e.g. "postgres://user:pass@host:5432/alertloop?sslmode=disable".
+  # PostgreSQL, either form:
+  #   "host=HOST port=5432 user=USER dbname=alertloop sslmode=disable password=PASS"
+  #   "postgres://USER:PASS@HOST:5432/alertloop?sslmode=disable"
+  # In the URL form, a password containing / ? # @ % or a space must be
+  # percent-encoded (/ as %2F) or the URL does not parse. The keyword/value form
+  # takes the password as written, unless it contains a space or a backslash
+  # or starts with a single quote — then write password='...' with \' and \\
+  # for ' and \.
+  # The Compose postgres profile passes a keyword/value DSN in here.
   # A DSN carries a password, so it is a good candidate for ${VAR} too.
   dsn: ${ALERTLOOP_DB_DSN:-alertloop.db}
 

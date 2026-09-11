@@ -6,9 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/golovanov-dev/alertloop/internal/domain"
 )
@@ -341,5 +344,46 @@ func TestPostgresRetentionDeletesInBatches(t *testing.T) {
 	}
 	if len(page.Items) != 5 {
 		t.Fatalf("%d events survived retention, want 5", len(page.Items))
+	}
+}
+
+// The DSN form docker-compose.yml now builds, against a real server. The unit
+// tests prove the driver parses the password intact; this proves PostgreSQL
+// then accepts it — for a role whose password carries every character the URL
+// form broke on, plus a literal "%2F" that a URL would have decoded.
+func TestPostgresKeywordValueDSNAuthenticatesASpecialPassword(t *testing.T) {
+	s := postgresStore(t)
+	ctx := context.Background()
+	admin, err := pgx.ParseConfig(os.Getenv("ALERTLOOP_TEST_POSTGRES_DSN"))
+	if err != nil {
+		t.Fatalf("parse the test DSN: %v", err)
+	}
+
+	const role = "alertloop_dsn_check"
+	const password = "Ab+/=@:#?!$&'()*,;~%2F-._9"
+	db := s.(*sqlStore).db
+	if _, err := db.ExecContext(ctx, "DROP ROLE IF EXISTS "+role); err != nil {
+		t.Fatalf("drop leftover role: %v", err)
+	}
+	// A role name and password cannot be bind parameters in CREATE ROLE; the
+	// literal is built by doubling quotes, which is PostgreSQL's own escaping.
+	literal := "'" + strings.ReplaceAll(password, "'", "''") + "'"
+	if _, err := db.ExecContext(ctx, "CREATE ROLE "+role+" LOGIN PASSWORD "+literal); err != nil {
+		t.Fatalf("create role (the test DSN needs CREATEROLE): %v", err)
+	}
+	t.Cleanup(func() { _, _ = db.ExecContext(context.Background(), "DROP ROLE IF EXISTS "+role) })
+
+	dsn := fmt.Sprintf("host=%s port=%d user=%s dbname=%s sslmode=disable password=%s",
+		admin.Host, admin.Port, role, admin.Database, password)
+	if err := Check(ctx, "postgres", dsn); err != nil {
+		t.Fatalf("keyword/value DSN with a special password did not authenticate: %v", err)
+	}
+}
+
+// check-db, the worker's health check, against a real server.
+func TestPostgresCheckReachesTheDatabase(t *testing.T) {
+	postgresStore(t)
+	if err := Check(context.Background(), "postgres", os.Getenv("ALERTLOOP_TEST_POSTGRES_DSN")); err != nil {
+		t.Fatalf("Check: %v", err)
 	}
 }

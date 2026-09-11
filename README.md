@@ -94,8 +94,12 @@ Pick by what you are doing:
 
 ```bash
 cp .env.example .env      # presets COMPOSE_PROFILES=demo
-docker compose up -d
+docker compose up -d --wait --wait-timeout 120
 ```
+
+`--wait` makes Compose wait for the containers' health checks, and fail if they
+do not pass. Without it `up -d` reports success as soon as the containers exist,
+even if AlertLoop then fails to start and restarts in a loop.
 
 Both deployments live in the single `docker-compose.yml` at the repository root,
 selected by profile — `demo` here, `postgres` below. Switch by **editing**
@@ -135,9 +139,9 @@ embedded.
 cp .env.example .env                        # then edit it:
                                             #   COMPOSE_PROFILES=postgres
                                             #   ALERTLOOP_ADMIN_TOKEN=$(openssl rand -hex 32)
-                                            #   POSTGRES_PASSWORD=$(openssl rand -base64 32)
+                                            #   POSTGRES_PASSWORD=$(openssl rand -hex 32)
 cp alertloop.example.yaml alertloop.yaml    # edit: channels, routing
-docker compose up -d
+docker compose up -d --wait --wait-timeout 120
 ```
 
 Create `alertloop.yaml` **before** starting. Docker creates a directory in place
@@ -154,6 +158,13 @@ It refuses to start without `ALERTLOOP_ADMIN_TOKEN` and `POSTGRES_PASSWORD`
 rather than falling back to placeholders published in this repository. Pin
 `ALERTLOOP_IMAGE` to a version tag in production: `latest` moves under you on
 the next `docker compose pull`.
+
+Each AlertLoop container has a health check, visible in `docker compose ps`:
+the api probes `/health/ready`, and the worker, which serves no HTTP, runs
+`alertloop check-db`. That is what `--wait` waits for.
+
+If port 8080 on the host is taken, set `ALERTLOOP_PORT` in `.env`. It moves the
+host side of the mapping only, and it applies to both profiles.
 
 ### Build from source
 
@@ -308,6 +319,23 @@ The single `alertloop` binary runs in three modes:
 - `worker` — delivery workers and retention cleanup.
 - `all` — both in one process (default; ideal for small installs).
 
+`alertloop check-db` is not a mode but a one-shot check: it loads the config,
+connects to the database, and exits 0 if it answered. It migrates nothing and
+changes nothing in the database. It is the health check of the worker
+container. Outside Docker it needs what the service has: the same user, the
+variables the config references, and the working directory a relative SQLite
+path resolves against. For an install made by `deploy/systemd/install.sh`:
+
+```bash
+sudo -u alertloop sh -c 'cd /var/lib/alertloop && set -a &&
+  . /etc/alertloop/alertloop.env &&
+  exec /usr/local/bin/alertloop --config /etc/alertloop/alertloop.yaml check-db'
+```
+
+That reads `alertloop.env` as a shell file, which works for the plain
+`NAME=value` lines the installer writes; quote any value you add there that
+contains spaces.
+
 ## Admin console
 
 AlertLoop ships a React admin console (Overview, Events, Event detail,
@@ -319,13 +347,16 @@ reachable from differs, because the two paths bind the port differently:
 - **Local (either path)**: <http://localhost:8080/admin>.
 - **Binary / systemd on a server**: AlertLoop listens on `:8080` on all
   interfaces, so it is also reachable at `http://<server-ip>:8080/admin`.
-- **Docker Compose on a server**: both bundled Compose files publish the port on
-  `127.0.0.1` only, so `http://<server-ip>:8080/admin` is refused **by design** —
-  a published Docker port is not filtered by a host firewall such as ufw, so
-  binding `0.0.0.0` would silently expose the console. Reach it through the
-  reverse proxy in `deploy/proxy/`, through an SSH tunnel
+- **Docker Compose on a server**: both profiles publish the port on `127.0.0.1`
+  only, so `http://<server-ip>:8080/admin` is refused **by design** — a published
+  Docker port is not filtered by a host firewall such as ufw, so binding
+  `0.0.0.0` would silently expose the console. Reach it through the reverse
+  proxy in `deploy/proxy/`, through an SSH tunnel
   (`ssh -L 8080:127.0.0.1:8080 user@server`, then use the Local URL above), or by
-  deliberately changing the mapping to `"8080:8080"` if you accept the exposure.
+  deliberately publishing it on all interfaces if you accept the exposure — in a
+  `docker-compose.override.yml`, with `ports: !override` and `- "8080:8080"`
+  under the service. The `!override` tag (Compose v2.24+) is required: without
+  it Compose adds your entry to the existing list instead of replacing it.
 
 For a real domain with HTTPS (the recommended setup for either path), see
 [Access over a domain](#access-over-a-domain-https).
@@ -359,11 +390,11 @@ Where AlertLoop is reachable before you add a proxy depends on how you run it:
 - **Binary / systemd**: the process listens on `:8080` on all interfaces, so on a
   server it is reachable at `http://<server-ip>:8080` (restrict it with your host
   firewall, or bind it to loopback with `addr: "127.0.0.1:8080"`).
-- **Docker Compose**: both bundled Compose files publish the port as
-  `127.0.0.1:8080:8080`, so the container is reachable from the host only. That is
-  deliberate: a published Docker port is not filtered by ufw/firewalld, so
-  binding `0.0.0.0` would put the admin console on the public internet without
-  the host firewall noticing.
+- **Docker Compose**: both profiles publish the port as `127.0.0.1:8080:8080`
+  (the host side is `ALERTLOOP_PORT` from `.env`, 8080 by default), so the
+  container is reachable from the host only. That is deliberate: a published
+  Docker port is not filtered by ufw/firewalld, so binding `0.0.0.0` would put
+  the admin console on the public internet without the host firewall noticing.
 
 Either way, for a real domain put an HTTPS reverse proxy in front — AlertLoop
 itself speaks plain HTTP and does not terminate TLS. Since the API, admin
@@ -415,6 +446,23 @@ database:
   driver: postgres
   dsn: "postgres://USER:PASSWORD@HOST:5432/alertloop?sslmode=require"
 ```
+
+In the URL form, a password containing `/`, `?`, `#`, `@`, `%` or a space has
+to be percent-encoded (`/` as `%2F`, `@` as `%40`), or the URL does not parse.
+The keyword/value form needs no encoding, and it is what the Compose postgres
+profile uses:
+
+```yaml
+database:
+  driver: postgres
+  dsn: "host=HOST port=5432 user=USER dbname=alertloop sslmode=require password=PASSWORD"
+```
+
+A value there that contains a space or a backslash, or starts with a single
+quote, goes in single quotes, with `'` and `\` inside it written as `\'` and
+`\\`. A DSN AlertLoop
+cannot parse stops it at startup with a message that says which form was
+expected; the message never repeats the DSN, because the DSN holds the password.
 
 The DSN carries a password, so it is a good candidate for `${VAR}` — see
 [Configuration](#configuration). Use `sslmode=require` for a remote database;
@@ -682,7 +730,7 @@ no drift. To use it:
 
 ```bash
 cp alertloop.example.yaml alertloop.yaml    # api_keys & channels optional
-COMPOSE_PROFILES=postgres docker compose up -d
+COMPOSE_PROFILES=postgres docker compose up -d --wait --wait-timeout 120
 ```
 
 The single-process `all` mode has no such split and needs no special handling.

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { api } from "../api";
-import { timeOfDay } from "../format";
+import { dateTime } from "../format";
 import { c, mono, typeLabels } from "../theme";
 import type { AlertEvent } from "../types";
 import { Badge, Card, ErrorState, Loading, td, tdMono, th } from "../ui";
@@ -221,7 +221,7 @@ export function Events() {
             <tbody>
               {visible.map((ev) => (
                 <tr key={ev.id} onClick={() => nav(`/events/${ev.id}`)} style={{ cursor: "pointer" }}>
-                  <td style={tdMono}>{timeOfDay(ev.created_at)}</td>
+                  <td style={tdMono}>{dateTime(ev.created_at)}</td>
                   <td style={{ ...td, color: c.text2 }}>{typeLabels[ev.type] ?? ev.type}</td>
                   <td style={td}>
                     <Badge kind="severity" value={ev.severity} />

@@ -8,11 +8,11 @@ please report it privately first.
 
 | Version | Supported |
 |---|---|
-| 0.4.x | ✅ current |
-| 0.3.x | ✅ security fixes until 0.5.0 |
-| ≤ 0.2.x | ❌ upgrade |
+| 0.5.x | ✅ current |
+| ≤ 0.4.x | ❌ upgrade |
 
-Before 1.0.0 the supported set is "the current minor and the one before it".
+Before 1.0.0 only the latest minor line is supported. A fix ships as a patch
+release of that line and is not backported: upgrading within 0.x is the fix.
 The compatibility contract that 1.0.0 publishes will replace this table with a
 firmer promise.
 

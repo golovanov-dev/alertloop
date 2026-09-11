@@ -105,6 +105,17 @@ func New(ctx context.Context, cfg config.Config, version string, log *slog.Logge
 	return app, nil
 }
 
+// CheckDatabase validates cfg and reaches its database, without migrating it.
+// It is `alertloop check-db`, the health check of a worker container: the
+// worker has no HTTP listener to probe. See storage.Check for what it will not
+// do on the way.
+func CheckDatabase(ctx context.Context, cfg config.Config) error {
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+	return storage.Check(ctx, cfg.Database.Driver, cfg.Database.DSN)
+}
+
 // buildRouter assembles the router from the optional routing section. A nil
 // section means no routing is configured, which keeps the historical behavior:
 // every event goes to every channel.

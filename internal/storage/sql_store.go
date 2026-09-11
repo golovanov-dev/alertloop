@@ -18,6 +18,9 @@ import (
 type sqlStore struct {
 	db *sql.DB
 	d  dialect
+	// percentPassword: the PostgreSQL password contains a %XX sequence, so a
+	// refused login gets a hint (see explainAuthFailure).
+	percentPassword bool
 }
 
 // Open opens a Store for the given driver and DSN.
@@ -26,12 +29,17 @@ func Open(driver, dsn string) (Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &sqlStore{db: db, d: d}, nil
+	return &sqlStore{db: db, d: d, percentPassword: d.name == "postgres" && passwordLooksPercentEncoded(dsn)}, nil
 }
 
-func (s *sqlStore) Migrate(ctx context.Context) error { return migrate(ctx, s.db, s.d) }
-func (s *sqlStore) Ping(ctx context.Context) error    { return s.db.PingContext(ctx) }
-func (s *sqlStore) Close() error                      { return s.db.Close() }
+// Migrate runs at startup and is the first thing to connect, so a refused
+// login surfaces here.
+func (s *sqlStore) Migrate(ctx context.Context) error {
+	return explainAuthFailure(migrate(ctx, s.db, s.d), s.percentPassword)
+}
+
+func (s *sqlStore) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }
+func (s *sqlStore) Close() error                   { return s.db.Close() }
 
 // timeLayout is a FIXED-WIDTH RFC3339 variant with a constant 9-digit
 // nanosecond fraction. Unlike time.RFC3339Nano (which trims trailing zeros),

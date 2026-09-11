@@ -6,10 +6,17 @@
 #   demo      one all-in-one container on SQLite. Loopback only, no setup.
 #   postgres  separate api and worker containers on PostgreSQL. Production.
 #
-# Pick exactly one. Both publish port 8080, so running them together fails.
+# Pick exactly one. Both publish the same host port (8080, or ALERTLOOP_PORT
+# from .env), so running them together fails.
 #
 #   cp .env.example .env      # COMPOSE_PROFILES=demo is preset there
-#   docker compose up -d
+#   docker compose up -d --wait --wait-timeout 120
+#
+# --wait is what makes a failed start visible. Plain `up -d` returns as soon as
+# the containers are created, so a service that then fails and restarts in a
+# loop looks exactly like a working one. With --wait, Compose waits for every
+# health check below to pass, and exits non-zero if one does not within the
+# timeout. `docker compose ps` then shows which service it was.
 #
 # For production, EDIT that line to COMPOSE_PROFILES=postgres and run the same
 # command. Do NOT set the variable and pass --profile as well: Compose COMBINES
@@ -21,8 +28,9 @@
 #   1. cp alertloop.example.yaml alertloop.yaml   and edit it. Create the file
 #      BEFORE starting: a bind mount whose source is missing gets a directory
 #      created in its place, and AlertLoop then fails on "is a directory".
-#   2. set ALERTLOOP_ADMIN_TOKEN in .env          (openssl rand -hex 32)
-# It refuses to start without the token rather than running on a placeholder
+#   2. set ALERTLOOP_ADMIN_TOKEN and POSTGRES_PASSWORD in .env
+#                                                  (openssl rand -hex 32, each)
+# It refuses to start without them rather than running on a placeholder
 # published in this repository.
 #
 # Images are pulled from GHCR; nothing is built from this file. To run a build
@@ -61,6 +69,18 @@ x-hardening: &hardening
   logging: *logging
   restart: unless-stopped
 
+# Health of a process that serves HTTP: the demo container and the api. The
+# readiness probe answers only when the database does, so "healthy" means the
+# service is up AND can store events. The image's busybox wget does the
+# request; it writes nothing to disk and needs no capabilities, so it works on
+# the read-only, capability-less containers above.
+x-http-health: &http-health
+  test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health/ready"]
+  interval: 10s
+  timeout: 5s
+  retries: 3
+  start_period: 30s
+
 # Environment shared by the api and the worker. They run the same config file
 # and must see the same secrets; only the log file differs, per service.
 x-pg-env: &pg-env
@@ -80,7 +100,20 @@ x-pg-env: &pg-env
   # inject a secret — a *leftover* one that the file does not reference is
   # what AlertLoop refuses to start on.
   ALERTLOOP_DB_DRIVER: postgres
-  ALERTLOOP_DB_DSN: postgres://alertloop:${POSTGRES_PASSWORD}@postgres:5432/alertloop?sslmode=disable
+  # Keyword/value, not a postgres:// URL. Compose pastes the password in as
+  # text, and in a URL a "/", "?" or "#" in it ends the user:password part —
+  # the DSN stops parsing and both containers restart in a loop. Keyword/value
+  # gives those characters no meaning.
+  #
+  # The password is deliberately unquoted and last: unquoted, a single quote
+  # inside it works (quoting would break it), and last, nothing follows it.
+  # Keyword/value still gives three things a meaning. Whitespace ends the
+  # value — "ab c=d" arrives as password "ab" plus a setting c=d, and
+  # "ab dbname=x" switches the database. A backslash escapes the next
+  # character ("\\" becomes one backslash). A leading single quote opens a
+  # quoted value and fails to parse. Any other password arrives exactly as
+  # written; one from `openssl rand -hex 32` always does.
+  ALERTLOOP_DB_DSN: host=postgres port=5432 user=alertloop dbname=alertloop sslmode=disable password=${POSTGRES_PASSWORD}
 
 services:
   # --- demo profile ------------------------------------------------------
@@ -96,7 +129,11 @@ services:
       # from other hosts. A published Docker port bypasses host firewalls such
       # as ufw, so do NOT bind 0.0.0.0 here. For remote access put the reverse
       # proxy from deploy/proxy/ in front of it.
-      - "127.0.0.1:8080:8080"
+      #
+      # ALERTLOOP_PORT in .env moves the HOST side only, for when 8080 is taken.
+      # Inside the container AlertLoop always listens on 8080. The variable is
+      # read by Compose to fill in this line and is not passed to the container.
+      - "127.0.0.1:${ALERTLOOP_PORT:-8080}:8080"
     environment:
       # The image ships a config file that reads the token from this variable.
       # It signs in to /admin AND grants full API access. The demo has a
@@ -104,6 +141,7 @@ services:
       ALERTLOOP_ADMIN_TOKEN: ${ALERTLOOP_ADMIN_TOKEN:-change-me-admin}
     volumes:
       - alertloop-data:/data
+    healthcheck: *http-health
     <<: *hardening
 
   # --- postgres profile --------------------------------------------------
@@ -147,8 +185,9 @@ services:
       postgres:
         condition: service_healthy
     ports:
-      # Loopback only — see the note on the demo service.
-      - "127.0.0.1:8080:8080"
+      # Loopback only, host port from ALERTLOOP_PORT — see the demo service.
+      - "127.0.0.1:${ALERTLOOP_PORT:-8080}:8080"
+    healthcheck: *http-health
     volumes:
       # Both containers mount the SAME file, so channels and routing are defined
       # once and cannot drift between the API and the worker.
@@ -179,8 +218,25 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      # Started, deliberately not healthy: with service_healthy a plain
+      # `docker compose up -d` would wait forever on an api that restarts in a
+      # loop. Both processes run the migrations at startup, and that is safe
+      # without ordering: each migration is one transaction recorded under a
+      # primary key, so the loser of a race rolls back and finds it applied.
       api:
         condition: service_started
+    # The worker serves no HTTP, so its check is the binary itself: check-db
+    # loads the same config file and pings the database. It proves the worker's
+    # configuration loads and its database answers; it does not watch the
+    # delivery loop. A worker that cannot start never becomes healthy, and that
+    # is what `up --wait` reports. The image's own HEALTHCHECK probes HTTP and
+    # would call this container unhealthy forever, so it is replaced here.
+    healthcheck:
+      test: ["CMD", "alertloop", "--config", "/etc/alertloop/alertloop.yaml", "check-db"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     volumes:
       - ./alertloop.yaml:/etc/alertloop/alertloop.yaml:ro
       - ./logs:/var/log/alertloop

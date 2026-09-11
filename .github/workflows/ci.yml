@@ -222,6 +222,124 @@ jobs:
           done
           echo "COMPOSE_PROFILES selects exactly one deployment"
 
+      # The host port is ALERTLOOP_PORT, 8080 when unset (checked above). It
+      # must move the host side of the mapping in both profiles, and it must
+      # stay a Compose variable: nothing may hand it to a container.
+      - name: ALERTLOOP_PORT moves the host port and stays out of the containers
+        run: |
+          for profile in demo postgres; do
+            out=$(COMPOSE_PROFILES= ALERTLOOP_PORT=18080 docker compose --profile "$profile" config)
+            moved=$(echo "$out" | grep -c 'published: *"18080"' || true)
+            stale=$(echo "$out" | grep -c 'published: *"8080"' || true)
+            if [ "$moved" != "1" ] || [ "$stale" != "0" ]; then
+              echo "::error::profile $profile: ALERTLOOP_PORT=18080 published 18080 $moved time(s) and 8080 $stale time(s)."
+              echo "$out"
+              exit 1
+            fi
+            if echo "$out" | grep -q 'ALERTLOOP_PORT'; then
+              echo "::error::profile $profile passes ALERTLOOP_PORT into a container."
+              exit 1
+            fi
+          done
+          echo "ALERTLOOP_PORT moves the host port in both profiles"
+
+  compose-up:
+    name: Compose postgres profile starts healthy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # The compose job above proves the file parses. This one proves the stack
+    # it describes comes up — built from this tree, with a database password
+    # full of the characters that used to break the DSN — and that a stack that
+    # cannot start is reported as a failure by `up --wait` instead of looking
+    # like a running one.
+    env:
+      # Every character the pre-0.5.1 URL DSN broke on, plus a literal %2F.
+      PW: "Tr5Lw9Bq/Kx2+Nm7=@:#?%2F"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the image from this tree
+        run: docker build --build-arg VERSION=ci -t alertloop:ci .
+
+      # The password contains "#", so it goes in single quotes in .env — what
+      # the install guide and .env.example tell you to do with one like it.
+      - name: Write .env and alertloop.yaml as the install guide says
+        run: |
+          write_env() {
+            grep -v -E '^(COMPOSE_PROFILES|ALERTLOOP_ADMIN_TOKEN|POSTGRES_PASSWORD)=' .env.example
+            echo "COMPOSE_PROFILES=postgres"
+            echo "ALERTLOOP_ADMIN_TOKEN=$1"
+            echo "POSTGRES_PASSWORD='$PW'"
+            echo "ALERTLOOP_IMAGE=alertloop:ci"
+            echo "ALERTLOOP_PORT=18080"
+          }
+          write_env "ci-admin-token" > .env
+          cp alertloop.example.yaml alertloop.yaml
+
+      - name: up --wait succeeds, and both AlertLoop containers are healthy
+        run: |
+          docker compose up -d --wait --wait-timeout 180
+          docker compose ps
+          for svc in api worker; do
+            status=$(docker inspect -f '{{.State.Health.Status}}' "$(docker compose ps -q "$svc")")
+            if [ "$status" != "healthy" ]; then
+              echo "::error::$svc is $status after up --wait"
+              exit 1
+            fi
+          done
+          curl -fsS http://127.0.0.1:18080/health/ready
+          echo
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18080/v1/events \
+            -H "X-API-Key: ci-admin-token" -H 'Content-Type: application/json' \
+            -d '{"type":"incident","severity":"info","source":"ci","message":"compose smoke test"}')
+          if [ "$code" != "201" ]; then
+            echo "::error::POST /v1/events returned $code, want 201"
+            exit 1
+          fi
+          echo "the stack is up on port 18080, both containers healthy, and it stores events"
+
+      - name: Logs, if the stack did not come up
+        if: failure()
+        run: docker compose logs --no-color --tail=200
+
+      # The failure this whole setup exists to expose: containers created,
+      # AlertLoop failing at startup in a restart loop. Plain `up -d` reports
+      # success for that; `up --wait --wait-timeout` must not. Here the cause is
+      # a missing admin token, which AlertLoop refuses to start without.
+      #
+      # `timeout` is a guard, not the check. Compose's own --wait-timeout must be
+      # what ends the command: exit 124 means the outer timeout killed a Compose
+      # that was still waiting, i.e. --wait-timeout did not work, and that is
+      # reported as a failure rather than mistaken for the expected refusal.
+      - name: up --wait fails when AlertLoop cannot start
+        run: |
+          docker compose down -v
+          write_env() {
+            grep -v -E '^(COMPOSE_PROFILES|ALERTLOOP_ADMIN_TOKEN|POSTGRES_PASSWORD)=' .env.example
+            echo "COMPOSE_PROFILES=postgres"
+            echo "ALERTLOOP_ADMIN_TOKEN="
+            echo "POSTGRES_PASSWORD='$PW'"
+            echo "ALERTLOOP_IMAGE=alertloop:ci"
+            echo "ALERTLOOP_PORT=18080"
+          }
+          write_env > .env
+          rc=0
+          timeout 240 docker compose up -d --wait --wait-timeout 90 || rc=$?
+          docker compose ps
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::up --wait reported success for a stack whose api cannot start"
+            exit 1
+          fi
+          if [ "$rc" -eq 124 ]; then
+            echo "::error::up --wait was still waiting after 240s and had to be killed; --wait-timeout 90 did not end it"
+            exit 1
+          fi
+          echo "a stack that cannot start fails up --wait (exit $rc)"
+
+      - name: Clean up
+        if: always()
+        run: docker compose down -v || true
+
   monit-integration:
     name: Monit integration (shellcheck, tests)
     runs-on: ubuntu-latest

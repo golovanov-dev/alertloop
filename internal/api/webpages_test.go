@@ -188,3 +188,46 @@ func TestDeliveryAttemptsAPIFiltersByKind(t *testing.T) {
 		t.Fatalf("kind = %v, want recovery", first["kind"])
 	}
 }
+
+// The delivery table on /events/{id} used to print a bare "15:04:05". With up
+// to retention_days of history, and a retry that can be
+// scheduled for the next day, a time without a date does not say when. Both
+// columns carry the date now, in UTC as their headers say, in the same format
+// as the /events list.
+func TestEventPageDeliveryTableShowsTheDate(t *testing.T) {
+	ts, store := newTestServer(t, nil)
+	ctx := context.Background()
+	created := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+	updated := time.Date(2026, 3, 4, 23, 50, 1, 0, time.UTC)
+	retry := time.Date(2026, 3, 5, 0, 20, 1, 0, time.UTC) // tomorrow, from the row's point of view
+
+	e := &domain.Event{
+		ID: "evt-date", Type: domain.EventIncident, Severity: domain.SeverityCritical,
+		State: domain.StateNew, Source: "monit", Message: "disk full", Payload: []byte(`{}`),
+		CreatedAt: created, UpdatedAt: created, LastSeenAt: created,
+	}
+	if _, _, err := store.CreateEvent(ctx, e); err != nil {
+		t.Fatalf("create event: %v", err)
+	}
+	if err := store.CreateDeliveryAttempt(ctx, &domain.DeliveryAttempt{
+		ID: "att-date", EventID: "evt-date", Channel: domain.ChannelTelegram, ChannelName: "tg",
+		Kind: domain.KindAlert, State: domain.DeliveryFailed, Attempts: 2, MaxAttempts: 5,
+		NextRetryAt: &retry, LastError: "timeout", CreatedAt: created, UpdatedAt: updated,
+	}); err != nil {
+		t.Fatalf("create attempt: %v", err)
+	}
+
+	html := getPage(t, ts.URL+"/events/evt-date?token="+adminTok)
+	for header, want := range map[string]string{
+		"Updated (UTC)":    "2026-03-04 23:50:01",
+		"Next retry (UTC)": "2026-03-05 00:20:01",
+	} {
+		got, ok := columnUnder(t, html, header)
+		if !ok {
+			t.Fatal("no delivery rows rendered")
+		}
+		if got != want {
+			t.Errorf("%s = %q, want %q", header, got, want)
+		}
+	}
+}

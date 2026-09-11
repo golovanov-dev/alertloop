@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { api } from "../api";
 import { useApp } from "../context";
-import { relToLabel, timeOfDay } from "../format";
+import { relToLabel, dateTime } from "../format";
 import { c, mono } from "../theme";
 import type { DeliveryAttempt } from "../types";
 import { Badge, Card, ErrorState, Loading, td, tdMono, th } from "../ui";
@@ -191,7 +191,7 @@ export function Deliveries() {
                     >
                       {d.last_error || "—"}
                     </td>
-                    <td style={tdMono}>{timeOfDay(d.updated_at)}</td>
+                    <td style={tdMono}>{dateTime(d.updated_at)}</td>
                     <td style={{ ...td, textAlign: "right" }}>
                       {replayed[d.id] ? (
                         <span style={{ fontSize: 12, color: c.ok }}>Queued ✓</span>

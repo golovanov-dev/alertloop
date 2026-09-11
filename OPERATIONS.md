@@ -33,6 +33,35 @@ while the failure lasts.
 `/health` and `/health/live` are the same check under two names, as are `/ready`
 and `/health/ready`. Point your monitoring at whichever your tooling prefers.
 
+### Container health checks
+
+Under Compose every AlertLoop container has a Docker health check, run every
+10 seconds. The api (and the demo container) probe `/health/ready`. The worker
+serves no HTTP, so it runs `alertloop check-db`: load the config file, connect
+to the database, exit 0 if it answered. It migrates nothing and changes nothing
+in the database. Outside Docker it needs the service's user, environment and
+working directory — the README shows the call for a systemd install.
+
+```bash
+docker compose ps                                  # (healthy) / (unhealthy) per service
+docker compose up -d --wait --wait-timeout 120     # fails if one does not become healthy
+```
+
+Use `--wait` for installs and upgrades. Plain `up -d` returns as soon as the
+containers exist, so an AlertLoop that fails at startup and restarts in a loop
+looks exactly like one that is running.
+
+The worker does not wait for the api to be healthy, only for its container to
+start: a dependency on health would make a plain `up -d` hang on an api that
+restarts in a loop. Both processes run the migrations, and that is safe: each
+migration is one transaction recorded under a primary key, so whichever
+process loses a race rolls back and finds the migration applied on its next
+start.
+
+What the worker's check does **not** prove is that deliveries are moving: a
+worker whose database answers can still have a queue that never drains. That is
+what `deliveries.pending` below is for.
+
 ### What to alert on
 
 ```bash
@@ -175,7 +204,7 @@ ALERTLOOP_LOG_FILE_WORKER=/var/log/alertloop/worker.log
 ```
 
 ```bash
-docker compose up -d
+docker compose up -d --wait --wait-timeout 120
 sudo tail -f logs/worker.log        # the files belong to uid 10001
 ```
 
@@ -328,6 +357,36 @@ with a backup.
 Split deployments (`server` and `worker` as separate processes) must run the
 **same version**. Upgrade them together.
 
+### Upgrading to 0.5.1: the Compose profile passes the database password differently
+
+The postgres profile used to build a URL from `POSTGRES_PASSWORD`, and a
+password containing `/`, `?` or `#` broke it: the api and the worker restarted
+in a loop with a parse error. It now builds a keyword/value DSN
+(`host=postgres ... password=...`) with the password exactly as written in
+`.env`. A password that worked before works unchanged, with two exceptions:
+
+- **A percent-encoded password.** If you wrote `%2F` for `/` (or any `%XX`) in
+  `POSTGRES_PASSWORD` to make the URL parse, the URL decoded it and the new DSN
+  does not: AlertLoop would send `%2F` literally and PostgreSQL would refuse it.
+  Put the decoded password — the one PostgreSQL has — into `.env` before you
+  upgrade. `grep '^POSTGRES_PASSWORD=.*%' .env` finds the case. If you miss
+  it, the refused login in the log carries a note pointing here.
+- **A password that begins with a single quote** no longer parses. AlertLoop
+  refuses to start and says why; change the password as described in
+  "Changing the database password" below.
+
+A DSN you write yourself is unaffected, with one exception: a URL with an
+unencoded `@` in the path (the database name), in the fragment, or in the name
+of a query parameter is now refused, because that is what a misplaced password
+looks like. Write it as `%40`. An `@` in a parameter's value
+(`?user=name@domain`) is fine.
+
+Also new, none of it needing action: a health check of its own for the worker
+(it used to inherit the image's HTTP check and show as `unhealthy` for good),
+checks every 10 seconds instead of 30, `docker compose up -d --wait
+--wait-timeout 120` as the way to start (see "Container health checks"), and
+`ALERTLOOP_PORT` in `.env` for the host port.
+
 ### Upgrading to 0.5.0: `ALERTLOOP_LOG_FILE` needs a line in your config
 
 The Compose file now passes `ALERTLOOP_LOG_FILE` to the api and the worker, and
@@ -470,13 +529,36 @@ ingestion as something to retry.
    ```
 3. Common causes, in the order they actually occur: the database container was
    not restarted with the rest of the stack; the disk under the database filled
-   up; the password in `.env` changed but the volume still holds the old one;
-   connection limits exhausted by another application sharing the server.
+   up; the password in `.env` changed but the volume still holds the old one
+   (see "Changing the database password" below); connection limits exhausted by
+   another application sharing the server.
 4. **Do not delete the volume to "reset" it.** That is your event history.
 5. Once the database is back, AlertLoop reconnects on its own — no restart is
    needed, though a restart is harmless. Pending deliveries resume; anything
    left stuck in `sending` by a worker that died is requeued automatically
    within five minutes by the reaper.
+
+### Changing the database password
+
+The postgres image applies `POSTGRES_PASSWORD` only when it initialises an
+empty volume. On an existing database, editing `.env` changes what AlertLoop
+sends and not what PostgreSQL expects, and the api and the worker then fail on
+authentication. Change it in the database first:
+
+```bash
+NEW="$(openssl rand -hex 32)"
+docker compose exec postgres \
+  psql -U alertloop -c "ALTER USER alertloop WITH PASSWORD '$NEW';"
+sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$NEW/" .env
+docker compose up -d --wait --wait-timeout 120
+```
+
+`openssl rand -hex 32` is used on purpose: hex has no character that means
+anything to a shell, to `sed`, to SQL, to `.env`, or to a DSN.
+
+Changing `.env` makes the last command recreate the containers that read the
+variable — the database container included — so expect a short outage of a few
+seconds while PostgreSQL restarts. The data is on the volume and is untouched.
 
 ### Events arrive but nothing is delivered
 
@@ -488,7 +570,9 @@ This is a configuration problem, not a failure, and the log said so at startup.
    events and delivers nothing. That is a valid way to run, and it is what a
    fresh install does.
 2. **Is a worker running?** In `server` mode nothing sends. You need `worker` or
-   `all`. In a split deployment, check that the worker container is up.
+   `all`. In a split deployment, `docker compose ps` must show the worker as
+   `(healthy)`; `Restarting` or `(unhealthy)` means it cannot start or cannot
+   reach the database, and `docker compose logs worker` says which.
 3. **Does the server have the same channel configuration as the worker?** The
    server decides which delivery jobs to create; if *it* sees no channels, no
    jobs exist for the worker to send, however healthy the worker is. Both

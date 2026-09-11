@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { api } from "../api";
 import { useApp } from "../context";
-import { fullTime, timeOfDay } from "../format";
+import { fullTime, dateTime } from "../format";
 import { c, eventActionRules, mono } from "../theme";
 import type { AlertEvent, DeliveryAttempt, EventAction } from "../types";
 import { Badge, Card, ErrorState, Loading, td, tdMono, th } from "../ui";
@@ -255,11 +255,11 @@ export function EventDetail() {
                     <td style={{ ...tdMono, color: c.text2 }}>
                       {d.attempts} / {d.max_attempts}
                     </td>
-                    <td style={tdMono}>{d.next_retry_at ? timeOfDay(d.next_retry_at) : "—"}</td>
+                    <td style={tdMono}>{d.next_retry_at ? dateTime(d.next_retry_at) : "—"}</td>
                     <td style={{ ...tdMono, maxWidth: 200, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }} title={d.last_error}>
                       {d.last_error || "—"}
                     </td>
-                    <td style={tdMono}>{timeOfDay(d.updated_at)}</td>
+                    <td style={tdMono}>{dateTime(d.updated_at)}</td>
                     <td style={{ ...td, textAlign: "right" }}>
                       {replayed[d.id] ? (
                         <span style={{ fontSize: 12, color: c.ok }}>Queued ✓</span>
