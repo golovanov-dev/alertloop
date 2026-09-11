@@ -19,15 +19,15 @@
 # timeout. `docker compose ps` then shows which service it was.
 #
 # For production, EDIT that line to COMPOSE_PROFILES=postgres and run the same
-# command. Do NOT set the variable and pass --profile as well: Compose COMBINES
-# them, so `COMPOSE_PROFILES=demo docker compose --profile postgres up` starts
-# both and collides on the port. With no .env at all, `--profile <name>` on its
-# own is the way to select one.
+# command. Do NOT pass --profile on top of the variable: for that one command
+# the flag REPLACES it, so the command acts on a different deployment than the
+# rest — `--profile postgres up` next to a running demo collides on the port.
 #
 # The postgres profile needs two things first:
 #   1. cp alertloop.example.yaml alertloop.yaml   and edit it. Create the file
-#      BEFORE starting: a bind mount whose source is missing gets a directory
-#      created in its place, and AlertLoop then fails on "is a directory".
+#      BEFORE starting: Docker creates a missing bind-mount source as a
+#      directory, and `up` then fails with its own error, "not a directory ...
+#      Are you trying to mount a directory onto a file (or vice-versa)?".
 #   2. set ALERTLOOP_ADMIN_TOKEN and POSTGRES_PASSWORD in .env
 #                                                  (openssl rand -hex 32, each)
 # It refuses to start without them rather than running on a placeholder

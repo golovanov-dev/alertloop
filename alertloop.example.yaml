@@ -21,9 +21,11 @@
 # the process rather than leaving an empty setting; and the substituted text is
 # data, not YAML, so a password containing ": " or "#" stays a password.
 #
-# Upgrading from 0.2.x: ALERTLOOP_ADDR, ALERTLOOP_DB_DSN, ALERTLOOP_LOG_*,
-# ALERTLOOP_WORKER_* and friends no longer configure anything. A leftover one
-# stops startup with the config line to write instead.
+# Where the variables come from: under systemd, the EnvironmentFile
+# /etc/alertloop/alertloop.env. Under Compose, only the variables that
+# docker-compose.yml passes to the container (the admin token, the database,
+# the log file) — any other ${VAR} stays unset there, so write that value into
+# this file instead.
 
 # HTTP listen address for the API and web UI.
 addr: ":8080"
@@ -35,8 +37,7 @@ addr: ":8080"
 # startup when the variable is unset, naming what is missing — which is the only
 # safe behaviour for the credential that opens the whole API. An installation
 # silently running on a placeholder published in this repository is worse than
-# one that refuses to start, and that is not hypothetical: 0.3.0 shipped exactly
-# that and it was fixed in 0.3.1.
+# one that refuses to start.
 #
 #   export ALERTLOOP_ADMIN_TOKEN="$(openssl rand -hex 32)"
 #
@@ -53,8 +54,9 @@ admin_token: ${ALERTLOOP_ADMIN_TOKEN}
 # Commented out on purpose: an example that ships a WORKING key hands a live
 # ingest credential to everyone who copies this file, and whoever holds one can
 # create events and through them wake every configured channel. Uncomment and
-# generate your own (openssl rand -hex 32), or keep them in .env and reference
-# them here as ${VAR}.
+# put in keys of your own (openssl rand -hex 32): either the key itself in
+# quotes, or a ${VAR} reference as below where the environment can supply it
+# (see the top of this file — under Compose it cannot).
 #
 # api_keys:
 #   - key: ${ALERTLOOP_INGEST_KEY}
@@ -135,8 +137,13 @@ rate_limit:
   # would never fire.
   #
   # trusted_proxies:
-  #   - "127.0.0.1"          # nginx or Caddy on this host
+  #   - "127.0.0.1"          # nginx or Caddy on this host, binary install
   #   - "10.0.0.0/8"         # a load balancer range
+  #
+  # Under Compose the proxy on the host reaches the container from the Compose
+  # network gateway, not from 127.0.0.1. List that address; it is printed by
+  #   docker network inspect alertloop_default -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}'
+  # and can change after `docker compose down`.
   #
   # Also add rate limiting at the proxy itself; deploy/proxy/nginx.conf ships
   # with it configured. The two are complementary, not alternatives.
@@ -183,8 +190,9 @@ worker:
 # (e.g. two Telegram chats). Without a `routing` section (see below) every event
 # is delivered to EVERY configured channel. Each channel needs a unique `name`.
 # If you enable a channel you must fill ALL its required fields, or startup will
-# fail with a clear message.
-channels: {}
+# fail with a clear message. Secrets such as bot_token and password follow the
+# rule at the top of this file: under Compose, write them here.
+channels:
   # email:
   #   - name: dev-email
   #     host: "smtp.example.com"
@@ -198,7 +206,7 @@ channels: {}
   #
   # telegram:
   #   - name: dev-telegram
-  #     bot_token: ${TELEGRAM_BOT_TOKEN}   # from @BotFather; keep it in .env
+  #     bot_token: ${TELEGRAM_BOT_TOKEN}   # from @BotFather
   #     chat_id: "-1001234567890"
   #     # If this host cannot reach api.telegram.org directly, send this
   #     # channel's requests through a proxy. Schemes: http, https, socks5,
@@ -221,7 +229,7 @@ channels: {}
   #     secret: "shared-webhook-secret"
 
 # Routing is OPTIONAL. Without this section every event goes to every configured
-# channel (the behaviour of 0.1.x). With it, each event goes to the channels of
+# channel. With it, each event goes to the channels of
 # the FIRST rule it matches — rules are checked top to bottom and channel lists
 # are never merged.
 #

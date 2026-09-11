@@ -157,10 +157,13 @@ sudo nano /etc/alertloop/monit.env
 ```
 
 ```bash
-ALERTLOOP_URL=http://127.0.0.1:8080     # or https://alerts.example.com
+ALERTLOOP_URL=http://127.0.0.1:8080
 ALERTLOOP_API_KEY=the-key-you-just-made
-ALERTLOOP_HOST=server-01                # optional; defaults to `hostname -s`
 ```
+
+The adapter reads everything after `=` as the value, so keep comments on lines
+of their own. AlertLoop on another host:
+`ALERTLOOP_URL=https://alerts.example.com`.
 
 One key per server, so a compromised host can be cut off on its own. `ingest` is
 deliberately the whole scope: Monit needs to report events and nothing else.

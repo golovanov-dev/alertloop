@@ -302,11 +302,11 @@ the database you just replaced.
 
 ```bash
 # Backup (custom format, compressed, restorable selectively)
-docker compose --profile postgres exec -T postgres \
+docker compose exec -T postgres \
   pg_dump -U alertloop -Fc alertloop > alertloop-$(date -u +%Y%m%dT%H%M%SZ).dump
 
 # Restore into an empty database
-docker compose --profile postgres exec -T postgres \
+docker compose exec -T postgres \
   pg_restore -U alertloop -d alertloop --clean --if-exists < alertloop-20260822T090000Z.dump
 ```
 
@@ -319,20 +319,39 @@ point-in-time recovery over a dump on a timer.
 1. Stop the AlertLoop processes first. Restoring under a running worker means
    restoring under something that is writing.
 2. Restore.
-3. Start AlertLoop and check the log for `migrations applied` — a backup from an
-   older version is migrated forward on start, which is expected and safe.
-4. `curl /health/ready` and then `/v1/stats`, and compare the counts to what you
-   expect.
+3. Start AlertLoop. Migrations run at startup, so a backup from an older version
+   is migrated forward — expected and safe.
+4. `curl /health/ready`, then `/v1/stats` — compare the counts to what you
+   expect — and send one test event.
 
 ### Verify the backup, not the backup job
 
-A backup nobody has restored is a hypothesis. At least once, restore into a
-throwaway location and start AlertLoop against it:
+A backup nobody has restored is a hypothesis. At least once, restore it next to
+production, not over it, and start AlertLoop against the copy. For a binary
+install: a separate config pointing at the restored copy, on a port of its own,
+so the production process cannot answer the check in its place:
 
 ```bash
-alertloop --config /tmp/restore-check.yaml server   # database.dsn -> the restored copy
-curl -s localhost:8080/health/ready
+alertloop --config /tmp/restore-check.yaml server   # database.dsn -> the restored copy, addr: "127.0.0.1:18080"
+curl -s localhost:18080/health/ready
+curl -s -H "X-API-Key: $TOKEN" localhost:18080/v1/stats    # compare with production
 ```
+
+The counts in `/v1/stats` are the check. `/health/ready` only pings the
+database, so an empty one (a DSN typo, a restore that never ran) answers
+`ready` too.
+
+Under Docker a second clone is not separate by itself: `docker-compose.yml`
+sets the project name `alertloop`, so `docker compose up` in any directory
+recreates the production containers, and `pg_restore` there lands in the
+production database. In the second clone's `.env` set `COMPOSE_PROJECT_NAME` to
+another name and `ALERTLOOP_PORT` to a free port, comment out any
+`ALERTLOOP_LOG_FILE_*` lines, and continue only if
+`docker compose config | grep '^name:'` prints the new name. Then start
+`postgres`, restore into it with the command above, and start `api` alone, not
+the worker: it would deliver the restored queue to your real channels.
+Compare `/v1/stats` on the new port with production; `docker compose down -v`
+in that clone removes the check.
 
 ---
 
@@ -340,9 +359,7 @@ curl -s localhost:8080/health/ready
 
 **Upgrading** is: stop, replace the binary or pull the new image, start.
 Migrations run automatically at startup, in a transaction, and are recorded in
-`schema_migrations` so they never run twice. CI runs a real v0.1.0 install
-forward to the current build on both SQLite and PostgreSQL before every merge
-(`scripts/upgrade-test.sh`).
+`schema_migrations` so they never run twice.
 
 **Back up first anyway.** Automatic migrations are convenient precisely because
 they are irreversible in place.
@@ -523,8 +540,8 @@ ingestion as something to retry.
    readiness and not the whole process.
 2. Check the database itself:
    ```bash
-   docker compose --profile postgres ps
-   docker compose --profile postgres logs --tail=50 postgres
+   docker compose ps
+   docker compose logs --tail=50 postgres
    pg_isready -h <host> -U alertloop            # without Docker
    ```
 3. Common causes, in the order they actually occur: the database container was

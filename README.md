@@ -103,9 +103,9 @@ even if AlertLoop then fails to start and restarts in a loop.
 
 Both deployments live in the single `docker-compose.yml` at the repository root,
 selected by profile — `demo` here, `postgres` below. Switch by **editing**
-`COMPOSE_PROFILES` in `.env`; do not leave it set and add `--profile` as well,
-because Compose combines the two and would start both on the same port. With no
-`.env` at all, `docker compose --profile demo up -d` selects one directly.
+`COMPOSE_PROFILES` in `.env`, and do not pass `--profile`: for that one command
+the flag replaces the value in `.env`, so the command acts on a different
+deployment than every other one you run.
 
 The images are pulled from GHCR; nothing is built from the compose file.
 
@@ -138,15 +138,19 @@ embedded.
 ```bash
 cp .env.example .env                        # then edit it:
                                             #   COMPOSE_PROFILES=postgres
-                                            #   ALERTLOOP_ADMIN_TOKEN=$(openssl rand -hex 32)
-                                            #   POSTGRES_PASSWORD=$(openssl rand -hex 32)
+                                            #   ALERTLOOP_ADMIN_TOKEN=<output of: openssl rand -hex 32>
+                                            #   POSTGRES_PASSWORD=<output of: openssl rand -hex 32>
 cp alertloop.example.yaml alertloop.yaml    # edit: channels, routing
 docker compose up -d --wait --wait-timeout 120
 ```
 
-Create `alertloop.yaml` **before** starting. Docker creates a directory in place
-of a bind mount whose source is missing, and AlertLoop then fails on "is a
-directory".
+Paste the output of `openssl rand -hex 32` (run it twice, one value each), not
+the command: Compose does not run commands in `.env`, so `$(...)` there becomes
+the value itself.
+
+Create `alertloop.yaml` **before** starting. Docker creates a missing bind-mount
+source as a directory, and `up` then fails with its own error: "not a directory
+... Are you trying to mount a directory onto a file (or vice-versa)?"
 
 This profile runs the API and the delivery worker as separate containers against
 a PostgreSQL container, with **one** `alertloop.yaml` mounted into both — so the
@@ -470,17 +474,25 @@ The DSN carries a password, so it is a good candidate for `${VAR}` — see
 
 AlertLoop connects to an **existing database** and creates only its own tables
 (`events`, `delivery_attempts`, `schema_migrations`) through migrations that run
-at startup. **It does not create the database itself** — create it once:
+at startup. **It does not create the database itself** — create it once, owned
+by the user in your DSN:
 
 ```bash
-createdb -U postgres alertloop
-#   or:  psql -U postgres -c "CREATE DATABASE alertloop;"
+createdb -U postgres -O USER alertloop
+#   or:  psql -U postgres -c "CREATE DATABASE alertloop OWNER USER;"
 ```
 
+From PostgreSQL 15 on, only the database owner can create tables in its
+`public` schema by default, so for any other user the migrations fail at
+startup.
+
 Sharing that database with another application is fine: AlertLoop never touches
-tables that are not its own. Just make sure nothing else owns tables named
-`events`, `delivery_attempts`, or `schema_migrations`. (A configurable table
-prefix is on the roadmap for shared databases.)
+tables that are not its own. If the database belongs to another user, grant
+AlertLoop's user the right to create tables there:
+`psql -U postgres -d DBNAME -c "GRANT CREATE ON SCHEMA public TO USER;"`.
+Just make sure nothing else owns tables named `events`, `delivery_attempts`, or
+`schema_migrations`. (A configurable table prefix is on the roadmap for shared
+databases.)
 
 Switching later means changing those two lines and starting with an empty
 history: there is no migration path between the two engines, and event history
@@ -781,8 +793,10 @@ For a single local binary for your own machine, just `make build` (Go only).
 - **External PostgreSQL**: use `sslmode=require` (or stricter) in the DSN. The
   bundled Compose Postgres uses `sslmode=disable` only because it is on a private
   Docker network.
-- **Rate limiting** is on by default (`rate_limit` in the config). If your proxy
-  already rate limits, you can disable it here.
+- **Rate limiting** is on by default (`rate_limit` in the config). Behind a
+  reverse proxy it needs `rate_limit.trusted_proxies`, and the proxy should rate
+  limit too: the two are complementary, not alternatives (see
+  `deploy/proxy/nginx.conf`).
 - **SMTP**: set `starttls: true` (required upgrade, port 587) or `tls: true`
   (implicit TLS / SMTPS, port 465). AlertLoop will not send mail in plaintext
   when TLS is requested but unavailable.

@@ -1,5 +1,75 @@
 # Changelog
 
+## 0.5.3 - Unreleased
+
+Corrections to the example, deployment and integration files, the README and
+`OPERATIONS.md`. Nothing in AlertLoop itself changed.
+
+**Check your `.env`:** if `ALERTLOOP_ADMIN_TOKEN` reads
+`$(openssl rand -hex 32)`, that text is your admin token, and it is published
+in this repository. Put the output of `openssl rand -hex 32` in its place, run
+`docker compose up -d --wait --wait-timeout 120`, and give the new token to
+everyone who uses it. The same goes for a `key:` in `alertloop.yaml` with that
+text, which the Monit installer suggested: replace it, restart AlertLoop, and
+put the new key in `/etc/alertloop/monit.env`.
+
+### Fixed
+
+- `alertloop.example.yaml` shipped `channels: {}` above the commented-out
+  channels, so uncommenting one failed to parse ("did not find expected key").
+  It is now `channels:`. If your `alertloop.yaml` was copied from it, drop the
+  `{}` there too before enabling a channel.
+- `alertloop.example.yaml` advised keeping channel and API-key secrets in `.env`.
+  Under Compose only the variables `docker-compose.yml` passes reach the
+  containers, so such a `${VAR}` stopped startup as unset. The comments now say
+  where variables come from: the systemd `EnvironmentFile`, or, under Compose,
+  the value written into the file.
+- `rate_limit.trusted_proxies` behind a proxy under Docker must list the Compose
+  network gateway, not `127.0.0.1`; `alertloop.example.yaml`, `nginx.conf` and
+  `apache.conf` now say so and show how to find it. If yours lists `127.0.0.1`
+  under Compose, as every earlier example advised, replace it with the gateway
+  address: until then every client behind the proxy shares one rate-limit
+  bucket.
+- `deploy/proxy/nginx.conf` and `apache.conf` put the certificate step first:
+  both reference it, so `nginx -t` / `configtest` fail until it exists.
+- `README.md` said AlertLoop's rate limiter could be turned off when the proxy
+  already rate limits; the proxy examples call both necessary, and the README
+  now agrees.
+- `.env.example`, `docker-compose.yml` and `README.md` said `--profile`
+  combines with `COMPOSE_PROFILES`; it replaces it for that command. `.env` is
+  read from the directory of `docker-compose.yml`, not from where you run the
+  command. A missing `alertloop.yaml` fails with Docker's own mount error, now
+  quoted.
+- `OPERATIONS.md`: the restore checklist looked for a `migrations applied` log
+  line AlertLoop does not write, and its backup and runbook commands passed
+  `--profile postgres`, which the Compose files tell you not to. Its backup
+  check used port 8080, where the production process would answer the `curl`,
+  and trusted `/health/ready`, which an empty database passes; it now uses a
+  port of its own and compares `/v1/stats`. Under Docker a second clone is the same
+  Compose project unless `COMPOSE_PROJECT_NAME` differs, and the check now says
+  so before anything is started.
+- `deploy/systemd/install.sh` was committed without the executable bit, so
+  `sudo ./deploy/systemd/install.sh` failed with "Permission denied" in a fresh
+  checkout. `sudo bash deploy/systemd/install.sh` works with any version.
+- `README.md` showed `ALERTLOOP_ADMIN_TOKEN=$(openssl rand -hex 32)` as a line
+  to write into `.env`, from 0.4.0 on. Compose does not run commands there, so
+  the admin token became that literal text. The same line for the database
+  password failed loudly; once that was fixed, nothing warned about the token.
+  It now shows a placeholder.
+- `README.md` created the PostgreSQL database without an owner; on PostgreSQL 15
+  and later AlertLoop's user then cannot create its tables. The command now sets
+  the owner; for a database owned by another application it shows the `GRANT`
+  instead.
+- `integrations/monit/install.sh` printed the example key as
+  `key: "$(openssl rand -hex 32)"`; pasted as shown, that literal became a
+  working key known to everyone. It now prints a placeholder.
+- `integrations/monit/README.md` showed `monit.env` with comments after the
+  values; the adapter reads them as part of the value. `alertloop.env.example`
+  said `ALERTLOOP_HOST` sets the host in the `dedupe_key`; it is only the host
+  label on events you send with `alertloop-send` yourself without `--host`.
+  Events from the Monit rules take the host Monit reports. If your `monit.env`
+  has a comment after a value, move it to a line of its own.
+
 ## 0.5.2 - 2026-09-11
 
 One fix, in the example config: the documented way to pin the image named a tag

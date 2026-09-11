@@ -160,7 +160,7 @@ Next:
      AlertLoop's config file:
 
        api_keys:
-         - key: "\$(openssl rand -hex 32)"
+         - key: "<output of: openssl rand -hex 32>"
            scope: ingest
 
   2. Put the URL and that key in $ENV_FILE

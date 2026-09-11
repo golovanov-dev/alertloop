@@ -192,9 +192,8 @@ jobs:
 
       # Exactly one profile may claim port 8080, or `docker compose up` fails on
       # a port collision after the user has already been told it would work.
-      # COMPOSE_PROFILES is cleared per case: Compose UNIONS the variable with
-      # --profile, so leaving the value from .env in place would select both and
-      # test something nobody does on purpose.
+      # COMPOSE_PROFILES is cleared per case so that the flag alone selects the
+      # profile, whatever .env.example sets.
       - name: Each profile publishes port 8080 exactly once
         run: |
           for profile in demo postgres; do
@@ -369,6 +368,7 @@ jobs:
           integrations/monit/test/run-tests.sh
           scripts/upgrade-test.sh
           scripts/build-release.sh
+          deploy/systemd/install.sh
           docker-entrypoint.sh"
           bad=0
           while IFS= read -r f; do
