@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.5.2 - Unreleased
+## 0.5.2 - 2026-09-11
 
 One fix, in the example config: the documented way to pin the image named a tag
 that does not exist. Nothing in AlertLoop itself changed.
