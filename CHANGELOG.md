@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.5.1 - Unreleased
+## 0.5.1 - 2026-09-11
 
 A database password with `/` in it no longer takes the Compose deployment down,
 and the documented way to start the stack now fails when AlertLoop does not come
