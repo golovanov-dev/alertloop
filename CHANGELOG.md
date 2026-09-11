@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.2 - Unreleased
+
+One fix, in the example config: the documented way to pin the image named a tag
+that does not exist. Nothing in AlertLoop itself changed.
+
+### Fixed
+
+- `.env.example` showed the image pin as `ghcr.io/golovanov-dev/alertloop:v0.5.1`.
+  Images are published without the `v` (`:0.5.1`); the `v` form has never
+  existed, so following the example failed with "manifest unknown". If you
+  pinned the image that way, drop the `v`.
+
 ## 0.5.1 - 2026-09-11
 
 A database password with `/` in it no longer takes the Compose deployment down,

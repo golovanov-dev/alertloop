@@ -181,18 +181,36 @@ func changelogTopVersions(t *testing.T) (top, released string) {
 // more than the release in progress: while the top section is Unreleased the
 // example may name it or the last release; once the top section has a date,
 // only that version passes, so the release commit has to carry it.
+//
+// The tag format is checked against the release workflow rather than assumed:
+// release.yml strips the "v" from the git tag, so the image is :X.Y.Z. The
+// example said :vX.Y.Z from the day images were first published, a tag that
+// never existed, so following it failed with "manifest unknown".
 func TestEnvExamplePinsTheCurrentImage(t *testing.T) {
+	wf, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "release.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rule := range []string{`version="${GITHUB_REF_NAME#v}"`, `tags="$image:$version"`} {
+		if !strings.Contains(string(wf), rule) {
+			t.Fatalf("release.yml no longer contains %s: it changed how the image is tagged, so update .env.example and this test together", rule)
+		}
+	}
+
 	data, err := os.ReadFile(envExamplePath())
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := regexp.MustCompile(`ALERTLOOP_IMAGE=ghcr\.io/golovanov-dev/alertloop:v(\d+\.\d+\.\d+)`).FindStringSubmatch(string(data))
+	m := regexp.MustCompile(`ALERTLOOP_IMAGE=ghcr\.io/golovanov-dev/alertloop:(v?)(\d+\.\d+\.\d+)`).FindStringSubmatch(string(data))
 	if m == nil {
 		t.Fatal(".env.example no longer shows how to pin ALERTLOOP_IMAGE to a version")
 	}
+	if m[1] != "" {
+		t.Fatalf(".env.example pins :v%s, but release.yml publishes :%s (it strips the v); :v%s does not exist", m[2], m[2], m[2])
+	}
 	top, released := changelogTopVersions(t)
-	if m[1] != top && m[1] != released {
-		t.Fatalf(".env.example pins v%s; the CHANGELOG is at %s (last release %s). Update the example.", m[1], top, released)
+	if m[2] != top && m[2] != released {
+		t.Fatalf(".env.example pins %s; the CHANGELOG is at %s (last release %s). Update the example.", m[2], top, released)
 	}
 }
 
