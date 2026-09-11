@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.5.3 - Unreleased
+## 0.5.3 - 2026-09-11
 
 Corrections to the example, deployment and integration files, the README and
 `OPERATIONS.md`. Nothing in AlertLoop itself changed.
