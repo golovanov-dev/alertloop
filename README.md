@@ -95,7 +95,7 @@ The message arrives in Telegram within a few seconds. If it does not, see
   the flag replaces the value for that one command.
 - Port 8080 taken on the host: set `ALERTLOOP_PORT` in `.env`.
 - Pin the image in production: uncomment `ALERTLOOP_IMAGE` in `.env` and set the
-  release you run (`0.6.0`, without the `v`).
+  release you run (`0.6.1`, without the `v`).
 - After editing `alertloop.yaml`, apply it with
   `docker compose up -d --force-recreate --wait --wait-timeout 120 api worker`.
 

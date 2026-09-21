@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.6.1 - 2026-09-21
+
+The first container image of the 0.6 line. AlertLoop itself is the same as in
+0.6.0.
+
+**Upgrading from 0.5.x:** read "Before upgrading" under 0.6.0 in
+`CHANGELOG.md` first; everything there applies to this version. A Compose
+deployment that runs the default image (`:latest`, no `ALERTLOOP_IMAGE` in
+`.env`) moves from 0.5.3 to this version on its next `docker compose pull`.
+
+### Fixed
+
+- The container image for 0.6.0 was not published: its `linux/arm64` build
+  failed. 0.6.1 publishes the image for `linux/amd64` and `linux/arm64`; pin
+  `ghcr.io/golovanov-dev/alertloop:0.6.1`, since `:0.6.0` does not exist. The
+  0.6.0 binaries are unaffected.
+
 ## 0.6.0 - 2026-09-21
 
 A setting AlertLoop does not read now stops the start instead of being
