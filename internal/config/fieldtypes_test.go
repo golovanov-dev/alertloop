@@ -350,7 +350,7 @@ notify_on_resolve: ${AL_UNSET_NOR2:-}
 	}
 }
 
-// A variable holding the TEXT "null" must arrive as that text. Until 0.5.4 it
+// A variable holding the TEXT "null" must arrive as that text. Until 0.6.0 it
 // did not: the substituted scalar was left for YAML to resolve, YAML reads
 // null / Null / NULL / ~ as "no value", and the field was ERASED instead of
 // filled — ${ALERTLOOP_ADMIN_TOKEN} with the value "null" produced an empty
@@ -374,8 +374,8 @@ func TestVariableHoldingTheTextNullIsNotSwallowed(t *testing.T) {
 
 // The pin applies to a value that came from a VARIABLE, and to nothing else. A
 // default written in the file is the config author's own YAML: they wrote "~"
-// to mean "no value", and 0.5.4 briefly read it as a file called "~" in the
-// working directory.
+// to mean "no value", and a build on the way to 0.6.0 briefly read it as a
+// file called "~" in the working directory.
 func TestADefaultWrittenInTheFileIsYAMLAndNotText(t *testing.T) {
 	// log.file: the difference between "no log file" and a file named "~".
 	cfg := loadYAML(t, "log:\n  file: ${AL_UNSET_TILDE:-~}\n")
@@ -391,7 +391,7 @@ func TestADefaultWrittenInTheFileIsYAMLAndNotText(t *testing.T) {
 		t.Errorf("notify_on_resolve = %v, want nil", *cfg.NotifyOnResolve)
 	}
 
-	// And the variable that holds the text stays text, as 0.5.4 made it.
+	// And the variable that holds the text stays text, as 0.6.0 made it.
 	t.Setenv("AL_NULL_TEXT", "null")
 	eq(t, "admin_token", loadYAML(t, "admin_token: ${AL_NULL_TEXT}\n").AdminToken, "null")
 }

@@ -1,6 +1,24 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 - 2026-09-21
+
+A setting AlertLoop does not read now stops the start instead of being
+ignored, AlertLoop no longer serves its API without a credential, and a
+recovery no longer arrives before its alert. `cors_origins`, the log rotation
+settings, the built-in `/events` and `/deliveries` pages and the container
+entrypoint script are removed.
+
+**Before upgrading:** delete `cors_origins`, `log.max_size_mb` and
+`log.max_files` from your `alertloop.yaml` if it has them, make sure it sets
+`admin_token` or `api_keys`, and run `check-db` with the new version before
+restarting, as "Upgrades and downgrades" in `OPERATIONS.md` describes: it
+names every key the new version refuses. If you run `server` or `all` without
+`--config`, or with a config that sets neither credential, give it a config
+file with `admin_token` or `api_keys`: it no longer starts without one. If a
+script or client passes the admin token as `?token=` or in the `X-Admin-Token`
+header, move it to the `Authorization: Bearer` or `X-API-Key` header; links and
+bookmarks to `/events` and `/deliveries` answer 404, use the admin console at
+`/admin` instead.
 
 ### Changed
 
@@ -35,7 +53,11 @@
   suggests a `${VAR:-default}` fallback for `admin_token`, which deliberately
   has none.
 - Comments in `alertloop.example.yaml`, `.env.example` and
-  `docker-compose.yml` are shorter; the settings and defaults are unchanged.
+  `docker-compose.yml` are shorter; the remaining settings and their defaults
+  are unchanged.
+- `README.md` and `OPERATIONS.md` are shorter and describe the current
+  version only. The upgrade notes for past versions live in this changelog;
+  `OPERATIONS.md` keeps one upgrade procedure for every version.
 
 ### Removed
 
