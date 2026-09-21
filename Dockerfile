@@ -1,6 +1,8 @@
 # UI stage: build the React admin console so a fresh copy is embedded regardless
-# of what is checked in.
-FROM node:22-alpine AS ui
+# of what is checked in. The output is static files, the same for every
+# platform, so it is built once on the build machine: under QEMU emulation for
+# arm64, npm crashed with "Illegal instruction" and the image build hung.
+FROM --platform=$BUILDPLATFORM node:22-alpine AS ui
 WORKDIR /ui
 COPY web/admin/package.json web/admin/package-lock.json ./
 # `npm ci`, not `npm install`. install is allowed to update the lock file, so
@@ -15,7 +17,7 @@ RUN mkdir -p /internal/adminui && npm run build
 
 # Build stage: compile a static, CGO-free binary (modernc SQLite is pure Go, so
 # the image needs no libc and cross-compiles cleanly).
-FROM golang:1.27-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS build
 WORKDIR /src
 
 COPY go.mod go.sum ./
@@ -25,7 +27,9 @@ COPY . .
 # Overlay the freshly built admin UI from the UI stage.
 COPY --from=ui /internal/adminui/dist ./internal/adminui/dist
 ARG VERSION=docker
-RUN CGO_ENABLED=0 go build -trimpath \
+# Cross-compiled for the target platform on the build machine, not emulated.
+ARG TARGETOS TARGETARCH
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath \
     -ldflags "-s -w -X main.version=${VERSION}" \
     -o /out/alertloop ./cmd/alertloop
 

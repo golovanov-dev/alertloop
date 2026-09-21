@@ -1,8 +1,8 @@
 name: CI
 
 # Static analysis, tests, and formatting on every push and pull request. The
-# slow delivery checks (upgrade, compose-up) run only on release/** branches,
-# v* tags, and manual dispatch — see `if:` on those jobs.
+# slow delivery checks (upgrade, compose-up, image) run only on release/**
+# branches, v* tags, and manual dispatch — see `if:` on those jobs.
 #
 # Go is pinned to a release that still receives security fixes (1.27), matching
 # the Dockerfile and the release workflow — that toolchain builds the shipped
@@ -354,6 +354,29 @@ jobs:
       - name: Clean up
         if: always()
         run: docker compose down -v || true
+
+  image:
+    name: Container image builds (amd64, arm64)
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/heads/release/') || startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    # The same multi-platform build as the image job in release.yml, without
+    # the push. compose-up builds amd64 only, so an arm64-only failure used to
+    # surface after the tag: 0.6.0 published its binaries and no image. The
+    # timeout turns a hung build into a red job instead of a six-hour wait.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: false
+          build-args: |
+            VERSION=${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
   monit-integration:
     name: Monit integration (shellcheck, tests)

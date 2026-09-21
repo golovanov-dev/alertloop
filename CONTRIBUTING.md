@@ -65,9 +65,10 @@ this itself.
 Pushing a version tag runs `.github/workflows/release.yml`: it builds the admin
 console, cross-compiles every target, and publishes the binaries with a signed
 `checksums_*.txt` to the GitHub Release. On the tag, `ci.yml` and `release.yml`
-run in parallel, so the slow CI jobs (`upgrade`, `compose-up`) must pass before
-the tag: push the release commit to a `release/**` branch, or run CI by hand
-(Actions → CI → Run workflow). To build the same artifacts locally:
+run in parallel, so the slow CI jobs (`upgrade`, `compose-up`, and `image`, the
+amd64 and arm64 image build) must pass before the tag: push the release commit
+to a `release/**` branch, or run CI by hand (Actions → CI → Run workflow). To
+build the same artifacts locally:
 
 ```bash
 make admin
