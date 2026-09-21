@@ -41,6 +41,9 @@ func New(ctx context.Context, cfg config.Config, version string, log *slog.Logge
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
+	// The credential check is not here: it depends on what the process was
+	// asked to run (a worker serves nothing), so the entry point makes it
+	// before anything is opened. See RequireCredential.
 
 	store, err := storage.Open(cfg.Database.Driver, cfg.Database.DSN)
 	if err != nil {
@@ -86,14 +89,6 @@ func New(ctx context.Context, cfg config.Config, version string, log *slog.Logge
 	for _, w := range cfg.Warnings {
 		log.Warn(w)
 	}
-	// Both empty, not either: apiKeyAuth opens the API only when there is
-	// neither a key nor an admin token. Warning about a configuration that has
-	// an admin token - which is what the image ships and what the systemd
-	// installer generates - trains operators to ignore the message, and then
-	// they ignore the real one.
-	if len(cfg.APIKeys) == 0 && cfg.AdminToken == "" {
-		log.Warn("no API keys configured — the JSON API is open to anyone who can reach it")
-	}
 	if registry.Len() == 0 {
 		log.Warn("no delivery channels configured — events will be STORED BUT NOT DELIVERED. " +
 			"Configure channels in your config file. In split server+worker deployments, " +
@@ -103,6 +98,55 @@ func New(ctx context.Context, cfg config.Config, version string, log *slog.Logge
 	app.logRoutingTable()
 	app.warnOrphanedDeliveries(ctx)
 	return app, nil
+}
+
+// RequireCredential refuses to start an instance that would SERVE with a config
+// file naming no credential at all: no admin_token and no api_keys.
+//
+// The API is open with full scope when neither is configured — deliberately, so
+// that a binary started with nothing at all is something a newcomer can try. A
+// config FILE is the other case: someone wrote down what this installation is,
+// and "answers every request from anyone who can reach it" is not something
+// people write down. It is what they get from `admin_token: ""`, from a
+// reference whose fallback resolved to nothing, or from deleting the line while
+// editing — and nothing about the running service shows it, because every
+// request simply succeeds.
+//
+// The mode decides, because the requirement is about serving HTTP: a worker has
+// no listener, and refusing to run one over a credential it never uses would be
+// a false alarm in a split deployment. Called by the entry point before storage
+// is opened, so the mistake costs nothing but the message.
+//
+// The message names the file and the two settings and stops there: it prints
+// no line to copy. A line printed in an error is a line someone pastes, and
+// both ways that goes wrong are ones this product has already paid for: prose
+// next to a ${VAR} reference becomes part of the token, and a flow mapping
+// holding one does not parse. It points at no other file either: the shipped
+// example is named alertloop.example.yaml in the source tree only, and the file
+// an installed AlertLoop reads is the one the message already names.
+func RequireCredential(cfg config.Config, mode string) error {
+	if !modeServesHTTP(mode) {
+		return nil
+	}
+	if cfg.SourceFile == "" || cfg.AdminToken != "" || len(cfg.APIKeys) > 0 {
+		return nil
+	}
+	return fmt.Errorf("config file %s sets neither admin_token nor api_keys: the JSON API and the admin "+
+		"console would accept every request from anyone who can reach this process, with full access.\n"+
+		"Set admin_token or api_keys in that file.", cfg.SourceFile)
+}
+
+// modeServesHTTP reports whether a CLI mode puts an HTTP listener on the
+// network. The modes are the ones cmd/alertloop accepts: "server" and "all"
+// serve, "worker" only drains the delivery queue, "check-db" is a probe that
+// exits. An unknown mode serves nothing — cmd/alertloop rejects it by name a
+// moment later.
+func modeServesHTTP(mode string) bool {
+	switch mode {
+	case "server", "all":
+		return true
+	}
+	return false
 }
 
 // CheckDatabase validates cfg and reaches its database, without migrating it.
@@ -247,6 +291,19 @@ func buildRegistry(c config.Channels) (*channels.Registry, error) {
 
 // RunServer starts the HTTP server and blocks until ctx is cancelled.
 func (a *App) RunServer(ctx context.Context) error {
+	// Here rather than in New, because it is about a listener: a worker built
+	// from the same config has none, and told an operator its non-existent API
+	// was open to anyone — in the same output where the api container was
+	// refusing to start for exactly that reason. Both empty, not either:
+	// apiKeyAuth opens the API only when there is neither a key nor an admin
+	// token, and warning about a configuration that HAS one trains operators to
+	// ignore the message, and then they ignore the real one. With a config file
+	// this state does not get here at all (RequireCredential); what remains is
+	// a process started with no config file.
+	if len(a.cfg.APIKeys) == 0 && a.cfg.AdminToken == "" {
+		a.log.Warn("no API keys configured — the JSON API is open to anyone who can reach it")
+	}
+
 	keyScopes := make(map[string]string, len(a.cfg.APIKeys))
 	for _, k := range a.cfg.APIKeys {
 		keyScopes[k.Key] = k.Scope

@@ -3,6 +3,8 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -46,6 +48,86 @@ func TestExampleConfigLoadsWithAnAdminToken(t *testing.T) {
 	if cfg.RetentionDays != 30 {
 		t.Fatalf("retention_days = %d, want 30", cfg.RetentionDays)
 	}
+}
+
+// The example claims to list every key AlertLoop reads, and two places send an
+// operator there on that claim: the unknown-key error ("alertloop.example.yaml
+// lists every key AlertLoop reads") and the upgrade procedure, which is
+// "compare your file with the example and remove what is not there". A key
+// missing from the example turns that procedure into advice to delete a working
+// setting — routing.rules[].match.severity was missing exactly that way.
+func TestTheShippedExampleShowsEveryKey(t *testing.T) {
+	data, err := os.ReadFile(examplePath())
+	if err != nil {
+		t.Fatalf("read the example: %v", err)
+	}
+	shown := pathsShownIn(string(data))
+	known, _, _ := knownYAMLPaths(reflect.TypeOf(Config{}))
+
+	var missing []string
+	for _, path := range sortedKeys(known) {
+		if !shown[path] {
+			missing = append(missing, path)
+		}
+	}
+	if len(missing) > 0 {
+		t.Errorf("alertloop.example.yaml does not show %d of the %d configuration keys: %v\n"+
+			"Add them, in a comment if they should not be on by default: the file is what operators are "+
+			"told to check theirs against.", len(missing), len(known), missing)
+	}
+}
+
+// pathsShownIn collects the dotted paths an example file shows, comments
+// included — a channel the example shipped enabled would be a channel every new
+// installation delivers to, so the keys that matter most are commented out.
+//
+// Whole paths, not leaf names. Matching the leaf alone passed
+// `routing.rules.match.host` because `host:` appears under `channels.email`,
+// which is exactly the kind of miss this test exists to catch.
+//
+// Uncommenting in this file is removing "# ", by construction: the indentation
+// of a commented block is the indentation the lines have once it is gone. Lines
+// that are prose rather than YAML do not match the key pattern (prose has
+// spaces before its colon) and are skipped.
+func pathsShownIn(text string) map[string]bool {
+	key := regexp.MustCompile(`^(\s*)(- )?([A-Za-z_][A-Za-z0-9_.-]*):(\s|$)`)
+
+	out := map[string]bool{}
+	type level struct {
+		indent int
+		name   string
+	}
+	var stack []level
+
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimRight(line, " \t\r")
+		// Repeatedly: a key can sit inside a commented-out block that is itself
+		// commented out one level deeper (the Telegram proxy is written that
+		// way), and it is shown in the file all the same.
+		for {
+			i := strings.Index(line, "#")
+			if i < 0 || strings.TrimSpace(line[:i]) != "" {
+				break
+			}
+			line = line[:i] + strings.TrimPrefix(line[i+1:], " ")
+		}
+		m := key.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		indent := len(m[1]) + len(m[2]) // a "- " marker indents its own keys
+		name := m[3]
+		for len(stack) > 0 && stack[len(stack)-1].indent >= indent {
+			stack = stack[:len(stack)-1]
+		}
+		path := name
+		if len(stack) > 0 {
+			path = stack[len(stack)-1].name + "." + name
+		}
+		out[path] = true
+		stack = append(stack, level{indent: indent, name: path})
+	}
+	return out
 }
 
 // The same example file serves a binary install and the Compose postgres

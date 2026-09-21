@@ -77,6 +77,17 @@ vulnerability:
 - A configuration referencing an unset variable stops startup rather than
   running with an empty setting — an empty `admin_token` would leave the API
   open.
+- A config file that names no credential at all — neither `admin_token` nor
+  `api_keys` — stops startup in the modes that serve HTTP, instead of serving an
+  API that accepts every request with full scope. Running open is possible only
+  with no config file at all: a binary started without `--config` and without
+  `ALERTLOOP_CONFIG`, which then also listens on every interface. Container
+  images always ship a config file, so no container takes that path. Note that
+  the Compose `demo` profile falls back to a fixed admin token
+  (`change-me-admin`, in `docker-compose.yml`) when `.env` sets none: it is a
+  credential and the API refuses requests without it, but it is published in
+  this repository, so change it before that container is reachable by anyone
+  else.
 - The published container runs as a non-root user with no capabilities, on a
   read-only root filesystem.
 

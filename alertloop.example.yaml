@@ -17,9 +17,22 @@
 #   admin_token: ${ALERTLOOP_ADMIN_TOKEN}
 #
 # Three rules: the WHOLE value is substituted or nothing (so a password with a
-# literal "$" is never mangled); a missing variable without a :-default stops
-# the process rather than leaving an empty setting; and the substituted text is
-# data, not YAML, so a password containing ": " or "#" stays a password.
+# literal "$" is never mangled); a missing OR EMPTY variable without a :-default
+# stops the process rather than leaving an empty setting; and the substituted
+# text is data, not YAML, so a password containing ": " or "#" stays a password.
+#
+# Two details that are easy to meet by accident:
+#   - ${VAR:-} in a NON-STRING field does not zero the field. An empty value is
+#     YAML null, null means "not set", and the built-in default stays in force.
+#     To set such a field to 0 or false, write the value here.
+#   - In a FLOW list the reference must be quoted — cors_origins: ["${VAR}"] —
+#     because an unquoted "${" opens a YAML mapping and the file fails to parse
+#     before substitution ever runs. In a block list (an item per line, which is
+#     what this file uses) no quotes are needed.
+#
+# Every key this file can contain is below, including the ones that are
+# commented out: since 0.6.0 a key AlertLoop does not read stops startup, so
+# this file is also the list to check yours against.
 #
 # Where the variables come from: under systemd, the EnvironmentFile
 # /etc/alertloop/alertloop.env. Under Compose, only the variables that
@@ -203,6 +216,7 @@ channels:
   #     to: ["ops@example.com"]
   #     starttls: true   # require STARTTLS on a plaintext port (e.g. 587)
   #     tls: false       # set true for implicit TLS / SMTPS (e.g. port 465)
+  #     timeout: 10s     # per-delivery timeout; 10s when omitted
   #
   # telegram:
   #   - name: dev-telegram
@@ -217,6 +231,7 @@ channels:
   #     #
   #     # Alternative to a proxy: a trusted Bot API mirror or reverse proxy.
   #     # api_base: "https://tg-mirror.example.com"
+  #     timeout: 10s     # per-delivery timeout; 10s when omitted
   #
   #   - name: customer-telegram
   #     bot_token: "123456:ABC-DEF"
@@ -227,6 +242,7 @@ channels:
   #     url: "https://example.com/alertloop-hook"
   #     # Requests are HMAC-SHA256 signed; receivers verify X-AlertLoop-Signature.
   #     secret: "shared-webhook-secret"
+  #     timeout: 10s     # per-delivery timeout; 10s when omitted
 
 # Routing is OPTIONAL. Without this section every event goes to every configured
 # channel. With it, each event goes to the channels of
@@ -250,6 +266,15 @@ channels:
 #         type: [incident]      # values in one field are OR-ed...
 #         min_severity: warning # ...and different fields are AND-ed
 #       channels: [dev-telegram, dev-email]
+#
+#     - name: page-on-critical
+#       match:
+#         # severity lists the exact levels to match (info, success, warning,
+#         # error, critical). Use it instead of min_severity when the rule is
+#         # about particular levels rather than a threshold; setting both means
+#         # the event must satisfy each.
+#         severity: [critical]
+#       channels: [dev-telegram]
 #
 #     - name: orders-to-customer
 #       match:

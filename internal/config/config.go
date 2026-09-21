@@ -70,6 +70,15 @@ type Config struct {
 	// pre-0.3.0 environment variable that the config file overrides, for
 	// instance. The caller logs them at startup.
 	Warnings []string `yaml:"-"`
+
+	// SourceFile is the config file this Config came from, empty when the
+	// process was started without --config (or ALERTLOOP_CONFIG). Filled by
+	// Load, never read from the file.
+	//
+	// It exists because two situations that look identical in the struct are
+	// not the same decision: an operator who wrote a file said what this
+	// installation is, while `docker run` with no file is a demo of defaults.
+	SourceFile string `yaml:"-"`
 }
 
 // RateLimit configures in-process request rate limiting.
@@ -344,8 +353,10 @@ func Load(configPath string) (Config, error) {
 	cfg := Default()
 	referenced := map[string]bool{}
 	present := map[string]bool{}
+	var fallbacks []string
 
 	if configPath != "" {
+		cfg.SourceFile = configPath
 		data, err := os.ReadFile(configPath)
 		if err != nil {
 			return cfg, fmt.Errorf("read config file: %w", err)
@@ -367,13 +378,35 @@ func Load(configPath string) (Config, error) {
 		// An empty file leaves a zero node, which Decode would reject; defaults
 		// alone are a valid configuration.
 		if doc.Kind != 0 {
-			if err := substituteEnv(&doc, referenced); err != nil {
+			s := configSchema()
+			subWarnings, subErr := substituteEnv(&doc, referenced)
+			// Decoded before the tree is walked: yaml.v3 bounds alias
+			// expansion here, so what the walks below cross is a tree it has
+			// already crossed itself, and they need no budget of their own.
+			// Its error is held rather than returned, because AlertLoop has
+			// something better to say about the same file below.
+			decErr := doc.Decode(&cfg)
+			// Substitution fills in values; the key check judges keys. They are
+			// independent, and both are reported together rather than one per
+			// restart: an operator who mistyped a key AND forgot a variable
+			// would otherwise fix the first, restart, and only then learn about
+			// the second.
+			if err := errors.Join(subErr, checkUnknownKeys(&doc, s)); err != nil {
 				return cfg, err
 			}
-			if err := doc.Decode(&cfg); err != nil {
-				return cfg, fmt.Errorf("parse config file: %w", err)
+			// The type error comes last, and only when nothing above fired.
+			// An unresolved ${VAR} in a numeric field fails both: the text
+			// stayed in the node, so yaml.v3 reports a string it cannot turn
+			// into an int. That line sends the operator after a quoting
+			// problem that is not there, while the message above already
+			// names the variable and the line to fix. One refusal per run.
+			if decErr != nil {
+				return cfg, fmt.Errorf("parse config file: %w", decErr)
 			}
-			present = collectFields(&doc)
+			fallbacks = subWarnings
+			// Same schema and the same descent rule as the check above: this
+			// walk cannot see more of the file than that one did.
+			present = collectFields(&doc, s)
 		}
 	}
 
@@ -381,7 +414,7 @@ func Load(configPath string) (Config, error) {
 	if err != nil {
 		return cfg, err
 	}
-	cfg.Warnings = warnings
+	cfg.Warnings = append(warnings, fallbacks...)
 
 	normalizeChannels(&cfg.Channels)
 	for i := range cfg.APIKeys {

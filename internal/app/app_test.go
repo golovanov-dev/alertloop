@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -124,4 +126,163 @@ func TestStartupFailsOnUnsupportedProxyScheme(t *testing.T) {
 	if !strings.Contains(err.Error(), "dev-telegram") {
 		t.Fatalf("error should name the channel: %v", err)
 	}
+}
+
+// --- a config file must carry a credential --------------------------------
+
+// loadFile writes a config file and loads it exactly as the binary does, so the
+// tests below judge the situation an operator is actually in: a file on disk,
+// passed with --config.
+func loadFile(t *testing.T, yaml string) config.Config {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "alertloop.yaml")
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	return cfg
+}
+
+const inMemoryDB = "database:\n  driver: sqlite\n  dsn: \":memory:\"\n"
+
+// A config file that names neither an admin token nor an api key stops the
+// start. Until 0.6.0 it produced one WARN line and a JSON API that accepted
+// every request from anyone who could reach it, with full scope — and an
+// operator got there by following advice: writing admin_token as a reference
+// with a fallback, which resolved to nothing when the variable was unset.
+// Nothing about the running service showed it, because every request succeeded.
+func TestAConfigFileWithNoCredentialRefusesToStart(t *testing.T) {
+	cfg := loadFile(t, inMemoryDB)
+
+	err := RequireCredential(cfg, "all")
+	if err == nil {
+		t.Fatal("a config file with no admin_token and no api_keys started; the API would be open to anyone")
+	}
+	for _, want := range []string{"admin_token", "api_keys", cfg.SourceFile} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not mention %q:\n%v", want, err)
+		}
+	}
+	// The advice must not be the one that caused the incident: a ${VAR:-...}
+	// fallback on admin_token resolves to an empty token and an open API.
+	if strings.Contains(err.Error(), ":-") {
+		t.Errorf("the refusal suggests a fallback for admin_token, which is how the API was left open:\n%v", err)
+	}
+	// And it prints no line to paste. Both ways a printed line goes wrong
+	// have already cost a release: prose beside a ${VAR} reference becomes
+	// part of the token (0.4.0-0.5.2, in the README), and a flow mapping
+	// holding one does not parse at all. The message says what is missing
+	// and in which file, and stops there.
+	for _, pasteable := range []string{"${", "[{"} {
+		if strings.Contains(err.Error(), pasteable) {
+			t.Errorf("the refusal prints config text to copy (%q):\n%v", pasteable, err)
+		}
+	}
+}
+
+// An admin token is enough, and so is an api key on its own: the refusal is
+// about having no credential at all, not about which one.
+func TestAConfigFileWithEitherCredentialStarts(t *testing.T) {
+	withToken := loadFile(t, inMemoryDB+"admin_token: a-real-token\n")
+	if err := RequireCredential(withToken, "all"); err != nil {
+		t.Fatalf("a config file with an admin token must start: %v", err)
+	}
+
+	withKey := loadFile(t, inMemoryDB+"api_keys:\n  - key: k-ingest\n    scope: ingest\n")
+	if withKey.AdminToken != "" {
+		t.Fatalf("this case is about api_keys alone; admin_token = %q", withKey.AdminToken)
+	}
+	if err := RequireCredential(withKey, "all"); err != nil {
+		t.Fatalf("a config file with an api key and no admin token must start: %v", err)
+	}
+}
+
+// Which modes the credential is required for: the ones that put an HTTP
+// listener on the network. A worker serves nothing — refusing to run one over a
+// credential it never uses would stop a split deployment for no reason — and
+// check-db is a probe that exits. Documented deployments run `server` and
+// `worker` as separate processes, so this distinction is not hypothetical.
+func TestOnlyTheModesThatServeHTTPNeedACredential(t *testing.T) {
+	cfg := loadFile(t, inMemoryDB)
+
+	for mode, wantRefusal := range map[string]bool{
+		"server":   true,
+		"all":      true,
+		"worker":   false,
+		"check-db": false,
+	} {
+		err := RequireCredential(cfg, mode)
+		if wantRefusal && err == nil {
+			t.Errorf("mode %q serves HTTP and was allowed to start with no credential", mode)
+		}
+		if !wantRefusal && err != nil {
+			t.Errorf("mode %q serves no HTTP and must not be stopped over a credential: %v", mode, err)
+		}
+	}
+}
+
+// Without a config file nothing changes: the built-in defaults, where the open
+// API is the point and a first look answering 401 to its own curl teaches
+// nothing. The warning stays the only signal there.
+func TestWithoutAConfigFileTheOpenAPIStillStartsAndWarns(t *testing.T) {
+	cfg := newTestConfig() // built from defaults, not from a file
+	cfg.AdminToken = ""
+	cfg.APIKeys = nil
+	if cfg.SourceFile != "" {
+		t.Fatalf("this case is about running without --config; SourceFile = %q", cfg.SourceFile)
+	}
+
+	if err := RequireCredential(cfg, "all"); err != nil {
+		t.Fatalf("running without a config file must still start: %v", err)
+	}
+	if _, err := startApp(t, cfg); err != nil {
+		t.Fatalf("running without a config file must still start: %v", err)
+	}
+	if logged := runBriefly(t, cfg, (*App).RunServer); !strings.Contains(logged, "open to anyone who can reach it") {
+		t.Errorf("the open API must still be warned about:\n%s", logged)
+	}
+}
+
+// The warning belongs to the process that listens. A worker built from the same
+// config has no HTTP server, and it used to announce that its API — which does
+// not exist — was open to anyone; under Compose that line appeared in the same
+// output as the api container refusing to start for want of a credential. Two
+// opposite statements on one screen is how a log stops being read.
+func TestOnlyTheServerWarnsAboutAnOpenAPI(t *testing.T) {
+	cfg := newTestConfig()
+	cfg.AdminToken = ""
+	cfg.APIKeys = nil
+
+	if logged := runBriefly(t, cfg, (*App).RunWorker); strings.Contains(logged, "open to anyone") {
+		t.Errorf("a worker announced an open API it does not serve:\n%s", logged)
+	}
+	if logged := runBriefly(t, cfg, (*App).RunServer); !strings.Contains(logged, "open to anyone") {
+		t.Errorf("the server did not warn about the open API:\n%s", logged)
+	}
+}
+
+// runBriefly builds an App and runs one of its modes with a context that is
+// already cancelled: enough to see what the mode says on the way in, without
+// leaving anything listening.
+func runBriefly(t *testing.T, cfg config.Config, run func(*App, context.Context) error) string {
+	t.Helper()
+	cfg.Addr = "127.0.0.1:0"
+
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	app, err := New(context.Background(), cfg, "test", log)
+	if err != nil {
+		t.Fatalf("build the app: %v", err)
+	}
+	defer app.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := run(app, ctx); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	return buf.String()
 }

@@ -1,5 +1,76 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- A config file that contains a key AlertLoop does not read **no longer
+  starts**. Such a key used to be ignored, so `retention_day` ran on the
+  built-in 30 days and `trusted_proxy` left the trusted-proxy list empty: the
+  setting was written in the file, it was not in effect, and nothing said so.
+  The load now stops and lists every unknown key at once, each with its full
+  path (`rate_limit.trusted_proxy`), its line, and the spelling that was
+  probably meant. Keys inside sections and inside list entries are checked too.
+  Compare your `alertloop.yaml` with `alertloop.example.yaml` before upgrading;
+  see "Upgrading to 0.6.0" in `OPERATIONS.md`. A top-level key starting with
+  `x-` is still left alone: it holds YAML anchors, as it does in Compose.
+- A setting written as a path on one line (`log.level: debug`) is one of those
+  unknown keys. YAML has no key called `log.level`, so such a line never set the
+  log level; the refusal says that a key name is not a path.
+- A config file that sets **neither `admin_token` nor `api_keys` no longer
+  starts**. With neither configured the JSON API and the admin console accept
+  every request from anyone who can reach the process, with full scope; that
+  used to be a single warning in the log, and an open instance looks exactly
+  like a working one, so nobody found out from behaviour. The message names the
+  file and both ways to fix it. It applies to the modes that serve HTTP
+  (`server` and `all`): a `worker` has no listener and is not stopped over a
+  credential it never uses. Running with no config file at all is unchanged —
+  the binary on built-in defaults, which is also the only case that listens on
+  every interface with the API open; every container image ships a config file,
+  so no container takes that path.
+- `${VAR}` is substituted in **values** only. A reference standing in a key
+  position is now the key it literally is, which means an unknown one.
+- The error for an unset variable names the **field** as well as the variable
+  and the line (`admin_token — ${ALERTLOOP_ADMIN_TOKEN}`), and it no longer
+  suggests a `${VAR:-default}` fallback for `admin_token`: an empty admin token
+  with no API keys leaves the JSON API open, which is why that field
+  deliberately has no fallback.
+- The refusal for a leftover pre-0.3.0 `ALERTLOOP_*` variable names the setting
+  that replaced it (`ALERTLOOP_DB_DSN — replaced by the database.dsn setting in
+  the config file`) instead of printing a line of YAML to paste. No AlertLoop
+  message prints a config line to copy into the file now: a message says what
+  is wrong, in which file, and which setting it is about.
+
+### Fixed
+
+- A `${VAR}` reference whose variable holds the text `null`, `Null`, `NULL` or
+  `~` erased the field instead of filling it: YAML reads those four as "no
+  value". `admin_token: ${ALERTLOOP_ADMIN_TOKEN}` with such a value started
+  AlertLoop with an *empty* admin token — the API open — and the same applied
+  to any other field. It is easy to arrive there without noticing: `jq -r` and
+  most template engines print `null` for a key they cannot find. Such a value
+  now reaches string fields as text, and in non-string fields it stops the
+  start with a type error instead of silently leaving the built-in default.
+  This applies to the value that came **from the variable**: a default written
+  in the file (`log.file: ${VAR:-~}`, `routing: ${VAR:-null}`) still means YAML
+  null, as it always did.
+- A `${VAR:-default}` whose variable is present but **empty** now logs a warning
+  naming the field and the variable, because the value from the file is what
+  runs. A blanked `ALERTLOOP_DB_DSN` used to start a healthy-looking process on
+  a local SQLite file while its operator was certain it was on PostgreSQL. The
+  warning gives the field, the variable and the line, never the value — a
+  Telegram proxy URL and a webhook URL both carry credentials — and a variable
+  that is simply absent says nothing.
+- `alertloop check-db` names the version that answered
+  (`ok: alertloop 0.6.0, the database answered`). It is the pre-flight check of
+  an upgrade, and run from a directory still pointing at the old image it
+  answered `ok` about a config the new version refuses, with nothing in the
+  output to say which version had spoken.
+- A `worker` no longer logs that "the JSON API is open to anyone who can reach
+  it". It has no HTTP listener; the line belongs to the process that serves, and
+  under Compose it appeared next to the api container refusing to start for
+  exactly that reason.
+
 ## 0.5.3 - 2026-09-11
 
 Corrections to the example, deployment and integration files, the README and

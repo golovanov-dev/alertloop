@@ -69,6 +69,13 @@ func run() error {
 		return err
 	}
 
+	// Before storage, the logger, or anything else is opened: a process that
+	// would serve HTTP with a config file naming no credential is refused.
+	// Which modes serve is app's to know, not this switch's.
+	if err := app.RequireCredential(cfg, mode); err != nil {
+		return err
+	}
+
 	// Before the logger: a health check runs every few seconds next to the
 	// real process, and must neither append to nor rotate that process's log
 	// file, nor run migrations under it.
@@ -123,7 +130,11 @@ func checkDB(cfg config.Config) error {
 	if err := app.CheckDatabase(ctx, cfg); err != nil {
 		return err
 	}
-	fmt.Println("ok: the database answered")
+	// The version, because this is also the pre-flight check of an upgrade: run
+	// from a directory still pointing at the old image, it answers "ok" about a
+	// config the new version would refuse, and nothing in the output said which
+	// version had answered.
+	fmt.Printf("ok: alertloop %s, the database answered\n", version)
 	return nil
 }
 

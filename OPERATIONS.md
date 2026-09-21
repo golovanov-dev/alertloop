@@ -146,9 +146,10 @@ or add yourself to a group that can, rather than loosening the mode.
 
 The shipped unit has `LogsDirectory=alertloop`, so systemd creates
 `/var/log/alertloop` owned by the service user and makes it writable despite
-`ProtectSystem=strict`. Nothing else is needed for
-`log.file: /var/log/alertloop/alertloop.log`. On a unit of your own, either add
-that line or create the directory yourself:
+`ProtectSystem=strict`. Nothing else is needed to log to
+`/var/log/alertloop/alertloop.log` (the `file:` line under `log:` in your
+config). On a unit of your own, either add `LogsDirectory=alertloop` or create
+the directory yourself:
 
 ```bash
 sudo install -d -o alertloop -g alertloop -m 750 /var/log/alertloop
@@ -374,6 +375,31 @@ with a backup.
 Split deployments (`server` and `worker` as separate processes) must run the
 **same version**. Upgrade them together.
 
+### Upgrading to 0.6.0: three things in your config can now stop startup
+
+**1. A key AlertLoop does not read is refused.** It used to be ignored, so
+`retention_day: 5` ran on the built-in 30 days. All such keys are listed at once
+with their lines; a path on one line (`log.level: debug`) is one, `x-` is not.
+
+**2. A config file with neither `admin_token` nor `api_keys` no longer starts**,
+in the modes that serve HTTP (`server` and the default `all`): with neither, the
+API and the admin console accept every request from anyone who can reach the
+process. A `worker` is not stopped, and running with no config file is unchanged.
+
+**3. A variable holding `null`, `Null`, `NULL` or `~` no longer erases the
+field.** `admin_token: ${ALERTLOOP_ADMIN_TOKEN}` with that text used to start
+AlertLoop with an empty admin token and an open API. It now arrives as text in a
+string field, and stops the start in a numeric, boolean or duration one.
+
+Check the file first (this covers 1 and 3; the credential is checked at start):
+
+```bash
+docker compose run --rm --no-deps api --config /etc/alertloop/alertloop.yaml check-db  # Compose
+sudo -u alertloop /usr/local/bin/alertloop --config /etc/alertloop/alertloop.yaml check-db  # systemd
+#  ok: alertloop 0.6.0, the database answered
+#  Before the first start there is no database yet: the answer names the missing file, the config was still read
+```
+
 ### Upgrading to 0.5.1: the Compose profile passes the database password differently
 
 The postgres profile used to build a URL from `POSTGRES_PASSWORD`, and a
@@ -429,8 +455,9 @@ Until you do, one of two things happens, and neither is silent:
   `ALERTLOOP_LOG_FILE` is set but configures nothing, and the value in the file
   is what runs;
 - your file **does not mention `log.file`** — startup is refused, naming the
-  variable and printing the line to write. That refusal is deliberate (0.3.0): a
-  variable the operator believes is in effect must never be quietly ignored.
+  variable and the `log.file` setting that replaced it. That refusal is
+  deliberate (0.3.0): a variable the operator believes is in effect must never
+  be quietly ignored.
 
 Nothing else about the upgrade needs attention: `max_size_mb` and `max_files`
 default to 50 and 5 for configs that never heard of them, and logging to stdout

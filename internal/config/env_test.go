@@ -234,12 +234,14 @@ func TestLogFileVariableNeedsAReferenceInTheConfigFile(t *testing.T) {
 		t.Fatalf("no warning naming the shadowed variable: %v", cfg.Warnings)
 	}
 
-	// The file says nothing about log.file: startup is refused, naming it.
+	// The file says nothing about log.file: startup is refused, naming the
+	// variable and the setting that replaced it, and nothing else: there is no
+	// line in the message for anyone to paste into a config file.
 	_, err := loadYAMLErr(t, "addr: \":8080\"\n")
 	if err == nil {
 		t.Fatal("a leftover ALERTLOOP_LOG_FILE was accepted")
 	}
-	if !strings.Contains(err.Error(), "ALERTLOOP_LOG_FILE") || !strings.Contains(err.Error(), "${ALERTLOOP_LOG_FILE:-}") {
-		t.Fatalf("the error does not name the variable and the line to write: %v", err)
+	if !strings.Contains(err.Error(), "ALERTLOOP_LOG_FILE") || !strings.Contains(err.Error(), "log.file") {
+		t.Fatalf("the error does not name the variable and the setting that replaced it: %v", err)
 	}
 }

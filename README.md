@@ -124,9 +124,20 @@ Download a release binary (linux/amd64, linux/arm64; darwin/windows for local
 evaluation) and give it a config file:
 
 ```bash
-cp alertloop.example.yaml alertloop.yaml   # edit: admin_token, channels
+cp alertloop.example.yaml alertloop.yaml   # edit: channels, routing
+export ALERTLOOP_ADMIN_TOKEN="$(openssl rand -hex 32)"   # the file reads it from here
 ./alertloop --config alertloop.yaml all
 ```
+
+The listen address is the `addr` line in that file: change it if 8080 is already
+taken (`addr: ":9090"`), or to bind a single interface
+(`addr: "127.0.0.1:8080"`). Started with no config file at all, AlertLoop
+listens on **every** interface with its API open — see "Production notes".
+
+The example reads the admin token from `ALERTLOOP_ADMIN_TOKEN` and refuses to
+start without it, so the credential that opens the whole API never has to live
+in the file. Under systemd, `deploy/systemd/install.sh` puts it in an
+`EnvironmentFile` for you.
 
 `deploy/systemd/install.sh` turns that into a supervised service (unit file,
 `alertloop` user, `/etc/alertloop/alertloop.yaml`, `/var/lib/alertloop`). The
@@ -517,7 +528,7 @@ log:
 that form matters under Compose: the api and the worker share one config file,
 so the only way to give them separate logs is for the path to come from the
 environment (`ALERTLOOP_LOG_FILE_API` / `ALERTLOOP_LOG_FILE_WORKER`). With the
-variable unset it is the same as `file: ""`. A plain `file: "/path/to.log"`
+variable unset or empty it is the same as `file: ""`. A plain `file: "/path/to.log"`
 works fine for a single process — but then the variable configures nothing, and
 AlertLoop says so at startup rather than pretending otherwise.
 
@@ -555,6 +566,14 @@ file or the container's stdout.
 binary at it with `--config /path/to/alertloop.yaml` (or `ALERTLOOP_CONFIG`).
 See `alertloop.example.yaml` for the full list of settings.
 
+**A file containing a key AlertLoop does not read does not start.** The load
+stops and lists each one with its line and the spelling that was probably
+meant — a setting nobody reads is a setting the operator believes is in effect.
+`alertloop.example.yaml` shows every key there is, commented-out examples
+included, so it is also the file to check yours against. Note that a setting
+written as a path on one line (`log.level: debug`) is such a key: YAML reads it
+as a single name, so write one key per line, nested.
+
 The environment is not a second place to configure AlertLoop — it exists to keep
 secrets out of the file. Any value written as exactly `${VAR}` or
 `${VAR:-default}` is replaced from the environment at startup:
@@ -570,13 +589,21 @@ database:
   dsn: ${ALERTLOOP_DB_DSN:-alertloop.db}
 ```
 
+Under Compose, only the variables `docker-compose.yml` passes to the container
+arrive there — the admin token, the database, the log file. A `${VAR}` of your
+own, such as `${TELEGRAM_BOT_TOKEN}` above, stays unset inside the container and
+stops the start; write that value in the file instead, or add the variable to
+the service in `docker-compose.yml`.
+
 Rules, and there are only three:
 
 - **The whole value, or nothing.** `${VAR}` inside a longer string is left
   alone — that way a password containing a literal `$` is never mangled.
-- **A missing variable stops the process**, unless the reference carries a
-  `:-default`. An empty `admin_token` caused by a typo in a variable name would
-  leave the API open, so it is refused instead.
+- **A variable that is unset *or empty* stops the process**, unless the
+  reference carries a `:-default`. An empty `admin_token` caused by a typo in a
+  variable name would leave the API open, so it is refused instead; the message
+  names the field, the variable and the line. `admin_token` is also the one
+  field for which a `:-default` is never the answer — give it a real value.
 - **The substituted text is data, not YAML.** A password containing `: ` or `#`
   stays a password.
 
@@ -585,9 +612,12 @@ lives in the file only.
 
 > **Upgrading from 0.2.x:** the `ALERTLOOP_ADDR`, `ALERTLOOP_DB_DSN`,
 > `ALERTLOOP_LOG_*`, `ALERTLOOP_WORKER_*`, and related variables no longer
-> configure anything. If one is still set, AlertLoop **refuses to start** and
-> names the config line to write instead — ignoring them could leave a process
-> running on a database its operator did not choose.
+> configure anything. If one is still set and the config file does not set the
+> same field, AlertLoop **refuses to start**, naming the variable and the
+> setting that replaced it — ignoring them could leave a process running on a
+> database its operator did not choose. If the file does set that field, the
+> file wins and
+> startup only warns that the variable configures nothing.
 
 ### Delivery channels are optional
 
@@ -783,10 +813,17 @@ For a single local binary for your own machine, just `make build` (Go only).
 
 ## Production notes
 
-- **Always set `admin_token`**: if neither `admin_token` nor `api_keys` are set,
-  the API accepts unauthenticated requests with **full** scope (a local-demo
-  convenience; the process logs a warning at startup). Always set `admin_token`
-  on anything reachable by others.
+- **A config file must carry a credential.** If it sets neither `admin_token`
+  nor `api_keys`, AlertLoop **refuses to start** and says which to add: the API
+  would otherwise accept unauthenticated requests with **full** scope, and an
+  open instance looks exactly like a working one. The check applies to the modes
+  that serve HTTP (`server`, and `all`, the default); a `worker` has no listener
+  and is not stopped over a credential it never uses. Running with neither is
+  left open when there is no config file at all (no `--config` and no
+  `ALERTLOOP_CONFIG`) — the binary on built-in defaults, which logs a warning at
+  startup and listens on **every interface**, so do not leave it that way on a
+  shared host. Every container image ships a config file, so this is not the
+  container case.
 - **TLS**: AlertLoop serves plain HTTP and is designed to run **behind an
   HTTPS reverse proxy** (nginx, Caddy, Traefik). Terminate TLS there and forward
   to the container/port.

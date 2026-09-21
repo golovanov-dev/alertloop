@@ -60,6 +60,12 @@ func TestCheckDBReportsAReachableDatabaseAndWritesNoLog(t *testing.T) {
 	if !strings.Contains(out, "ok") {
 		t.Fatalf("check-db printed %q; a person running it by hand should see it passed", out)
 	}
+	// And which build answered: the same command is the pre-flight check of an
+	// upgrade, and run before the new image is in place it answers "ok" about a
+	// config the new version may refuse.
+	if !strings.Contains(out, version) {
+		t.Errorf("check-db does not name the version that answered: %q", out)
+	}
 	if _, err := os.Stat(logPath); !os.IsNotExist(err) {
 		t.Fatalf("check-db created or opened the log file %s (stat err %v)", logPath, err)
 	}
