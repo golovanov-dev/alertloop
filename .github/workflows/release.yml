@@ -106,6 +106,9 @@ jobs:
     # It runs after the binaries so a tag never produces an image without the
     # matching release, and both are built from the same commit.
     needs: release
+    # The 0.6.0 build hung here, and a job without a limit runs for up to six
+    # hours with the release already published. A hung build now fails.
+    timeout-minutes: 45
     permissions:
       contents: read
       packages: write # push the image to GHCR

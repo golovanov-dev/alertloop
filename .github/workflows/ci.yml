@@ -363,7 +363,7 @@ jobs:
     # the push. compose-up builds amd64 only, so an arm64-only failure used to
     # surface after the tag: 0.6.0 published its binaries and no image. The
     # timeout turns a hung build into a red job instead of a six-hour wait.
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-qemu-action@v3
