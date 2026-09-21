@@ -11,38 +11,70 @@
   The load now stops and lists every unknown key at once, each with its full
   path (`rate_limit.trusted_proxy`), its line, and the spelling that was
   probably meant. Keys inside sections and inside list entries are checked too.
-  Compare your `alertloop.yaml` with `alertloop.example.yaml` before upgrading;
-  see "Upgrading to 0.6.0" in `OPERATIONS.md`. A top-level key starting with
-  `x-` is still left alone: it holds YAML anchors, as it does in Compose.
+  Compare your `alertloop.yaml` with `alertloop.example.yaml` before upgrading,
+  and run `check-db` with the new version before restarting ("Upgrades and
+  downgrades" in `OPERATIONS.md`): it loads the config and names what it
+  refuses. A top-level key starting with `x-` is still left alone: it holds
+  YAML anchors, as it does in Compose.
 - A setting written as a path on one line (`log.level: debug`) is one of those
   unknown keys. YAML has no key called `log.level`, so such a line never set the
   log level; the refusal says that a key name is not a path.
-- A config file that sets **neither `admin_token` nor `api_keys` no longer
-  starts**. With neither configured the JSON API and the admin console accept
-  every request from anyone who can reach the process, with full scope; that
-  used to be a single warning in the log, and an open instance looks exactly
-  like a working one, so nobody found out from behaviour. The message names the
-  file and both ways to fix it. It applies to the modes that serve HTTP
-  (`server` and `all`): a `worker` has no listener and is not stopped over a
-  credential it never uses. Running with no config file at all is unchanged —
-  the binary on built-in defaults, which is also the only case that listens on
-  every interface with the API open; every container image ships a config file,
-  so no container takes that path.
+- `server` and `all` **no longer start without a credential** — neither
+  `admin_token` nor `api_keys` — whether they were given a config file or
+  none at all. With neither, the JSON API and the admin console accepted every
+  request from anyone who could reach the process, with full scope, and the only
+  sign was one warning in the log. There is no open mode any more: a request
+  without a credential is always refused. A `worker` has no listener and is not
+  stopped. To start, set `admin_token` or `api_keys` in the config file; a
+  binary run without `--config` needs one now too, for example
+  `ALERTLOOP_ADMIN_TOKEN=<token> alertloop --config alertloop.example.yaml all`.
 - `${VAR}` is substituted in **values** only. A reference standing in a key
   position is now the key it literally is, which means an unknown one.
 - The error for an unset variable names the **field** as well as the variable
   and the line (`admin_token — ${ALERTLOOP_ADMIN_TOKEN}`), and it no longer
-  suggests a `${VAR:-default}` fallback for `admin_token`: an empty admin token
-  with no API keys leaves the JSON API open, which is why that field
-  deliberately has no fallback.
-- The refusal for a leftover pre-0.3.0 `ALERTLOOP_*` variable names the setting
-  that replaced it (`ALERTLOOP_DB_DSN — replaced by the database.dsn setting in
-  the config file`) instead of printing a line of YAML to paste. No AlertLoop
-  message prints a config line to copy into the file now: a message says what
-  is wrong, in which file, and which setting it is about.
+  suggests a `${VAR:-default}` fallback for `admin_token`, which deliberately
+  has none.
+- Comments in `alertloop.example.yaml`, `.env.example` and
+  `docker-compose.yml` are shorter; the settings and defaults are unchanged.
+
+### Removed
+
+- `cors_origins`. The admin console is served on the same origin as the API
+  and needs no CORS. A config file that still contains the key no longer
+  starts, like any other unknown key: delete the line. A browser app of your
+  own on another origin can reach the API through a reverse proxy that serves
+  both on one origin.
+- `log.max_size_mb` and `log.max_files`: AlertLoop no longer rotates its log
+  file. A config file that still contains either key no longer starts, like any
+  other unknown key: delete both lines. If you set `log.file`, rotate it with
+  logrotate and `copytruncate`; the rule for the binary and for `./logs` under
+  Compose is in `OPERATIONS.md`, "Reading AlertLoop's own logs". `log.file`
+  itself is unchanged.
+- The startup warning about undelivered attempts whose channel is not in the
+  config. The worker already fails each such attempt with
+  `no channel configured with name ...`, and it ends in the dead-letter queue
+  once its retries run out.
+- The built-in pages `/events`, `/events/{id}` and `/deliveries`. The admin
+  console at `/admin` shows the same events, event details and delivery
+  attempts, with replay. With the pages go the `?token=` query parameter and the
+  `X-Admin-Token` header; the admin token now travels only in the
+  `Authorization: Bearer` or `X-API-Key` header, never in a URL. Old links and
+  bookmarks to the pages answer 404.
+- The container entrypoint script. The image runs `alertloop` directly, so
+  `docker run` without `ALERTLOOP_ADMIN_TOKEN` stops with the loader's own
+  error: the variable is unset, at `admin_token` on line 2 of
+  `/etc/alertloop/alertloop.yaml`. Arguments after the image name reach
+  `alertloop` as before.
 
 ### Fixed
 
+- A recovery notice no longer arrives before its alert. If the alert to a
+  channel was waiting for a retry when the incident closed, the recovery went
+  out first and "resolved" was followed by the alert. The recovery now waits
+  until that alert is sent; if the alert dead-letters, the recovery waits for
+  it to be replayed. A channel whose alert had already dead-lettered when the
+  incident closed now gets its recovery too, after the replayed alert; before,
+  a replay delivered the alert and no recovery ever followed.
 - A `${VAR}` reference whose variable holds the text `null`, `Null`, `NULL` or
   `~` erased the field instead of filling it: YAML reads those four as "no
   value". `admin_token: ${ALERTLOOP_ADMIN_TOKEN}` with such a value started
@@ -62,14 +94,10 @@
   Telegram proxy URL and a webhook URL both carry credentials — and a variable
   that is simply absent says nothing.
 - `alertloop check-db` names the version that answered
-  (`ok: alertloop 0.6.0, the database answered`). It is the pre-flight check of
+  (`ok: alertloop v0.6.0, the database answered`). It is the pre-flight check of
   an upgrade, and run from a directory still pointing at the old image it
   answered `ok` about a config the new version refuses, with nothing in the
   output to say which version had spoken.
-- A `worker` no longer logs that "the JSON API is open to anyone who can reach
-  it". It has no HTTP listener; the line belongs to the process that serves, and
-  under Compose it appeared next to the api container refusing to start for
-  exactly that reason.
 
 ## 0.5.3 - 2026-09-11
 
@@ -162,9 +190,11 @@ up.
 **Upgrading a Compose deployment:** the postgres profile now hands the password
 to AlertLoop exactly as written in `.env`. If you percent-encoded
 `POSTGRES_PASSWORD` to get the old URL working (`%2F` for `/`), write the
-decoded password there before upgrading, or authentication fails. A password
-that begins with a single quote no longer parses. Details in `OPERATIONS.md`,
-"Upgrading to 0.5.1".
+decoded password there before upgrading, or authentication fails;
+`grep '^POSTGRES_PASSWORD=.*%' .env` finds the case. A password that begins
+with a single quote no longer parses: AlertLoop refuses to start and says why;
+change the password as described in "Changing the database password" in
+`OPERATIONS.md`.
 
 ### Added
 
@@ -229,7 +259,8 @@ example `.env` that no longer hands out a working admin token.
 `file: ${ALERTLOOP_LOG_FILE:-}` under `log:` in your own `alertloop.yaml`. A
 config copied from an older example does not reference the variable, and the
 environment configures nothing the file does not ask for (0.3.0) — AlertLoop
-says so at startup rather than ignoring it. Details in `OPERATIONS.md`.
+says so at startup rather than ignoring it. Details in `OPERATIONS.md`,
+"Docker: plain log files on the host".
 
 ### Added
 

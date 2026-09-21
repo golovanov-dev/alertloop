@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"time"
 
+	apispec "github.com/golovanov-dev/alertloop/api"
 	"github.com/golovanov-dev/alertloop/internal/domain"
 	"github.com/golovanov-dev/alertloop/internal/routing"
 	"github.com/golovanov-dev/alertloop/internal/service"
@@ -247,6 +248,12 @@ func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 		"edition": "community",
 		"license": "AGPL-3.0-only",
 	})
+}
+
+// handleOpenAPISpec serves the embedded OpenAPI contract.
+func (s *Server) handleOpenAPISpec(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/yaml; charset=utf-8")
+	_, _ = w.Write(apispec.OpenAPIYAML)
 }
 
 func parseLimit(s string) int {

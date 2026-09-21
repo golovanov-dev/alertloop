@@ -116,18 +116,6 @@ func TestStartupFailsOnUnknownChannelInRule(t *testing.T) {
 	}
 }
 
-func TestStartupFailsOnUnsupportedProxyScheme(t *testing.T) {
-	cfg := newTestConfig()
-	cfg.Channels.Telegram[0].Proxy = "mtproto://127.0.0.1:443"
-	_, err := startApp(t, cfg)
-	if err == nil {
-		t.Fatal("expected startup to fail on an unsupported proxy scheme")
-	}
-	if !strings.Contains(err.Error(), "dev-telegram") {
-		t.Fatalf("error should name the channel: %v", err)
-	}
-}
-
 // --- a config file must carry a credential --------------------------------
 
 // loadFile writes a config file and loads it exactly as the binary does, so the
@@ -161,7 +149,7 @@ func TestAConfigFileWithNoCredentialRefusesToStart(t *testing.T) {
 	if err == nil {
 		t.Fatal("a config file with no admin_token and no api_keys started; the API would be open to anyone")
 	}
-	for _, want := range []string{"admin_token", "api_keys", cfg.SourceFile} {
+	for _, want := range []string{"admin_token", "api_keys", "--config"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("the refusal does not mention %q:\n%v", want, err)
 		}
@@ -222,67 +210,4 @@ func TestOnlyTheModesThatServeHTTPNeedACredential(t *testing.T) {
 			t.Errorf("mode %q serves no HTTP and must not be stopped over a credential: %v", mode, err)
 		}
 	}
-}
-
-// Without a config file nothing changes: the built-in defaults, where the open
-// API is the point and a first look answering 401 to its own curl teaches
-// nothing. The warning stays the only signal there.
-func TestWithoutAConfigFileTheOpenAPIStillStartsAndWarns(t *testing.T) {
-	cfg := newTestConfig() // built from defaults, not from a file
-	cfg.AdminToken = ""
-	cfg.APIKeys = nil
-	if cfg.SourceFile != "" {
-		t.Fatalf("this case is about running without --config; SourceFile = %q", cfg.SourceFile)
-	}
-
-	if err := RequireCredential(cfg, "all"); err != nil {
-		t.Fatalf("running without a config file must still start: %v", err)
-	}
-	if _, err := startApp(t, cfg); err != nil {
-		t.Fatalf("running without a config file must still start: %v", err)
-	}
-	if logged := runBriefly(t, cfg, (*App).RunServer); !strings.Contains(logged, "open to anyone who can reach it") {
-		t.Errorf("the open API must still be warned about:\n%s", logged)
-	}
-}
-
-// The warning belongs to the process that listens. A worker built from the same
-// config has no HTTP server, and it used to announce that its API — which does
-// not exist — was open to anyone; under Compose that line appeared in the same
-// output as the api container refusing to start for want of a credential. Two
-// opposite statements on one screen is how a log stops being read.
-func TestOnlyTheServerWarnsAboutAnOpenAPI(t *testing.T) {
-	cfg := newTestConfig()
-	cfg.AdminToken = ""
-	cfg.APIKeys = nil
-
-	if logged := runBriefly(t, cfg, (*App).RunWorker); strings.Contains(logged, "open to anyone") {
-		t.Errorf("a worker announced an open API it does not serve:\n%s", logged)
-	}
-	if logged := runBriefly(t, cfg, (*App).RunServer); !strings.Contains(logged, "open to anyone") {
-		t.Errorf("the server did not warn about the open API:\n%s", logged)
-	}
-}
-
-// runBriefly builds an App and runs one of its modes with a context that is
-// already cancelled: enough to see what the mode says on the way in, without
-// leaving anything listening.
-func runBriefly(t *testing.T, cfg config.Config, run func(*App, context.Context) error) string {
-	t.Helper()
-	cfg.Addr = "127.0.0.1:0"
-
-	var buf bytes.Buffer
-	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	app, err := New(context.Background(), cfg, "test", log)
-	if err != nil {
-		t.Fatalf("build the app: %v", err)
-	}
-	defer app.Close()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if err := run(app, ctx); err != nil {
-		t.Fatalf("run: %v", err)
-	}
-	return buf.String()
 }

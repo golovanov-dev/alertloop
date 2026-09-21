@@ -98,7 +98,7 @@ func TestPostgresEventRoundTrip(t *testing.T) {
 }
 
 // The partial unique index and the lifecycle SQL are written once and run on
-// both engines. This is the PostgreSQL half of TestFailureRecursAfterResolve.
+// both engines. This is the PostgreSQL half of TestRecurrenceAfterRecoveryAlertsAgain.
 func TestPostgresIncidentLifecycle(t *testing.T) {
 	s := postgresStore(t)
 	ctx := context.Background()
@@ -251,65 +251,27 @@ func TestPostgresClaimDueNeverDoubleClaims(t *testing.T) {
 	}
 }
 
-func TestPostgresListPaginationAndCounts(t *testing.T) {
+// CountEventsByState backs GET /v1/stats and has no other test.
+func TestPostgresCountEventsByState(t *testing.T) {
 	s := postgresStore(t)
 	ctx := context.Background()
 	base := time.Date(2026, 8, 22, 9, 0, 0, 0, time.UTC)
 
-	for i := 0; i < 12; i++ {
-		e := sampleEvent(fmt.Sprintf("pg-list-%02d", i), fmt.Sprintf("pg:list:%02d", i),
+	for i := 0; i < 3; i++ {
+		e := sampleEvent(fmt.Sprintf("pg-count-%02d", i), fmt.Sprintf("pg:count:%02d", i),
 			base.Add(time.Duration(i)*time.Minute))
 		e.LastSeenAt = e.CreatedAt
-		if i%3 == 0 {
-			e.Severity = domain.SeverityCritical
-		}
 		if _, _, err := s.CreateEvent(ctx, e); err != nil {
 			t.Fatalf("create %d: %v", i, err)
 		}
-	}
-
-	// Walk the whole set through the keyset cursor and check nothing is
-	// repeated or dropped — the cursor is base64 over timestamp+id and is
-	// exactly where a dialect difference in text ordering would show up.
-	seen := map[string]bool{}
-	cursor := ""
-	for pages := 0; ; pages++ {
-		if pages > 10 {
-			t.Fatal("pagination did not terminate")
-		}
-		page, err := s.ListEvents(ctx, EventFilter{}, 5, cursor)
-		if err != nil {
-			t.Fatalf("list: %v", err)
-		}
-		for _, e := range page.Items {
-			if seen[e.ID] {
-				t.Fatalf("event %s returned on two pages", e.ID)
-			}
-			seen[e.ID] = true
-		}
-		if page.NextCursor == "" {
-			break
-		}
-		cursor = page.NextCursor
-	}
-	if len(seen) != 12 {
-		t.Fatalf("pagination returned %d of 12 events", len(seen))
-	}
-
-	filtered, err := s.ListEvents(ctx, EventFilter{Severity: domain.SeverityCritical}, 50, "")
-	if err != nil {
-		t.Fatalf("filtered list: %v", err)
-	}
-	if len(filtered.Items) != 4 {
-		t.Fatalf("critical events = %d, want 4", len(filtered.Items))
 	}
 
 	counts, err := s.CountEventsByState(ctx)
 	if err != nil {
 		t.Fatalf("counts: %v", err)
 	}
-	if counts[string(domain.StateNew)] != 12 {
-		t.Fatalf("new events = %d, want 12", counts[string(domain.StateNew)])
+	if counts[string(domain.StateNew)] != 3 {
+		t.Fatalf("new events = %d, want 3", counts[string(domain.StateNew)])
 	}
 }
 

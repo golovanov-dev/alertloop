@@ -1,128 +1,45 @@
-# AlertLoop example configuration.
+# AlertLoop example configuration — the only configuration file, for the binary
+# and both Compose profiles:  alertloop --config alertloop.yaml all
 #
-# THIS FILE IS THE ONLY SOURCE OF CONFIGURATION, on top of built-in defaults.
-# Point the binary at it:  alertloop --config alertloop.yaml all
-# (or set ALERTLOOP_CONFIG=/path/to/alertloop.yaml).
-#
-# It is also the ONLY example: the same file serves the binary install and both
-# Compose profiles. The database section reads its driver and DSN from the
-# environment with SQLite as the default, which is what lets the postgres
-# profile point it at PostgreSQL without a second, divergent copy of this
-# file to keep in sync.
-#
-# The environment is not a second place to configure AlertLoop — it only keeps
-# secrets out of this file. A value written as exactly ${VAR} or ${VAR:-default}
-# is replaced from the environment at startup:
-#
-#   admin_token: ${ALERTLOOP_ADMIN_TOKEN}
-#
-# Three rules: the WHOLE value is substituted or nothing (so a password with a
-# literal "$" is never mangled); a missing OR EMPTY variable without a :-default
-# stops the process rather than leaving an empty setting; and the substituted
-# text is data, not YAML, so a password containing ": " or "#" stays a password.
-#
-# Two details that are easy to meet by accident:
-#   - ${VAR:-} in a NON-STRING field does not zero the field. An empty value is
-#     YAML null, null means "not set", and the built-in default stays in force.
-#     To set such a field to 0 or false, write the value here.
-#   - In a FLOW list the reference must be quoted — cors_origins: ["${VAR}"] —
-#     because an unquoted "${" opens a YAML mapping and the file fails to parse
-#     before substitution ever runs. In a block list (an item per line, which is
-#     what this file uses) no quotes are needed.
-#
-# Every key this file can contain is below, including the ones that are
-# commented out: since 0.6.0 a key AlertLoop does not read stops startup, so
-# this file is also the list to check yours against.
-#
-# Where the variables come from: under systemd, the EnvironmentFile
-# /etc/alertloop/alertloop.env. Under Compose, only the variables that
-# docker-compose.yml passes to the container (the admin token, the database,
-# the log file) — any other ${VAR} stays unset there, so write that value into
-# this file instead.
+# A value written as exactly ${VAR} or ${VAR:-default} is taken from the
+# environment at startup; an unset or empty ${VAR} without a default stops
+# startup. Substituted text is data, not YAML.
+# ${VAR:-} in a non-string field keeps the built-in default; in a flow list
+# write it quoted: ["${VAR}"].
+# Under Compose only the variables docker-compose.yml passes are set; write
+# any other value into this file directly.
+# Every key AlertLoop reads is shown below; an unknown key stops startup.
 
-# HTTP listen address for the API and web UI.
+# HTTP listen address for the API, the admin console and Swagger.
 addr: ":8080"
 
-# Admin token protects the events web page and the admin console at /admin, and
-# grants FULL API access (it is the admin console credential).
-#
-# There is deliberately NO fallback here. A reference with no default stops
-# startup when the variable is unset, naming what is missing — which is the only
-# safe behaviour for the credential that opens the whole API. An installation
-# silently running on a placeholder published in this repository is worse than
-# one that refuses to start.
-#
-#   export ALERTLOOP_ADMIN_TOKEN="$(openssl rand -hex 32)"
-#
-# Under systemd put it in an EnvironmentFile; under Compose put it in .env.
+# Signs in to /admin and grants full API access. No fallback: an unset token
+# stops startup. Generate one with: openssl rand -hex 32
 admin_token: ${ALERTLOOP_ADMIN_TOKEN}
 
-# API keys for services calling the JSON API. Each key has a scope:
-#   ingest - may only create events (POST /v1/events)   → for event sources
-#   read   - may only read events/deliveries/stats       → for dashboards
-#   full   - full access incl. state actions and replay  → for trusted tools
-# Omitted scope defaults to full. The admin token already has full access, so
-# keys are optional (e.g. only needed for least-privilege service credentials).
-#
-# Commented out on purpose: an example that ships a WORKING key hands a live
-# ingest credential to everyone who copies this file, and whoever holds one can
-# create events and through them wake every configured channel. Uncomment and
-# put in keys of your own (openssl rand -hex 32): either the key itself in
-# quotes, or a ${VAR} reference as below where the environment can supply it
-# (see the top of this file — under Compose it cannot).
-#
+# API keys with a scope: ingest (POST /v1/events), read (queries), full
+# (everything; the default). Optional — put in keys of your own.
 # api_keys:
 #   - key: ${ALERTLOOP_INGEST_KEY}
 #     scope: ingest
 #   - key: ${ALERTLOOP_READ_KEY}
 #     scope: read
 
-# Event retention window in days: events older than this are pruned automatically
-# by the worker. No upper bound.
+# Days to keep events; the worker prunes older ones.
 retention_days: 30
 
-# When an incident closes, tell the channels that were told about it.
-#
-# Applies both to an ingested `status: resolved` and to the manual resolve
-# action in the console. The notice goes ONLY to the channels that received the
-# alert — resolving is not re-routed, and a channel whose alert dead-lettered is
-# skipped, because it never learned there was a problem. Repeating a recovery
-# does not notify twice.
-#
-# On by default: an alerting service that says the database is down and never
-# says it came back leaves you to guess. Set it to false if your channel is a
-# ticketing webhook that opens an issue per message — such a receiver should
-# read the `kind` field ("alert" or "recovery") in the webhook body instead.
+# Send a recovery notice to the channels that received the alert when an
+# incident is resolved. Set false for a receiver that opens a ticket per message.
 notify_on_resolve: true
 
-# Logging. Output ALWAYS goes to stdout; `file` adds a copy on disk. Setting a
-# file never silences stdout, so `docker compose logs`, journald and any log
-# shipper keep working alongside it.
+# Logs always go to stdout; `file` adds a copy on disk.
 log:
   level: "info"     # debug | info | warn | error
-  format: "text"    # text (human-readable) | json (for log processors)
+  format: "text"    # text | json
 
-  # Path of the log file. Empty (the default) means stdout only.
-  #
-  # Written as a reference so the Compose file can give the api and the worker
-  # SEPARATE files without a second copy of this config: both containers mount
-  # this one file on purpose, and two processes appending to one log would
-  # rotate it out from under each other.
-  #
-  # AlertLoop creates the directory if it is missing, but it must be able to
-  # write there. Under Docker the containers run as uid 10001 with a read-only
-  # root filesystem, so a path such as /var/log/alertloop/alertloop.log works
-  # only if that directory is a mounted volume owned by that uid — see the
-  # "Reading AlertLoop's own logs" section of OPERATIONS.md. Under systemd the
-  # shipped unit declares LogsDirectory=alertloop, so /var/log/alertloop is
-  # created for the service user and this path just works.
+  # Log file path; empty means stdout only. Writable by the process (uid 10001
+  # in Docker); rotate it with logrotate — see OPERATIONS.md.
   file: ${ALERTLOOP_LOG_FILE:-}
-
-  # Rotation of that file, by size — nothing else rotates it. Disk use is
-  # bounded by max_size_mb * (max_files + 1): 300 MB with the values below.
-  # Set max_size_mb to 0 if logrotate or a shipping agent handles the file.
-  max_size_mb: 50   # rotate to <file>.1 at this size; older ones shift up
-  max_files: 5      # rotated files kept besides the active one
 
 # In-process rate limiting.
 rate_limit:
@@ -132,59 +49,18 @@ rate_limit:
   ingest_per_second: 100   # overall event ingestion cap for the process
   ingest_burst: 200
 
-  # IF YOU RUN BEHIND A REVERSE PROXY, SET THIS.
-  #
-  # Otherwise every request reaches AlertLoop from the proxy's address, the
-  # per-IP limiter sees exactly one client, and the whole internet shares a
-  # single bucket. Two things follow, and both are worse than having no limiter
-  # at all — because the documentation says there is one:
-  #
-  #   * guessing at the admin token is effectively unlimited;
-  #   * one noisy client empties the shared bucket and every legitimate event
-  #     source starts getting 429.
-  #
-  # List the addresses of proxies you actually run. Their X-Forwarded-For is
-  # then believed, and only theirs: the header is trivially forged by anyone
-  # talking to AlertLoop directly, so trusting it unconditionally would be
-  # worse still — every request would look like a new client and the limiter
-  # would never fire.
-  #
+  # Behind a reverse proxy, list its addresses: without it every client shares
+  # the proxy's rate-limit bucket. Only these proxies' X-Forwarded-For is used.
   # trusted_proxies:
-  #   - "127.0.0.1"          # nginx or Caddy on this host, binary install
+  #   - "127.0.0.1"          # nginx or Caddy on this host
   #   - "10.0.0.0/8"         # a load balancer range
-  #
-  # Under Compose the proxy on the host reaches the container from the Compose
-  # network gateway, not from 127.0.0.1. List that address; it is printed by
-  #   docker network inspect alertloop_default -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}'
-  # and can change after `docker compose down`.
-  #
-  # Also add rate limiting at the proxy itself; deploy/proxy/nginx.conf ships
-  # with it configured. The two are complementary, not alternatives.
-
-# The admin console is served by this API at /admin (same origin — no CORS
-# needed). Only set cors_origins if you build your OWN browser app on a
-# different origin that calls this API. Use "*" to allow any origin; empty (the
-# default) disables CORS and allows same-origin only.
-# cors_origins:
-#   - "https://my-dashboard.example.com"
 
 database:
-  # "sqlite" (local/demo) or "postgres" (production). Inferred from dsn if empty.
-  # Written as a reference so the Compose postgres profile can select the driver
-  # without editing this file; hard-code "postgres" instead if you prefer the
-  # file to be self-contained.
+  # "sqlite" or "postgres"; inferred from dsn if empty.
   driver: ${ALERTLOOP_DB_DRIVER:-sqlite}
-  # SQLite: a file path or ":memory:".
-  # PostgreSQL, either form:
+  # SQLite: a file path or ":memory:". PostgreSQL, either form:
   #   "host=HOST port=5432 user=USER dbname=alertloop sslmode=disable password=PASS"
   #   "postgres://USER:PASS@HOST:5432/alertloop?sslmode=disable"
-  # In the URL form, a password containing / ? # @ % or a space must be
-  # percent-encoded (/ as %2F) or the URL does not parse. The keyword/value form
-  # takes the password as written, unless it contains a space or a backslash
-  # or starts with a single quote — then write password='...' with \' and \\
-  # for ' and \.
-  # The Compose postgres profile passes a keyword/value DSN in here.
-  # A DSN carries a password, so it is a good candidate for ${VAR} too.
   dsn: ${ALERTLOOP_DB_DSN:-alertloop.db}
 
 worker:
@@ -194,17 +70,8 @@ worker:
   base_backoff: 30s    # first retry delay; doubles each attempt
   max_backoff: 30m     # cap on the retry delay
 
-# Delivery channels are OPTIONAL. With none configured (as below), AlertLoop
-# simply stores events (visible in the API and at /admin) and delivers nothing —
-# this is a perfectly valid way to run. To send notifications, uncomment one or
-# more channels and fill in their fields.
-#
-# Each type is a LIST, so you can configure several channels of the same type
-# (e.g. two Telegram chats). Without a `routing` section (see below) every event
-# is delivered to EVERY configured channel. Each channel needs a unique `name`.
-# If you enable a channel you must fill ALL its required fields, or startup will
-# fail with a clear message. Secrets such as bot_token and password follow the
-# rule at the top of this file: under Compose, write them here.
+# Delivery channels are optional; with none, events are stored and not sent.
+# Each type is a list; every channel needs a unique name.
 channels:
   # email:
   #   - name: dev-email
@@ -215,23 +82,18 @@ channels:
   #     from: "alerts@example.com"
   #     to: ["ops@example.com"]
   #     starttls: true   # require STARTTLS on a plaintext port (e.g. 587)
-  #     tls: false       # set true for implicit TLS / SMTPS (e.g. port 465)
-  #     timeout: 10s     # per-delivery timeout; 10s when omitted
+  #     tls: false       # implicit TLS / SMTPS (e.g. port 465)
+  #     timeout: 10s     # per-delivery timeout
   #
   # telegram:
   #   - name: dev-telegram
-  #     bot_token: ${TELEGRAM_BOT_TOKEN}   # from @BotFather
+  #     bot_token: "123456:ABC-DEF"   # from @BotFather, written here as is
   #     chat_id: "-1001234567890"
-  #     # If this host cannot reach api.telegram.org directly, send this
-  #     # channel's requests through a proxy. Schemes: http, https, socks5,
-  #     # socks5h (socks5h is a synonym: the proxy resolves DNS either way).
-  #     # MTProto proxies do NOT work for the Bot API. Any other scheme stops
-  #     # startup. Leave it out to keep using HTTP_PROXY/HTTPS_PROXY, if set.
+  #     # Proxy for this channel: http, https, socks5 or socks5h (not MTProto).
   #     # proxy: "socks5://user:pass@127.0.0.1:1080"
-  #     #
-  #     # Alternative to a proxy: a trusted Bot API mirror or reverse proxy.
+  #     # Or a trusted Bot API mirror instead of a proxy.
   #     # api_base: "https://tg-mirror.example.com"
-  #     timeout: 10s     # per-delivery timeout; 10s when omitted
+  #     timeout: 10s     # per-delivery timeout
   #
   #   - name: customer-telegram
   #     bot_token: "123456:ABC-DEF"
@@ -240,26 +102,17 @@ channels:
   # webhook:
   #   - name: siem
   #     url: "https://example.com/alertloop-hook"
-  #     # Requests are HMAC-SHA256 signed; receivers verify X-AlertLoop-Signature.
-  #     secret: "shared-webhook-secret"
-  #     timeout: 10s     # per-delivery timeout; 10s when omitted
+  #     secret: "shared-webhook-secret"   # HMAC-SHA256 key for X-AlertLoop-Signature
+  #     timeout: 10s     # per-delivery timeout
 
-# Routing is OPTIONAL. Without this section every event goes to every configured
-# channel. With it, each event goes to the channels of
-# the FIRST rule it matches — rules are checked top to bottom and channel lists
-# are never merged.
-#
-# The example below is the common split: the customer gets the orders, the
-# developer gets the failures, and neither gets the other's events.
-#
+# Routing is optional; without it every event goes to every channel. With it,
+# an event goes to the channels of the FIRST matching rule.
 # routing:
 #   rules:
-#     # Suppression first: a rule that silences a source must sit above the
-#     # rules it overrides, because the first match wins.
 #     - name: silence-healthchecks
 #       match:
 #         source: [healthcheck]
-#       channels: []            # explicit "nowhere": stored, never delivered
+#       channels: []            # stored, never delivered
 #
 #     - name: incidents-to-dev
 #       match:
@@ -269,19 +122,14 @@ channels:
 #
 #     - name: page-on-critical
 #       match:
-#         # severity lists the exact levels to match (info, success, warning,
-#         # error, critical). Use it instead of min_severity when the rule is
-#         # about particular levels rather than a threshold; setting both means
-#         # the event must satisfy each.
-#         severity: [critical]
+#         severity: [critical]  # exact levels, unlike min_severity
 #       channels: [dev-telegram]
 #
 #     - name: orders-to-customer
 #       match:
 #         type: [business_event]
-#         category: ["order.*"] # only a TRAILING "*" is supported
+#         category: ["order.*"] # only a trailing "*" is supported
 #       channels: [customer-telegram]
 #
-#   # Events matching no rule. Omit it and they are delivered nowhere — each one
-#   # is then logged at warn level so the loss is never silent.
+#   # Events matching no rule; omitted, they go nowhere (logged at warn).
 #   default: [dev-telegram]

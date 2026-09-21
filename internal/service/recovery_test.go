@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/golovanov-dev/alertloop/internal/config"
 	"github.com/golovanov-dev/alertloop/internal/domain"
 	"github.com/golovanov-dev/alertloop/internal/routing"
 	"github.com/golovanov-dev/alertloop/internal/storage"
@@ -101,41 +102,116 @@ func TestRepeatedResolveDoesNotNotifyTwice(t *testing.T) {
 	}
 }
 
-// A channel whose alert dead-lettered never learned there was a problem. A bare
-// "resolved" would be the only message it ever received, which reads as a
-// notification about nothing.
-func TestRecoverySkipsChannelsWhoseAlertDeadLettered(t *testing.T) {
+// A channel whose alert dead-lettered before the incident closed still gets its
+// recovery queued. It waits: nothing goes out until the alert is replayed and
+// sent, and then the recovery follows it, so the channel never sees "down"
+// without "back up", and never "back up" first.
+func TestRecoveryForDeadLetteredAlertWaitsForReplay(t *testing.T) {
 	ingest, _, store := twoChannelService(t, true)
 	ctx := context.Background()
 	const key = "server-01:disk:usage"
+	later := time.Now().Add(time.Hour)
 
 	if _, err := ingest.Ingest(ctx, firing(key, "disk full", domain.SeverityCritical)); err != nil {
 		t.Fatalf("firing: %v", err)
 	}
 	// Claim before recording an outcome: MarkResult only writes to a row that
 	// is still `sending`, which is how the worker reaches it.
-	if _, err := store.ClaimDue(ctx, time.Now().Add(time.Hour), 10); err != nil {
+	if _, err := store.ClaimDue(ctx, later, 10); err != nil {
 		t.Fatalf("claim: %v", err)
 	}
 	alerts := attemptsFor(t, store, domain.KindAlert)
-	dead := alerts["ops-email"]
-	dead.State = domain.DeliveryDeadLetter
-	dead.Attempts = dead.MaxAttempts
-	dead.LastError = "smtp: connection refused"
-	if err := store.MarkResult(ctx, &dead); err != nil {
-		t.Fatalf("dead-letter the email attempt: %v", err)
+	mark := func(d domain.DeliveryAttempt, state domain.DeliveryState) {
+		t.Helper()
+		d.State, d.NextRetryAt = state, nil
+		if err := store.MarkResult(ctx, &d); err != nil {
+			t.Fatalf("mark %s %s: %v", d.ChannelName, state, err)
+		}
 	}
+	mark(alerts["ops-telegram"], domain.DeliverySent)
+	mark(alerts["ops-email"], domain.DeliveryDeadLetter)
 
 	if _, err := ingest.Ingest(ctx, EventInput{Status: domain.StatusResolved, DedupeKey: key}); err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
-
 	recoveries := attemptsFor(t, store, domain.KindRecovery)
-	if _, ok := recoveries["ops-email"]; ok {
-		t.Fatal("a channel that never received the alert was sent a recovery notice")
+	for _, name := range []string{"ops-telegram", "ops-email"} {
+		if d, ok := recoveries[name]; !ok || d.State != domain.DeliveryPending {
+			t.Fatalf("recovery for %q = %+v, want it queued", name, d)
+		}
 	}
-	if _, ok := recoveries["ops-telegram"]; !ok {
-		t.Fatal("the channel that did receive the alert got no recovery notice")
+
+	claimIDs := func() []string {
+		t.Helper()
+		claimed, err := store.ClaimDue(ctx, later, 10)
+		if err != nil {
+			t.Fatalf("claim: %v", err)
+		}
+		var ids []string
+		for _, c := range claimed {
+			ids = append(ids, c.ID)
+		}
+		return ids
+	}
+	want := func(got []string, ids ...string) {
+		t.Helper()
+		if len(got) != len(ids) {
+			t.Fatalf("claimed %v, want %v", got, ids)
+		}
+		for i := range ids {
+			if got[i] != ids[i] {
+				t.Fatalf("claimed %v, want %v", got, ids)
+			}
+		}
+	}
+
+	// Only the telegram recovery goes: the email one waits behind its alert.
+	want(claimIDs(), recoveries["ops-telegram"].ID)
+	want(claimIDs())
+
+	// Replayed: the alert goes first, the recovery only once it is sent.
+	if _, err := store.Replay(ctx, alerts["ops-email"].ID, later); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	want(claimIDs(), alerts["ops-email"].ID)
+	replayed, err := store.GetDeliveryAttempt(ctx, alerts["ops-email"].ID)
+	if err != nil {
+		t.Fatalf("get replayed alert: %v", err)
+	}
+	mark(*replayed, domain.DeliverySent)
+	want(claimIDs(), recoveries["ops-email"].ID)
+}
+
+// A recovery goes only to channels an alert was queued to. A configured channel
+// the routing did not send the alert to gets no recovery either.
+func TestRecoverySkipsChannelsTheAlertWasNotRoutedTo(t *testing.T) {
+	s := newStore(t)
+	targets := []domain.ChannelTarget{
+		{Type: domain.ChannelTelegram, Name: "ops-telegram"},
+		{Type: domain.ChannelEmail, Name: "ops-email"},
+	}
+	router, err := routing.New(config.Routing{Default: []string{"ops-telegram"}}, targets)
+	if err != nil {
+		t.Fatalf("router: %v", err)
+	}
+	rec := NewRecoveryNotifier(s, true, 5, quietLogger())
+	clock := clockAt(time.Date(2026, 8, 22, 10, 0, 0, 0, time.UTC))
+	ingest := NewIngestService(s, router, 5, rec, clock, quietLogger())
+	ctx := context.Background()
+	const key = "server-01:cron:backup"
+
+	if _, err := ingest.Ingest(ctx, firing(key, "backup failed", domain.SeverityError)); err != nil {
+		t.Fatalf("firing: %v", err)
+	}
+	if _, err := ingest.Ingest(ctx, EventInput{Status: domain.StatusResolved, DedupeKey: key}); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	recoveries := attemptsFor(t, s, domain.KindRecovery)
+	if len(recoveries) != 1 {
+		t.Fatalf("recovery attempts = %v, want only ops-telegram", recoveries)
+	}
+	if _, ok := recoveries["ops-email"]; ok {
+		t.Fatal("a channel the alert was never routed to got a recovery notice")
 	}
 }
 

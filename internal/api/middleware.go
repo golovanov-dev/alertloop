@@ -19,14 +19,10 @@ type scopeCtxKey struct{}
 // API key (via `Authorization: Bearer <key>` or the `X-API-Key` header) OR the
 // admin token (the full-access admin console credential). The resolved scope is
 // stored on the request context for per-endpoint enforcement by requireScope.
-// When no keys AND no admin token are configured the API is open with full
-// scope (useful for local demos); this is logged at startup by the server.
+// With no keys and no admin token every request is refused; the process does
+// not start in that state (app.RequireCredential).
 func apiKeyAuth(keyScopes map[string]string, adminToken string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if len(keyScopes) == 0 && adminToken == "" {
-			next.ServeHTTP(w, withScope(r, config.ScopeFull))
-			return
-		}
 		presented := extractAPIKey(r)
 		if presented == "" {
 			writeError(w, http.StatusUnauthorized, "unauthorized", "missing API key or admin token")
@@ -102,79 +98,7 @@ func extractAPIKey(r *http.Request) string {
 	return strings.TrimSpace(r.Header.Get("X-API-Key"))
 }
 
-// adminTokenAuth guards the events web page and admin-only endpoints with a
-// single shared token (no user accounts in Community). The token may be provided
-// via `Authorization: Bearer`, the `X-Admin-Token` header, or a `token` query
-// parameter (so the page is reachable from a browser).
-func adminTokenAuth(token string, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if token == "" {
-			writeError(w, http.StatusServiceUnavailable, "admin_disabled",
-				"admin token is not configured; set admin_token in your config file "+
-					"(e.g. admin_token: ${ALERTLOOP_ADMIN_TOKEN}) to enable the events page")
-			return
-		}
-		presented := extractAdminToken(r)
-		if subtle.ConstantTimeCompare([]byte(presented), []byte(token)) != 1 {
-			writeError(w, http.StatusUnauthorized, "unauthorized", "invalid admin token")
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
-func extractAdminToken(r *http.Request) string {
-	if h := r.Header.Get("Authorization"); h != "" {
-		if after, ok := strings.CutPrefix(h, "Bearer "); ok {
-			return strings.TrimSpace(after)
-		}
-	}
-	if h := r.Header.Get("X-Admin-Token"); h != "" {
-		return strings.TrimSpace(h)
-	}
-	return strings.TrimSpace(r.URL.Query().Get("token"))
-}
-
-// cors enables cross-origin requests from the configured admin console
-// origins. It reflects an allowed Origin, permits the admin/API headers, and
-// answers preflight OPTIONS requests. Needed only when the admin UI is served
-// from a different origin (standalone deployment); same-origin needs no CORS.
-func cors(allowed []string, next http.Handler) http.Handler {
-	allowAll := false
-	set := map[string]bool{}
-	for _, o := range allowed {
-		if o == "*" {
-			allowAll = true
-		}
-		set[o] = true
-	}
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		origin := r.Header.Get("Origin")
-		if origin != "" && (allowAll || set[origin]) {
-			h := w.Header()
-			if allowAll {
-				h.Set("Access-Control-Allow-Origin", "*")
-			} else {
-				h.Set("Access-Control-Allow-Origin", origin)
-				h.Add("Vary", "Origin")
-			}
-			h.Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-			h.Set("Access-Control-Allow-Headers", "Authorization, X-API-Key, X-Admin-Token, Content-Type")
-			h.Set("Access-Control-Max-Age", "600")
-		}
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
 // securityHeaders adds conservative security headers to every response.
-// Referrer-Policy is the important one here: it stops the admin `?token=` in
-// the events page URL from leaking to third parties via the Referer header.
-// (A strict Content-Security-Policy is set per-page on the events pages, since a
-// global one would break the Swagger UI assets.)
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()

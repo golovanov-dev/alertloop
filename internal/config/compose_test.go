@@ -67,10 +67,8 @@ func TestComposePublishesAConfigurableLoopbackPort(t *testing.T) {
 }
 
 // ALERTLOOP_PORT is for Compose alone. Handed to the container it would look
-// like configuration, and since 0.3.0 the environment configures nothing the
-// config file does not ask for — so it must not be passed in, and AlertLoop
-// must not trip over it where it is set anyway (a binary install whose shell
-// exports it, say).
+// like configuration, and the environment configures nothing the config file
+// does not ask for — so it must not be passed in.
 func TestAlertLoopPortStaysOutOfTheContainers(t *testing.T) {
 	for name, svc := range loadCompose(t) {
 		if svc.EnvFile != nil {
@@ -81,19 +79,6 @@ func TestAlertLoopPortStaysOutOfTheContainers(t *testing.T) {
 				t.Errorf("service %s passes ALERTLOOP_PORT into the container (%s: %s)", name, k, v)
 			}
 		}
-	}
-	if _, ok := legacyEnvVars["ALERTLOOP_PORT"]; ok {
-		t.Fatal("ALERTLOOP_PORT is listed as a legacy variable; setting it for Compose would stop AlertLoop")
-	}
-
-	t.Setenv("ALERTLOOP_ADMIN_TOKEN", "a-real-token")
-	t.Setenv("ALERTLOOP_PORT", "8090")
-	cfg, err := Load(examplePath())
-	if err != nil {
-		t.Fatalf("the example config does not load with ALERTLOOP_PORT set: %v", err)
-	}
-	if len(cfg.Warnings) != 0 {
-		t.Fatalf("ALERTLOOP_PORT produced startup warnings: %v", cfg.Warnings)
 	}
 }
 

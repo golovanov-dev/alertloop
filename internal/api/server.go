@@ -22,7 +22,6 @@ type Server struct {
 	apiKeys        map[string]string // key -> scope
 	adminToken     string
 	version        string
-	corsOrigins    []string
 	trustedProxies *TrustedProxies
 	log            *slog.Logger
 
@@ -39,13 +38,12 @@ type Config struct {
 	Deliveries *service.DeliveryService
 	// Routing backs the routing preview endpoints. Nil is treated as "routing
 	// not configured".
-	Routing     *routing.Router
-	APIKeys     map[string]string // key -> scope (ingest|read|full)
-	AdminToken  string
-	Version     string
-	RateLimit   config.RateLimit
-	CORSOrigins []string
-	Logger      *slog.Logger
+	Routing    *routing.Router
+	APIKeys    map[string]string // key -> scope (ingest|read|full)
+	AdminToken string
+	Version    string
+	RateLimit  config.RateLimit
+	Logger     *slog.Logger
 	// TrustedProxies decides whose X-Forwarded-For is believed when the per-IP
 	// limiter identifies a client. Nil trusts nothing.
 	TrustedProxies *TrustedProxies
@@ -70,7 +68,6 @@ func NewServer(c Config) *Server {
 		apiKeys:        c.APIKeys,
 		adminToken:     c.AdminToken,
 		version:        c.Version,
-		corsOrigins:    c.CORSOrigins,
 		trustedProxies: c.TrustedProxies,
 		log:            log,
 	}
@@ -125,11 +122,6 @@ func (s *Server) Handler() http.Handler {
 		http.Redirect(w, r, "/swagger/", http.StatusFound)
 	})
 
-	// Events web page (guarded by admin token).
-	mux.Handle("GET /events", adminTokenAuth(s.adminToken, http.HandlerFunc(s.handleEventsPage)))
-	mux.Handle("GET /events/{id}", adminTokenAuth(s.adminToken, http.HandlerFunc(s.handleEventDetailPage)))
-	mux.Handle("GET /deliveries", adminTokenAuth(s.adminToken, http.HandlerFunc(s.handleDeliveriesPage)))
-
 	// Root redirect to Swagger for convenience.
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/swagger", http.StatusFound)
@@ -138,9 +130,6 @@ func (s *Server) Handler() http.Handler {
 	var h http.Handler = mux
 	if s.ipLimiter != nil {
 		h = perIPLimit(s.ipLimiter, s.trustedProxies, h)
-	}
-	if len(s.corsOrigins) > 0 {
-		h = cors(s.corsOrigins, h)
 	}
 	return logging(s.log, securityHeaders(h))
 }

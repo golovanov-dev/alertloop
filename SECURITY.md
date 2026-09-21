@@ -53,12 +53,6 @@ such:
 - Publishing the API to the internet without TLS in front of it. AlertLoop
   serves plain HTTP by design and expects a reverse proxy — see
   `deploy/proxy/`.
-- The admin token in the `?token=` query parameter on the built-in pages. This
-  is a **known and consciously accepted** tradeoff, not an oversight: it is what
-  lets an event list be opened from a plain browser link. It risks exposure via
-  browser history and reverse-proxy access logs; `Referrer-Policy: no-referrer`
-  is set to stop it leaking onward via `Referer`. A cookie session is on the
-  roadmap. The admin console at `/admin` does not use the query parameter.
 - Denial of service from a client you have given a valid API key to. Rate
   limiting is built in and on by default, but a trusted key is trusted.
 - Findings from an automated scanner with no demonstrated impact.
@@ -68,22 +62,17 @@ such:
 These are deliberate, tested behaviours. A break in any of them **is** a
 vulnerability:
 
-- Secrets never reach logs, stored delivery errors, the API, or either web
-  interface. Telegram bot tokens and proxy passwords are redacted at every
+- Secrets never reach logs, stored delivery errors, the API, or the admin
+  console. Telegram bot tokens and proxy passwords are redacted at every
   boundary.
 - The admin token is compared in constant time.
 - Outbound webhooks are HMAC-SHA256 signed.
 - TLS verification cannot be disabled. There is no `--insecure`.
 - A configuration referencing an unset variable stops startup rather than
-  running with an empty setting — an empty `admin_token` would leave the API
-  open.
-- A config file that names no credential at all — neither `admin_token` nor
-  `api_keys` — stops startup in the modes that serve HTTP, instead of serving an
-  API that accepts every request with full scope. Running open is possible only
-  with no config file at all: a binary started without `--config` and without
-  `ALERTLOOP_CONFIG`, which then also listens on every interface. Container
-  images always ship a config file, so no container takes that path. Note that
-  the Compose `demo` profile falls back to a fixed admin token
+  running with an empty setting.
+- With no credential at all — neither `admin_token` nor `api_keys` — the modes
+  that serve HTTP do not start, with or without a config file. There is no
+  open, unauthenticated mode. Note that the Compose `demo` profile falls back to a fixed admin token
   (`change-me-admin`, in `docker-compose.yml`) when `.env` sets none: it is a
   credential and the API refuses requests without it, but it is published in
   this repository, so change it before that container is reachable by anyone

@@ -1,471 +1,305 @@
 # AlertLoop
 
 AlertLoop is a self-hosted event, incident, and business notification center for
-software teams and operations-heavy businesses.
-
-It helps applications send important technical incidents and business events into
-one reliable place, track their status, and deliver them through channels such as
-email, Telegram, and webhooks. Planned paid editions will add channels such as
-WhatsApp.
-
-## Product Direction
-
-AlertLoop starts as a self-hosted product. Cloud SaaS is intentionally deferred
-until the core product and market positioning are validated.
+software teams and operations-heavy businesses. Applications and monitors send
+events to one API; AlertLoop stores them, deduplicates them, routes them, and
+delivers them by email, Telegram, and webhooks.
 
 ## Editions
 
-- **Community** (this repository): free, self-hosted, backend API, Swagger/OpenAPI,
-  basic events list page, Email/Telegram/Webhook delivery, routing rules,
-  Telegram delivery through a proxy, delivery retries and dead-letter replay,
-  SQLite and PostgreSQL.
+- **Community** (this repository): free, self-hosted, AGPL-3.0-only.
 - **Pro Self-hosted** (planned, paid): multi-project, SDKs, WhatsApp, RBAC,
-  retention policies (per-project and per-event-type rules managed from the UI),
-  escalation policies.
+  retention policies, escalation policies.
 - **Enterprise** (planned, paid): on-prem license, SSO, HA, audit, custom
   adapters, support.
 
 ## Features (Community)
 
-- Events API with API-key auth and OpenAPI/Swagger.
-- Three event families: `incident`, `business_event`, `audit`.
-- Event lifecycle: `new`, `acknowledged`, `resolved`, `muted`, `escalated`
-  (with a manual `escalate` action).
-- Idempotent ingestion via `dedupe_key`.
-- [Incident lifecycle](#incident-lifecycle-firing-and-resolved): a monitoring
-  source reports `status: firing` while a problem lasts and `status: resolved`
-  when it ends; repeats update the open incident instead of notifying again, and
-  a recovery closes it automatically.
-- **Recovery notifications**: closing an incident tells the channels that were
-  told about it, with how long the outage lasted. On by default.
-- [Monit integration](integrations/monit/): watch processes, ports,
-  filesystems, load, workers, and cron jobs on a Linux host, and have every
-  finding become an incident that opens and closes on its own.
-- Delivery channels: Email (SMTP), Telegram, Webhook (HMAC-signed).
-- [Routing rules](#routing-rules): send each event to the channels that should
-  get it (by type, severity, source, or category), with a dry-run preview
-  endpoint.
-- [Telegram from a restricted network](#telegram-from-a-restricted-network): a
-  per-channel HTTP/SOCKS5 `proxy`, or an `api_base` mirror.
-- Delivery worker with retries, exponential backoff, dead-letter, and replay.
-- Delivery attempt history, separate from event state.
-- Three simple built-in web pages protected by an admin token: events list
-  (`/events`), event detail (`/events/{id}`), and deliveries (`/deliveries`) —
-  next to the richer React admin console at `/admin`.
-- Cursor-paginated list endpoints.
-- Structured logs (text or JSON) to stdout, optionally copied to a size-rotated
-  file at the same time.
-- Event retention with automatic cleanup (30 days by default, configurable via
-  `retention_days`).
-- Health probes under both names: `/health` and `/health/live`, `/ready` and
-  `/health/ready`.
+- Events API with scoped API keys (`ingest`, `read`, `full`) and OpenAPI/Swagger.
+- Event types `incident`, `business_event`, `audit`; states `new`,
+  `acknowledged`, `resolved`, `muted`, `escalated`.
+- Deduplication by `dedupe_key`, and an [incident lifecycle](#incident-lifecycle)
+  with automatic recovery notifications.
+- Email (SMTP), Telegram (optionally through a proxy), and HMAC-signed webhooks,
+  several of each.
+- [Routing rules](#routing-rules) by type, severity, source, and category.
+- Retries with backoff, dead-letter, and replay; retention cleanup (30 days).
+- Admin console at `/admin`, embedded in the binary.
+- SQLite (embedded) or PostgreSQL 12+.
+- [Monit integration](integrations/monit/) for Linux server monitoring.
 
-Operating it — backup and restore, upgrades, and runbooks for the failures that
-actually happen — is in [OPERATIONS.md](OPERATIONS.md). Reporting a
-vulnerability is in [SECURITY.md](SECURITY.md).
+Operating it — monitoring, logs, backup, upgrades, runbooks — is in
+[OPERATIONS.md](OPERATIONS.md). Reporting a vulnerability is in
+[SECURITY.md](SECURITY.md).
 
-## Requirements
+## Install and get the first message in Telegram
 
-- **Go**: 1.25 or newer — only to build from source. Release binaries are static
-  and need no runtime; there is no CGO dependency.
-- **SQLite**: nothing to install — it is embedded (pure-Go driver). This is the
-  default and needs no decision.
-- **PostgreSQL**, only if you choose it: 12 or newer (14+ recommended, tested on
-  16). Uses `JSONB`, partial indexes, and `FOR UPDATE SKIP LOCKED`.
-- **Docker** (optional): any recent Docker Engine with Compose v2 for the
-  container deployment path.
+Both paths below run on a Linux server: Docker Engine with Compose v2, or a
+prebuilt binary (linux/amd64, linux/arm64) under systemd. Both end with a
+message in a Telegram chat. You need:
 
-## Install
+- a bot token from [@BotFather](https://t.me/BotFather);
+- the chat id: send your bot a message (add it to the group for a group chat),
+  then run `curl -s https://api.telegram.org/bot<BOT_TOKEN>/getUpdates` and take
+  `chat.id` from the answer. Group ids start with `-`.
 
-There is **one** AlertLoop and **one** configuration file. What differs between
-the paths below is only how the process is supervised — and the database is a
-single line in that file, not a separate flavour of the product.
+### Docker Compose (PostgreSQL)
 
-Pick by what you are doing:
-
-| You want to… | Path | Database |
-|---|---|---|
-| see what it is, in a minute | Docker Compose demo | SQLite, thrown away with the volume |
-| run it on a server, no Docker | prebuilt binary + systemd | SQLite by default |
-| run it on a server, with Docker | Compose + PostgreSQL profile | PostgreSQL |
-| split API and workers | Compose + PostgreSQL profile | PostgreSQL (required) |
-
-### Try it (Docker Compose, SQLite)
+On the server, as a user who can run `docker`:
 
 ```bash
-cp .env.example .env      # presets COMPOSE_PROFILES=demo
+git clone https://github.com/golovanov-dev/alertloop.git && cd alertloop
+git checkout "$(git describe --tags --abbrev=0)"    # the latest release
+cp .env.example .env
+cp alertloop.example.yaml alertloop.yaml
+openssl rand -hex 32                                # run twice: two values for .env
+nano .env
+```
+
+In `.env`, set these three lines. Paste the output of `openssl rand -hex 32`, not
+the command: Compose does not run commands in `.env`.
+
+```dotenv
+COMPOSE_PROFILES=postgres
+ALERTLOOP_ADMIN_TOKEN=<first value>
+POSTGRES_PASSWORD=<second value>
+```
+
+In `alertloop.yaml`, add these lines directly under the existing `channels:`
+line (keep that line, do not add a second one). Write the bot token as a
+literal: under Compose a `${VAR}` of your own does not reach the container.
+
+```yaml
+  telegram:
+    - name: alerts
+      bot_token: "123456:ABC-DEF"      # from @BotFather
+      chat_id: "-1001234567890"
+```
+
+Start it and send a test event:
+
+```bash
 docker compose up -d --wait --wait-timeout 120
-```
-
-`--wait` makes Compose wait for the containers' health checks, and fail if they
-do not pass. Without it `up -d` reports success as soon as the containers exist,
-even if AlertLoop then fails to start and restarts in a loop.
-
-Both deployments live in the single `docker-compose.yml` at the repository root,
-selected by profile — `demo` here, `postgres` below. Switch by **editing**
-`COMPOSE_PROFILES` in `.env`, and do not pass `--profile`: for that one command
-the flag replaces the value in `.env`, so the command acts on a different
-deployment than every other one you run.
-
-The images are pulled from GHCR; nothing is built from the compose file.
-
-Then open:
-
-- Admin console: <http://localhost:8080/admin>
-- API docs: <http://localhost:8080/swagger>
-- Events page: <http://localhost:8080/events?token=change-me-admin> (admin token)
-
-Nothing is configured yet, so events are stored and delivered nowhere — which
-is a valid way to run. Add channels when you want notifications.
-
-### Run it on a server without Docker (binary + systemd)
-
-Download a release binary (linux/amd64, linux/arm64; darwin/windows for local
-evaluation) and give it a config file:
-
-```bash
-cp alertloop.example.yaml alertloop.yaml   # edit: channels, routing
-export ALERTLOOP_ADMIN_TOKEN="$(openssl rand -hex 32)"   # the file reads it from here
-./alertloop --config alertloop.yaml all
-```
-
-The listen address is the `addr` line in that file: change it if 8080 is already
-taken (`addr: ":9090"`), or to bind a single interface
-(`addr: "127.0.0.1:8080"`). Started with no config file at all, AlertLoop
-listens on **every** interface with its API open — see "Production notes".
-
-The example reads the admin token from `ALERTLOOP_ADMIN_TOKEN` and refuses to
-start without it, so the credential that opens the whole API never has to live
-in the file. Under systemd, `deploy/systemd/install.sh` puts it in an
-`EnvironmentFile` for you.
-
-`deploy/systemd/install.sh` turns that into a supervised service (unit file,
-`alertloop` user, `/etc/alertloop/alertloop.yaml`, `/var/lib/alertloop`). The
-binary is static and CGO-free, so there is nothing else to install — SQLite is
-embedded.
-
-### Run it on a server with Docker (PostgreSQL)
-
-```bash
-cp .env.example .env                        # then edit it:
-                                            #   COMPOSE_PROFILES=postgres
-                                            #   ALERTLOOP_ADMIN_TOKEN=<output of: openssl rand -hex 32>
-                                            #   POSTGRES_PASSWORD=<output of: openssl rand -hex 32>
-cp alertloop.example.yaml alertloop.yaml    # edit: channels, routing
-docker compose up -d --wait --wait-timeout 120
-```
-
-Paste the output of `openssl rand -hex 32` (run it twice, one value each), not
-the command: Compose does not run commands in `.env`, so `$(...)` there becomes
-the value itself.
-
-Create `alertloop.yaml` **before** starting. Docker creates a missing bind-mount
-source as a directory, and `up` then fails with its own error: "not a directory
-... Are you trying to mount a directory onto a file (or vice-versa)?"
-
-This profile runs the API and the delivery worker as separate containers against
-a PostgreSQL container, with **one** `alertloop.yaml` mounted into both — so the
-channel and routing configuration can never drift between them. The database
-driver and DSN reach that file from the environment, which is why the same
-example config serves this profile and a binary install.
-
-It refuses to start without `ALERTLOOP_ADMIN_TOKEN` and `POSTGRES_PASSWORD`
-rather than falling back to placeholders published in this repository. Pin
-`ALERTLOOP_IMAGE` to a version tag in production: `latest` moves under you on
-the next `docker compose pull`.
-
-Each AlertLoop container has a health check, visible in `docker compose ps`:
-the api probes `/health/ready`, and the worker, which serves no HTTP, runs
-`alertloop check-db`. That is what `--wait` waits for.
-
-If port 8080 on the host is taken, set `ALERTLOOP_PORT` in `.env`. It moves the
-host side of the mapping only, and it applies to both profiles.
-
-### Build from source
-
-```bash
-make run                 # build + run all-in-one on :8080 (SQLite)
-make test                # run the test suite
-```
-
-### Send your first event
-
-The API accepts your **admin token** (full access) or a scoped **API key**. For
-a quick test, use the admin token from your config:
-
-```bash
-curl -X POST http://localhost:8080/v1/events \
-  -H "X-API-Key: change-me-admin" \
+TOKEN="$(grep '^ALERTLOOP_ADMIN_TOKEN=' .env | cut -d= -f2-)"
+curl -X POST http://127.0.0.1:8080/v1/events -H "X-API-Key: $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{
-    "type": "incident",
-    "severity": "critical",
-    "source": "feeds_worker",
-    "message": "Feed processing failed",
-    "dedupe_key": "feeds:developer:15:flats"
-  }'
+  -d '{"type":"incident","severity":"critical","source":"test","message":"hello"}'
 ```
 
-For real integrations, create least-privilege **API keys** with a scope
-(`ingest` for event sources, `read` for dashboards, `full` for trusted tools) in
-the config file — see `alertloop.example.yaml`.
+The message arrives in Telegram within a few seconds. If it does not, see
+[Events arrive but nothing is delivered](OPERATIONS.md#events-arrive-but-nothing-is-delivered).
 
-### Incident lifecycle: `firing` and `resolved`
+- `--wait` fails when a container does not become healthy; `docker compose ps`
+  shows which one.
+- Switch profiles by editing `COMPOSE_PROFILES` in `.env`, not with `--profile`:
+  the flag replaces the value for that one command.
+- Port 8080 taken on the host: set `ALERTLOOP_PORT` in `.env`.
+- Pin the image in production: uncomment `ALERTLOOP_IMAGE` in `.env` and set the
+  release you run (`0.6.0`, without the `v`).
+- After editing `alertloop.yaml`, apply it with
+  `docker compose up -d --force-recreate --wait --wait-timeout 120 api worker`.
 
-A monitoring source does not send one-off notifications. It reports that a
-problem *is happening*, keeps reporting it while it lasts, and reports when it
-is over. Add `status` to say so:
+### Binary and systemd
+
+On the server, as a user with `sudo` (use `linux_arm64` on ARM):
 
 ```bash
-# The problem starts. Creates an incident and notifies. -> 201
-curl -X POST http://localhost:8080/v1/events \
+git clone https://github.com/golovanov-dev/alertloop.git && cd alertloop
+VERSION="$(git describe --tags --abbrev=0)" && git checkout "$VERSION"
+curl -fLO "https://github.com/golovanov-dev/alertloop/releases/download/$VERSION/alertloop_${VERSION}_linux_amd64"
+curl -fLO "https://github.com/golovanov-dev/alertloop/releases/download/$VERSION/checksums_${VERSION}.txt"
+sha256sum --ignore-missing -c "checksums_${VERSION}.txt"
+sudo bash deploy/systemd/install.sh "alertloop_${VERSION}_linux_amd64"
+sudo nano /etc/alertloop/alertloop.yaml      # add the Telegram channel shown above
+sudo systemctl enable --now alertloop
+TOKEN="$(sudo grep '^ALERTLOOP_ADMIN_TOKEN=' /etc/alertloop/alertloop.env | cut -d= -f2-)"
+curl -X POST http://127.0.0.1:8080/v1/events -H "X-API-Key: $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"type":"incident","severity":"critical","source":"test","message":"hello"}'
+```
+
+The installer creates the `alertloop` user, `/etc/alertloop/alertloop.yaml`,
+`/var/lib/alertloop` for the SQLite database, the systemd unit, and
+`/etc/alertloop/alertloop.env` with a generated admin token. Logs:
+`journalctl -u alertloop -f`.
+
+The binary listens on `:8080` on every interface. Change `addr` in the config
+(`addr: "127.0.0.1:8080"`) to keep it local behind a reverse proxy.
+
+### Try it without configuring anything
+
+In a fresh clone. Where you already set up `.env`, the demo is not for that
+directory: `-n` keeps your `.env`, and its `COMPOSE_PROFILES` would start your
+own profile instead.
+
+```bash
+cp -n .env.example .env   # COMPOSE_PROFILES=demo is preset
+docker compose up -d --wait --wait-timeout 120
+```
+
+One container on SQLite. Open <http://localhost:8080/admin> and sign in with
+`change-me-admin`. The demo takes no channels: it stores events and delivers
+nothing.
+
+## Admin console and HTTPS
+
+The admin console is at `/admin`, served by the same process as the API; sign
+in with the admin token. On a server, reach it through an HTTPS reverse proxy:
+both Compose profiles publish the port on `127.0.0.1` only.
+
+AlertLoop speaks plain HTTP. Put an HTTPS reverse proxy in front; one rule
+covers the API, `/admin`, and `/swagger`. Ready-to-adapt configs:
+`deploy/proxy/nginx.conf` and `deploy/proxy/apache.conf`, both forwarding to
+`127.0.0.1:8080`. Get a certificate with `certbot`.
+
+Behind the proxy, set `rate_limit.trusted_proxies` in the config, and rate limit
+on the proxy too. Under Compose the proxy arrives from the Compose network
+gateway, not `127.0.0.1`:
+
+```bash
+docker network inspect alertloop_default -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}'
+```
+
+## Sending events
+
+The API accepts the admin token (full access) or an API key. For each event
+source, create a key with the least scope it needs — `ingest` to send events,
+`read` for dashboards, `full` for trusted tools — under `api_keys` in the
+config (see `alertloop.example.yaml`). The full reference is Swagger UI at
+`/swagger`; the contract is `api/openapi.yaml`, also served at `/openapi.yaml`.
+
+### Incident lifecycle
+
+A monitoring source reports `status: firing` while a problem lasts and
+`status: resolved` when it ends:
+
+```bash
+# The problem starts: creates an incident and notifies. -> 201
+curl -X POST http://127.0.0.1:8080/v1/events \
   -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
   -d '{"status":"firing","type":"incident","severity":"critical","source":"monit",
        "message":"PostgreSQL does not respond on port 5432",
        "dedupe_key":"server-01:postgresql:availability"}'
 
-# Still broken, reported every minute. Updates the SAME incident with the newest
-# severity and message. No second incident, and nobody is notified again. -> 200
-# (identical request)
+# The same request again updates the same incident and notifies nobody. -> 200
 
-# Fixed. Closes the incident and records when. -> 200
-curl -X POST http://localhost:8080/v1/events \
+# Fixed: closes the incident and sends a recovery notice. -> 200
+curl -X POST http://127.0.0.1:8080/v1/events \
   -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
   -d '{"status":"resolved","dedupe_key":"server-01:postgresql:availability"}'
 ```
 
-Rules worth knowing:
-
-- **`dedupe_key` is the incident's identity.** Keep it stable for one logical
-  check — `host:service:check`. Never put a timestamp, a random id, a measured
-  value, or varying error text in it.
-- **Resolving frees the key.** The same failure happening again opens a *new*
-  incident and notifies again, which is what you want from a service that
-  flaps.
-- **A recovery only needs `dedupe_key`.** It identifies an incident to close; it
-  does not describe a new event.
-- **A recovery for something unknown is a success, not an error.** It returns
-  `204` when no event has ever carried that key — the source may be reporting a
-  recovery after retention removed the incident, or after restarting without
-  having seen the failure.
-- **Repeats do not re-notify.** Refreshing an incident creates no delivery
-  attempts. A check that fails every minute must not page anyone every minute.
-- **An acknowledged incident stays acknowledged** while it keeps firing.
-- **Closing an incident sends a recovery notice** to the channels that received
-  the alert, and to no others:
-
-  ```
-  [RESOLVED] PostgreSQL does not respond on port 5432
-    Key:      server-01:postgresql:availability
-    Started:  2026-08-22 03:14:07 UTC
-    Resolved: 2026-08-22 03:26:37 UTC
-    Duration: 12m30s
-  ```
-
-  Resolving is deliberately **not** re-routed: routing ran once at ingestion,
-  and the audience for "it is fixed" is the audience of "it is broken". A
-  channel whose alert dead-lettered is skipped — it never learned there was a
-  problem. Repeating a recovery does not notify twice. The manual resolve action
-  in the console notifies too. Turn it all off with `notify_on_resolve: false`.
-
-**Without `status`, nothing changes from earlier versions.** `dedupe_key` remains
-a plain idempotency key: a repeat returns the stored event untouched. The two
-readings of that field are now explicit rather than conflated.
+- `dedupe_key` is the incident's identity: keep it stable for one check
+  (`host:service:check`), with no timestamps, ids, or measured values in it.
+- After a resolve, the same failure opens a new incident and notifies again.
+- A resolve for a key AlertLoop has never seen returns `204`.
+- The recovery notice goes to the channels that received the alert and to no
+  others. Turn it off with `notify_on_resolve: false`.
+- Without `status`, `dedupe_key` is a plain idempotency key: a repeat returns the
+  stored event unchanged.
 
 ### Event state is not delivery state
 
-Two separate things, kept apart on purpose:
+Delivery state (`sent`, `failed`, `dead_letter`) says whether a message was
+delivered; see it per channel in the console or at `GET /v1/delivery-attempts`.
+Event state says whether anyone has dealt with the event, and it changes only
+when a person acts on it or a source sends `status: resolved`. A delivered event
+stays `new`; for a `business_event` or an `audit` entry that is the normal
+resting state.
 
-- **Delivery state** — `sent`, `failed`, `dead_letter` — answers *was the
-  message delivered*. Visible per channel in `/deliveries` and in
-  `GET /v1/delivery-attempts`.
-- **Event state** — `new`, `acknowledged`, `resolved`, `muted`, `escalated` —
-  answers *has anyone dealt with this*. Visible on the event itself.
+Do not send `status: firing` for a stream of business events under one
+`dedupe_key`: only the first one would notify. Send them without `status`, or
+give each its own `dedupe_key`.
 
-An event delivered to every channel stays `new`. That is not a stuck job:
-nothing moves an event's state by itself. It moves when a person acts on it
-(the buttons in `/admin`, or `POST /v1/events/{id}/ack|resolve|…`), or when a
-monitoring source closes an incident with `status: resolved` and the same
-`dedupe_key`.
+## Configuration
 
-**For a `business_event` or an `audit` entry, `new` is a normal resting state.**
-A submitted form, a completed order or an admin action is a fact, not a problem
-with an end; there is nothing to resolve. Use the state as a reading mark
-("taken care of") if it helps, or leave it — such events are removed by
-`retention_days` (30 by default, counted from the last time the event was seen)
-either way. The `firing → resolved` cycle exists for `incident`.
+One YAML file configures everything: `--config /path/to/alertloop.yaml` (or
+`ALERTLOOP_CONFIG`). `alertloop.example.yaml` lists every key there is; a key
+AlertLoop does not read stops the start, with its line.
 
-One consequence worth knowing before you build on it: **do not send
-`status: firing` for a stream of business events under one stable
-`dedupe_key`** such as `contact-form`. The first submission opens an event and
-notifies; every later one refreshes that same open event and creates no
-delivery, so notifications stop with no error anywhere. That behaviour is
-correct for a check that fails every minute and wrong for a queue of requests.
-Send business events without `status`, or give each one its own `dedupe_key`
-(the request id). The same applies to `audit` entries. AlertLoop logs a warning
-whenever `firing` arrives on a `business_event` or an `audit` event.
+A value written as exactly `${VAR}` or `${VAR:-default}` is taken from the
+environment at startup, to keep secrets out of the file:
 
-### Monitoring a Linux server
+- only a whole value is substituted; `${VAR}` inside a longer string stays as is;
+- an unset or empty variable without `:-default` stops the start;
+- the substituted text is data, not YAML.
 
-The [Monit integration](integrations/monit/) connects AlertLoop to Monit, which
-watches processes, ports, filesystems, memory, load, workers, and cron jobs:
+Under Compose only the variables `docker-compose.yml` passes reach the
+container: the admin token, the database settings, and the log file. Under
+systemd, put variables in `/etc/alertloop/alertloop.env`.
+
+`server` and `all` need `admin_token` or `api_keys` in the config file; without
+either they do not start, and without a config file they do not start either.
+
+### Channels
+
+No channels is a valid setup: events are stored and delivered nowhere. A channel
+with a missing required field stops the start. Email, Telegram, and webhook
+entries are shown in `alertloop.example.yaml`. SMTP needs `starttls: true`
+(port 587) or `tls: true` (port 465).
+
+A host that cannot reach `api.telegram.org` can use, per Telegram channel,
+either a `proxy` (`http`, `https`, `socks5`, `socks5h`) or an `api_base` Bot API
+mirror:
+
+```yaml
+    - name: alerts
+      bot_token: "123456:ABC-DEF"
+      chat_id: "-1001234567890"
+      proxy: "socks5://user:pass@127.0.0.1:1080"
+      # or: api_base: "https://tg-mirror.example.com"
+```
+
+MTProto proxies do not work for the Bot API. Without `proxy`, the standard
+`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` variables apply.
+
+### Routing rules
+
+Without a `routing` section every event goes to every channel. With one, each
+event goes to the channels of the **first** rule it matches:
+
+```yaml
+routing:
+  rules:
+    - name: incidents-to-dev
+      match:
+        type: [incident]
+        min_severity: warning
+      channels: [dev-telegram, dev-email]
+    - name: orders-to-customer
+      match:
+        type: [business_event]
+        category: ["order.*"]
+      channels: [customer-telegram]
+  default: [dev-telegram]       # events that matched no rule
+```
+
+| Field in `match` | Format |
+|---|---|
+| `type` | list of `incident`, `business_event`, `audit` |
+| `severity` | list of `info`, `success`, `warning`, `error`, `critical` |
+| `min_severity` | one level; matches it and above (`success` ranks with `info`) |
+| `source`, `category` | list; a trailing `*` is a prefix wildcard |
+
+Values in one field are OR-ed, fields are AND-ed, comparison ignores case.
+`channels: []` stores the event and delivers it nowhere. A rule naming an
+unknown channel stops the start. Without `default`, unmatched
+events are delivered nowhere and logged at `warn`. Check a rule set without
+creating anything:
 
 ```bash
-cd integrations/monit
-sudo ./install.sh --with-examples
+curl -X POST http://127.0.0.1:8080/v1/routing/preview \
+  -H "X-API-Key: $TOKEN" -H "Content-Type: application/json" \
+  -d '{"type":"business_event","source":"shop","category":"order.created"}'
 ```
 
-Monit detects; AlertLoop receives, deduplicates, routes, and delivers. AlertLoop
-does not grow its own server monitoring, and Monit runs on the host rather than
-in a container — it has to see host processes and real filesystems, and it has
-to be able to notice that Docker itself has died.
-
-It ships eleven example rules, `install`/`uninstall` scripts, wrappers for cron
-jobs and worker heartbeats, and a README that is explicit about what it cannot
-do. It is Community, like every inbound integration: what stays paid is the
-policy layer on top — escalation policies, on-call schedules, per-project
-routing.
-
-## Runtime Modes
-
-The single `alertloop` binary runs in three modes:
-
-- `server` — HTTP API and web UI.
-- `worker` — delivery workers and retention cleanup.
-- `all` — both in one process (default; ideal for small installs).
-
-`alertloop check-db` is not a mode but a one-shot check: it loads the config,
-connects to the database, and exits 0 if it answered. It migrates nothing and
-changes nothing in the database. It is the health check of the worker
-container. Outside Docker it needs what the service has: the same user, the
-variables the config references, and the working directory a relative SQLite
-path resolves against. For an install made by `deploy/systemd/install.sh`:
-
-```bash
-sudo -u alertloop sh -c 'cd /var/lib/alertloop && set -a &&
-  . /etc/alertloop/alertloop.env &&
-  exec /usr/local/bin/alertloop --config /etc/alertloop/alertloop.yaml check-db'
-```
-
-That reads `alertloop.env` as a shell file, which works for the plain
-`NAME=value` lines the installer writes; quote any value you add there that
-contains spaces.
-
-## Admin console
-
-AlertLoop ships a React admin console (Overview, Events, Event detail,
-Deliveries with dead-letter replay, About). **It is embedded in the binary** and
-served at `/admin` on the same origin as the API — nothing extra to install or
-run. With either deployment path you simply open `/admin` — but *where* it is
-reachable from differs, because the two paths bind the port differently:
-
-- **Local (either path)**: <http://localhost:8080/admin>.
-- **Binary / systemd on a server**: AlertLoop listens on `:8080` on all
-  interfaces, so it is also reachable at `http://<server-ip>:8080/admin`.
-- **Docker Compose on a server**: both profiles publish the port on `127.0.0.1`
-  only, so `http://<server-ip>:8080/admin` is refused **by design** — a published
-  Docker port is not filtered by a host firewall such as ufw, so binding
-  `0.0.0.0` would silently expose the console. Reach it through the reverse
-  proxy in `deploy/proxy/`, through an SSH tunnel
-  (`ssh -L 8080:127.0.0.1:8080 user@server`, then use the Local URL above), or by
-  deliberately publishing it on all interfaces if you accept the exposure — in a
-  `docker-compose.override.yml`, with `ports: !override` and `- "8080:8080"`
-  under the service. The `!override` tag (Compose v2.24+) is required: without
-  it Compose adds your entry to the existing list instead of replacing it.
-
-For a real domain with HTTPS (the recommended setup for either path), see
-[Access over a domain](#access-over-a-domain-https).
-
-Sign in with the **admin token** from your config (there are no user accounts in
-Community). The token is kept in the browser's session storage and sent to the
-API. Because the console is same-origin with the API, it works at any host or
-domain with no rebuild and no CORS configuration.
-
-The console has a light responsive layout: on phones the sidebar collapses into
-a menu and wide tables scroll horizontally. A full mobile experience is not a
-Community goal — use a desktop browser for day-to-day work.
-
-### Developing the console
-
-```bash
-cd web/admin
-npm install
-npm run dev        # http://localhost:5273, proxies /v1 to localhost:8080
-```
-
-Build it into the binary with `make admin` (outputs to `internal/adminui/dist`,
-which the Go build embeds). The Docker image build does this automatically, so
-`go build` and `docker build` both produce a binary/image with the console
-already inside.
-
-## Access over a domain (HTTPS)
-
-Where AlertLoop is reachable before you add a proxy depends on how you run it:
-
-- **Binary / systemd**: the process listens on `:8080` on all interfaces, so on a
-  server it is reachable at `http://<server-ip>:8080` (restrict it with your host
-  firewall, or bind it to loopback with `addr: "127.0.0.1:8080"`).
-- **Docker Compose**: both profiles publish the port as `127.0.0.1:8080:8080`
-  (the host side is `ALERTLOOP_PORT` from `.env`, 8080 by default), so the
-  container is reachable from the host only. That is deliberate: a published
-  Docker port is not filtered by ufw/firewalld, so binding `0.0.0.0` would put
-  the admin console on the public internet without the host firewall noticing.
-
-Either way, for a real domain put an HTTPS reverse proxy in front — AlertLoop
-itself speaks plain HTTP and does not terminate TLS. Since the API, admin
-console, and Swagger are all one origin, a single proxy rule covers everything:
-
-```text
-[browser] --HTTPS--> [nginx/Apache :443] --HTTP--> [alertloop 127.0.0.1:8080]
-```
-
-Then everything is on your domain, same-origin, no CORS:
-
-- `https://alerts.example.com/admin` — admin console
-- `https://alerts.example.com/v1/...` — API
-- `https://alerts.example.com/swagger` — API docs
-
-Ready-to-adapt configs are in `deploy/proxy/`:
-
-- **nginx** — `deploy/proxy/nginx.conf`
-- **Apache** — `deploy/proxy/apache.conf`
-
-Both redirect HTTP→HTTPS and forward to `127.0.0.1:8080` — which is exactly what
-the Compose port mapping publishes, so the proxy path needs no Compose changes.
-Get a certificate with Let's Encrypt (`certbot`). HTTPS is required in
-production — the admin token travels with each request and must not go over
-plaintext HTTP.
+`GET /v1/routing` returns the table in effect.
 
 ## Database
 
-The database is **one line of configuration**, not a different edition of the
-product. Both drivers run the same code, the same migrations, and the same
-queue; they differ in what they let you do around it.
-
-**SQLite** — the default. Nothing to install: it is embedded (pure Go, no CGO),
-and AlertLoop creates the file and its tables on first run. Right for a
-single-host install, which is most installs. `:memory:` works for throwaway runs.
-
-```yaml
-database:
-  driver: sqlite
-  dsn: alertloop.db
-```
-
-**PostgreSQL** — when you need what SQLite cannot give: the API and the delivery
-worker as separate processes (they share the queue through the database), a
-database you already operate and back up, or room to grow.
-
-```yaml
-database:
-  driver: postgres
-  dsn: "postgres://USER:PASSWORD@HOST:5432/alertloop?sslmode=require"
-```
-
-In the URL form, a password containing `/`, `?`, `#`, `@`, `%` or a space has
-to be percent-encoded (`/` as `%2F`, `@` as `%40`), or the URL does not parse.
-The keyword/value form needs no encoding, and it is what the Compose postgres
-profile uses:
+SQLite is the default and needs nothing installed; AlertLoop creates the file.
+PostgreSQL is for running `server` and `worker` as separate processes or for a
+database you already operate:
 
 ```yaml
 database:
@@ -473,378 +307,67 @@ database:
   dsn: "host=HOST port=5432 user=USER dbname=alertloop sslmode=require password=PASSWORD"
 ```
 
-A value there that contains a space or a backslash, or starts with a single
-quote, goes in single quotes, with `'` and `\` inside it written as `\'` and
-`\\`. A DSN AlertLoop
-cannot parse stops it at startup with a message that says which form was
-expected; the message never repeats the DSN, because the DSN holds the password.
+In this form a value that contains a space or a backslash, or starts with a
+single quote, goes in single quotes, with `'` and `\` inside it written as `\'`
+and `\\`.
 
-The DSN carries a password, so it is a good candidate for `${VAR}` — see
-[Configuration](#configuration). Use `sslmode=require` for a remote database;
-`sslmode=disable` only on a local or private-network Postgres.
-
-AlertLoop connects to an **existing database** and creates only its own tables
-(`events`, `delivery_attempts`, `schema_migrations`) through migrations that run
-at startup. **It does not create the database itself** — create it once, owned
-by the user in your DSN:
+The URL form `postgres://USER:PASSWORD@HOST:5432/alertloop?sslmode=require`
+works too; percent-encode `/ ? # @ % space` in its password. Use
+`sslmode=require` for a remote database. AlertLoop creates
+its tables (`events`, `delivery_attempts`, `schema_migrations`) but not the
+database:
 
 ```bash
 createdb -U postgres -O USER alertloop
-#   or:  psql -U postgres -c "CREATE DATABASE alertloop OWNER USER;"
 ```
 
-From PostgreSQL 15 on, only the database owner can create tables in its
-`public` schema by default, so for any other user the migrations fail at
-startup.
-
-Sharing that database with another application is fine: AlertLoop never touches
-tables that are not its own. If the database belongs to another user, grant
-AlertLoop's user the right to create tables there:
+In a database owned by someone else, grant the right to create tables:
 `psql -U postgres -d DBNAME -c "GRANT CREATE ON SCHEMA public TO USER;"`.
-Just make sure nothing else owns tables named `events`, `delivery_attempts`, or
-`schema_migrations`. (A configurable table prefix is on the roadmap for shared
-databases.)
-
-Switching later means changing those two lines and starting with an empty
-history: there is no migration path between the two engines, and event history
-is not carried over.
+There is no migration between SQLite and PostgreSQL.
 
 ## Logs
 
-AlertLoop writes structured logs to **stdout**. Set `log.file` to write them to
-a file as well — stdout keeps working either way, so `docker compose logs`,
-journald and log shippers are never silenced by turning a file on.
+Logs go to stdout: `journalctl -u alertloop -f` under systemd,
+`docker compose logs -f` under Compose. `log.file` adds a copy in a file, which
+you rotate with logrotate; `log.format: json` suits log collectors. Log files and
+rotation: [Reading AlertLoop's own logs](OPERATIONS.md#reading-alertloops-own-logs).
 
-```yaml
-log:
-  level: "info"     # debug | info | warn | error
-  format: "text"    # text (human-readable) | json (for Loki/Elasticsearch/Vector)
-  file: ${ALERTLOOP_LOG_FILE:-}   # empty = stdout only; a path adds a copy on disk
-  max_size_mb: 50   # rotate the file to <file>.1 at this size; 0 disables rotation
-  max_files: 5      # rotated files kept besides the active one
-```
+## Runtime modes
 
-`file` is written as a reference, exactly as in `alertloop.example.yaml`, and
-that form matters under Compose: the api and the worker share one config file,
-so the only way to give them separate logs is for the path to come from the
-environment (`ALERTLOOP_LOG_FILE_API` / `ALERTLOOP_LOG_FILE_WORKER`). With the
-variable unset or empty it is the same as `file: ""`. A plain `file: "/path/to.log"`
-works fine for a single process — but then the variable configures nothing, and
-AlertLoop says so at startup rather than pretending otherwise.
+`alertloop [--config FILE] MODE`:
 
-The file is rotated by AlertLoop itself: at `max_size_mb` the active file
-becomes `<file>.1`, older generations shift up, and anything past `max_files` is
-deleted. Disk use is bounded by `max_size_mb × (max_files + 1)` — 300 MB with
-the values above. Set `max_size_mb: 0` if logrotate or a shipping agent handles
-the file instead. The directory is created if it does not exist; AlertLoop must
-be able to write to it, and fails at startup saying so if it cannot. If a
-rotation fails later, logging continues and the reason is printed once on
-stderr.
+- `all` — API and delivery worker in one process (default);
+- `server` — HTTP API and admin console;
+- `worker` — delivery and retention cleanup;
+- `check-db` — load the config, ping the database, exit 0 if it answered.
 
-How to read logs by deployment:
+With `server` and `worker` separate, both must load the same config file and run
+the same version. The Compose postgres profile mounts one `alertloop.yaml` into
+both.
 
-- **Binary (stdout)**: run in a terminal, or redirect: `./alertloop all >> alertloop.log 2>&1`.
-- **Binary (file)**: set `log.file` and read it with any tool:
-  `tail -f /var/log/alertloop/alertloop.log`.
-- **systemd**: logs go to the journal — `journalctl -u alertloop -f`. Set
-  `format: json` for machine-readable output that log shippers can parse.
-- **Docker**: `docker compose logs -f alertloop` (or `docker logs`). To get
-  ordinary files on the host instead, see
-  [Reading AlertLoop's own logs](OPERATIONS.md#reading-alertloops-own-logs) in
-  OPERATIONS.md — the Compose file has a `./logs` mount and a per-service
-  `ALERTLOOP_LOG_FILE_*` variable for it.
-
-Give each process its own file when you run `server` and `worker` separately:
-two processes appending to and rotating one file cut each other's history short.
-
-For centralized logging, set `format: json` and point your log collector at the
-file or the container's stdout.
-
-## Configuration
-
-**One YAML file configures everything**, on top of built-in defaults. Point the
-binary at it with `--config /path/to/alertloop.yaml` (or `ALERTLOOP_CONFIG`).
-See `alertloop.example.yaml` for the full list of settings.
-
-**A file containing a key AlertLoop does not read does not start.** The load
-stops and lists each one with its line and the spelling that was probably
-meant — a setting nobody reads is a setting the operator believes is in effect.
-`alertloop.example.yaml` shows every key there is, commented-out examples
-included, so it is also the file to check yours against. Note that a setting
-written as a path on one line (`log.level: debug`) is such a key: YAML reads it
-as a single name, so write one key per line, nested.
-
-The environment is not a second place to configure AlertLoop — it exists to keep
-secrets out of the file. Any value written as exactly `${VAR}` or
-`${VAR:-default}` is replaced from the environment at startup:
-
-```yaml
-admin_token: ${ALERTLOOP_ADMIN_TOKEN}
-channels:
-  telegram:
-    - name: alerts
-      bot_token: ${TELEGRAM_BOT_TOKEN}
-      chat_id: "-1001234567890"
-database:
-  dsn: ${ALERTLOOP_DB_DSN:-alertloop.db}
-```
-
-Under Compose, only the variables `docker-compose.yml` passes to the container
-arrive there — the admin token, the database, the log file. A `${VAR}` of your
-own, such as `${TELEGRAM_BOT_TOKEN}` above, stays unset inside the container and
-stops the start; write that value in the file instead, or add the variable to
-the service in `docker-compose.yml`.
-
-Rules, and there are only three:
-
-- **The whole value, or nothing.** `${VAR}` inside a longer string is left
-  alone — that way a password containing a literal `$` is never mangled.
-- **A variable that is unset *or empty* stops the process**, unless the
-  reference carries a `:-default`. An empty `admin_token` caused by a typo in a
-  variable name would leave the API open, so it is refused instead; the message
-  names the field, the variable and the line. `admin_token` is also the one
-  field for which a `:-default` is never the answer — give it a real value.
-- **The substituted text is data, not YAML.** A password containing `: ` or `#`
-  stays a password.
-
-Everything else — channels, API keys, routing, worker and rate-limit tuning —
-lives in the file only.
-
-> **Upgrading from 0.2.x:** the `ALERTLOOP_ADDR`, `ALERTLOOP_DB_DSN`,
-> `ALERTLOOP_LOG_*`, `ALERTLOOP_WORKER_*`, and related variables no longer
-> configure anything. If one is still set and the config file does not set the
-> same field, AlertLoop **refuses to start**, naming the variable and the
-> setting that replaced it — ignoring them could leave a process running on a
-> database its operator did not choose. If the file does set that field, the
-> file wins and
-> startup only warns that the variable configures nothing.
-
-### Delivery channels are optional
-
-You can run AlertLoop **with no channels configured** — it will accept and store
-events (visible in the API and at `/admin`) and simply deliver nothing. This is
-the default in the example configs, so the app starts out of the box. To send
-notifications, configure one or more channels (email/telegram/webhook) in the
-YAML file. If you enable a channel you must fill in all of its required fields,
-or startup fails with a clear message (this catches typos like a missing
-`bot_token`).
-
-With no `routing` section configured, every event is delivered to **every**
-configured channel. To split events between audiences, see
-[Routing rules](#routing-rules).
-
-### Routing rules
-
-One AlertLoop instance usually serves more than one audience: the customer who
-only wants orders, and the developer who also wants the technical failures. The
-optional `routing` section decides which channels each event goes to.
-
-```yaml
-routing:
-  # Rules are checked top to bottom; the FIRST match wins.
-  rules:
-    - name: silence-healthchecks
-      match:
-        source: [healthcheck]
-      channels: []              # explicit "nowhere": stored, never delivered
-
-    - name: incidents-to-dev
-      match:
-        type: [incident]
-      channels: [dev-telegram, dev-email]
-
-    - name: orders-to-customer
-      match:
-        type: [business_event]
-        category: ["order.*"]
-      channels: [customer-telegram]
-
-  # Where events that matched no rule go.
-  default: [dev-telegram]
-```
-
-Conditions inside `match`:
-
-| Field | Matches | Format |
-|---|---|---|
-| `type` | event family | list of `incident`, `business_event`, `audit` |
-| `severity` | severity | list of `info`, `success`, `warning`, `error`, `critical` |
-| `min_severity` | severity | one value; matches that level and above |
-| `source` | event source | list; a trailing `*` is a prefix wildcard |
-| `category` | event category | list; a trailing `*` is a prefix wildcard |
-
-Rules of the road:
-
-- Values inside one field are OR-ed; different fields are AND-ed. An omitted
-  field constrains nothing, and a rule with no `match` at all is a catch-all.
-- Comparison ignores case and surrounding whitespace.
-- Only a **trailing** `*` is supported, and only for `source` and `category`:
-  `order.*` matches `order.created`. A `*` anywhere else is a configuration
-  error — there are no regular expressions.
-- `min_severity` ranks are `info` = 10, `success` = 10, `warning` = 20,
-  `error` = 30, `critical` = 40. `success` deliberately shares `info`'s rank:
-  this is an order of **alarm**, not of importance, and a successful outcome is
-  not more alarming than a notice.
-- **The first matching rule wins** and later rules are not consulted. Channel
-  lists from several rules are never merged — at three in the morning,
-  predictability beats expressiveness.
-- `channels: []` is deliberate suppression: the event is stored (and visible in
-  the API and the console) but nothing is delivered.
-- `default` applies **only** when no rule matched. Without it, unmatched events
-  are delivered nowhere and each one is logged at `warn` level with its id,
-  type, severity, source, and category.
-
-The startup log prints the resolved table, plus warnings for the two mistakes
-that are otherwise invisible: rules that can never match because a catch-all
-sits above them, and configured channels that no rule and no default sends to.
-A rule naming a channel that does not exist stops the process.
-
-To check rules against a live instance without raising a false incident, use the
-preview endpoint (`full` scope, creates nothing):
+## Monitoring a Linux server
 
 ```bash
-curl -X POST http://localhost:8080/v1/routing/preview \
-  -H "X-API-Key: change-me-admin" -H "Content-Type: application/json" \
-  -d '{"type":"business_event","source":"shop","category":"order.created"}'
-# {"matched_rule":"orders-to-customer","channels":["customer-telegram"]}
+cd integrations/monit
+sudo ./install.sh --with-examples
 ```
 
-`GET /v1/routing` returns the whole table as it took effect.
-
-**Omitting the `routing` section keeps the pre-0.2.0 behavior**: every event goes
-to every configured channel. Upgrading from 0.1.1 needs no configuration change.
-
-### Telegram from a restricted network
-
-Some hosts cannot reach `api.telegram.org` directly. Two independent ways out,
-both per channel:
-
-```yaml
-channels:
-  telegram:
-    - name: dev-alerts
-      bot_token: "123456:ABC-DEF"
-      chat_id: "-1001234567890"
-      proxy: "socks5://user:pass@127.0.0.1:1080"   # or http://, https://
-    - name: customer-alerts
-      bot_token: "123456:ABC-DEF"
-      chat_id: "-1009876543210"
-      api_base: "https://tg-mirror.example.com"    # a trusted Bot API mirror
-```
-
-- **`proxy`** — when you have your own HTTP or SOCKS5 proxy and the traffic
-  should go through it. Supported schemes: `http`, `https`, `socks5`, and
-  `socks5h`. Anything else stops the process at startup with a clear message,
-  rather than quietly sending nothing.
-- **`api_base`** — when you have a trusted mirror or reverse proxy in front of
-  the Bot API.
-
-Notes:
-
-- **MTProto proxies do not work for the Bot API.** They speak Telegram's client
-  protocol, not HTTP; pointing `proxy` at one produces an obscure network error.
-  Use an HTTP/SOCKS5 proxy or a mirror instead.
-- `socks5` and `socks5h` behave **identically** here, and the difference people
-  expect does not apply: Go's HTTP transport sends the target **host name** to
-  the proxy (SOCKS5 address type `0x03`), so the **proxy resolves DNS**, not
-  AlertLoop. Verified by a test with a local SOCKS5 server
-  (`TestTelegramSendsThroughSOCKS5Proxy`), not by assumption.
-- The setting is per channel, not per process, so a Telegram channel can use a
-  proxy while a webhook into your internal network stays direct.
-- With `proxy` unset, the process-wide `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY`
-  variables keep working exactly as before.
-- Credentials in the proxy URL are supported, and the password is redacted from
-  logs, delivery errors, the API, and the console — as the bot token already is.
-- There is no way to disable TLS verification, by design.
-- A proxy for the email and webhook channels is not implemented.
-
-### Split deployments (separate server + worker)
-
-The channel configuration is used by **both** roles: the `server` decides which
-delivery jobs to create when an event arrives, and the `worker` performs the
-actual sending. **Both processes must load the same channel configuration** — if
-the server has no channels, no delivery jobs are created and nothing is ever
-sent (it will log a prominent warning at startup).
-
-The PostgreSQL Compose profile does this correctly by mounting a **single**
-`alertloop.yaml` into both the api and worker containers — one source of truth,
-no drift. To use it:
-
-```bash
-cp alertloop.example.yaml alertloop.yaml    # api_keys & channels optional
-COMPOSE_PROFILES=postgres docker compose up -d --wait --wait-timeout 120
-```
-
-The single-process `all` mode has no such split and needs no special handling.
-
-## API
-
-The OpenAPI contract lives at `api/openapi.yaml` and is served live at
-`/openapi.yaml`, with Swagger UI at `/swagger`.
-
-Documentation lives in two places today: this README (installation, deployment,
-configuration, operations) and the interactive Swagger UI at `/swagger` on a
-running instance (the full endpoint reference, request/response schemas, and
-examples).
-
-## Releases and building
-
-**Download a prebuilt binary** for your OS/arch from the repository's GitHub
-**Releases** page — pick `linux_amd64`, `linux_arm64`, `darwin_arm64`,
-`windows_amd64`, etc., unpack, and run. Each release also ships a
-`checksums_*.txt` to verify the download.
-
-You do **not** need a Windows machine to get a Windows binary (or a Mac for a Mac
-binary). AlertLoop is CGO-free (pure-Go SQLite), so it **cross-compiles** — a
-single build machine produces every OS/arch at once. Releases are built
-automatically by CI when a version tag is pushed (`.github/workflows/release.yml`),
-which builds the admin UI, cross-compiles all targets, and uploads them to the
-GitHub Release.
-
-To build the release artifacts yourself:
-
-```bash
-make admin                 # build the embedded admin UI (needs Node)
-make release               # cross-compile all targets into dist/
-#   equivalently: VERSION=v0.1.0 ./scripts/build-release.sh
-```
-
-For a single local binary for your own machine, just `make build` (Go only).
+Monit watches processes, ports, filesystems, load, workers, and cron jobs; each
+finding becomes an incident that opens and closes by itself. Details:
+[integrations/monit/README.md](integrations/monit/README.md).
 
 ## Production notes
 
-- **A config file must carry a credential.** If it sets neither `admin_token`
-  nor `api_keys`, AlertLoop **refuses to start** and says which to add: the API
-  would otherwise accept unauthenticated requests with **full** scope, and an
-  open instance looks exactly like a working one. The check applies to the modes
-  that serve HTTP (`server`, and `all`, the default); a `worker` has no listener
-  and is not stopped over a credential it never uses. Running with neither is
-  left open when there is no config file at all (no `--config` and no
-  `ALERTLOOP_CONFIG`) — the binary on built-in defaults, which logs a warning at
-  startup and listens on **every interface**, so do not leave it that way on a
-  shared host. Every container image ships a config file, so this is not the
-  container case.
-- **TLS**: AlertLoop serves plain HTTP and is designed to run **behind an
-  HTTPS reverse proxy** (nginx, Caddy, Traefik). Terminate TLS there and forward
-  to the container/port.
-- **External PostgreSQL**: use `sslmode=require` (or stricter) in the DSN. The
-  bundled Compose Postgres uses `sslmode=disable` only because it is on a private
-  Docker network.
-- **Rate limiting** is on by default (`rate_limit` in the config). Behind a
-  reverse proxy it needs `rate_limit.trusted_proxies`, and the proxy should rate
-  limit too: the two are complementary, not alternatives (see
-  `deploy/proxy/nginx.conf`).
-- **SMTP**: set `starttls: true` (required upgrade, port 587) or `tls: true`
-  (implicit TLS / SMTPS, port 465). AlertLoop will not send mail in plaintext
-  when TLS is requested but unavailable.
-- **Secrets**: never commit real `alertloop.yaml` / `.env` (they are gitignored);
-  keep the `*.example` templates only.
-- **Monitor AlertLoop itself**: alert on `deliveries.dead_letter` from
-  `/v1/stats`, and check `/health/ready` from *outside* this host — a service
-  that is down cannot report that it is down. See
-  [OPERATIONS.md](OPERATIONS.md).
-- **Back up before upgrading**: migrations run automatically at startup and are
-  not reversible in place. Downgrading is not supported; restoring a backup is.
+- Serve it over HTTPS: the admin token travels with each request.
+- Alert on `deliveries.dead_letter` from `/v1/stats`, and check `/health/ready`
+  from another host: see [OPERATIONS.md](OPERATIONS.md).
+- Back up before upgrading: migrations run at startup, and downgrading is not
+  supported.
+
+## Contributing
+
+Building from source, the admin console, and release builds are in
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

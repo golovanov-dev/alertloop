@@ -81,16 +81,16 @@ type EventStore interface {
 // queue.
 type DeliveryStore interface {
 	CreateDeliveryAttempt(ctx context.Context, d *domain.DeliveryAttempt) error
-	// AlertedChannels lists the channels that received, or are still going to
-	// receive, the alert for eventID. Dead-lettered attempts are excluded: that
-	// channel never saw the problem, so it has no recovery to be told about.
-	// This is the audience for a recovery notice.
+	// AlertedChannels lists the channels an alert for eventID was queued to,
+	// whatever its state, dead_letter included. This is the audience for a
+	// recovery notice; ClaimDue holds each recovery until its alert is sent.
 	AlertedChannels(ctx context.Context, eventID string) ([]domain.ChannelTarget, error)
 	GetDeliveryAttempt(ctx context.Context, id string) (*domain.DeliveryAttempt, error)
 	ListDeliveryAttempts(ctx context.Context, f DeliveryFilter, limit int, cursor string) (Page[domain.DeliveryAttempt], error)
 	// ClaimDue atomically claims up to limit deliverable attempts (pending or
 	// failed with next_retry_at due), transitioning them to `sending`, and
-	// returns them. Concurrent workers never claim the same row.
+	// returns them. Concurrent workers never claim the same row. A recovery is
+	// held back until the alert of its event to its channel is sent.
 	ClaimDue(ctx context.Context, now time.Time, limit int) ([]domain.DeliveryAttempt, error)
 	// MarkResult records the outcome of a delivery attempt. On success state
 	// becomes `sent`; otherwise it becomes `failed` (with next_retry_at set) or
@@ -106,10 +106,6 @@ type DeliveryStore interface {
 	RequeueStuckSending(ctx context.Context, staleBefore time.Time) (int64, error)
 	// DeleteDeliveryAttemptsBefore removes attempts created before cutoff.
 	DeleteDeliveryAttemptsBefore(ctx context.Context, cutoff time.Time) (int64, error)
-	// ActiveChannelNames returns the distinct channel names among attempts that
-	// still need delivery (pending/failed/sending). Used at startup to warn about
-	// undeliverable jobs whose channel is no longer configured.
-	ActiveChannelNames(ctx context.Context) ([]string, error)
 	// CountDeliveriesByState returns the number of delivery attempts in each
 	// delivery state.
 	CountDeliveriesByState(ctx context.Context) (map[string]int64, error)

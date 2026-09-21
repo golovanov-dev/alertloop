@@ -96,44 +96,32 @@ func New(ctx context.Context, cfg config.Config, version string, log *slog.Logge
 			"jobs to create; the worker sends them).")
 	}
 	app.logRoutingTable()
-	app.warnOrphanedDeliveries(ctx)
 	return app, nil
 }
 
-// RequireCredential refuses to start an instance that would SERVE with a config
-// file naming no credential at all: no admin_token and no api_keys.
-//
-// The API is open with full scope when neither is configured — deliberately, so
-// that a binary started with nothing at all is something a newcomer can try. A
-// config FILE is the other case: someone wrote down what this installation is,
-// and "answers every request from anyone who can reach it" is not something
-// people write down. It is what they get from `admin_token: ""`, from a
-// reference whose fallback resolved to nothing, or from deleting the line while
-// editing — and nothing about the running service shows it, because every
-// request simply succeeds.
+// RequireCredential refuses to start an instance that would SERVE with no
+// credential at all: no admin_token and no api_keys, whether or not a config
+// file was given. Such an instance would answer every request from anyone who
+// can reach it, and nothing about it looks different from a working one.
 //
 // The mode decides, because the requirement is about serving HTTP: a worker has
-// no listener, and refusing to run one over a credential it never uses would be
-// a false alarm in a split deployment. Called by the entry point before storage
-// is opened, so the mistake costs nothing but the message.
+// no listener, and refusing to run one over a credential it never uses would
+// stop a split deployment for no reason. Called by the entry point before
+// storage is opened.
 //
-// The message names the file and the two settings and stops there: it prints
-// no line to copy. A line printed in an error is a line someone pastes, and
-// both ways that goes wrong are ones this product has already paid for: prose
-// next to a ${VAR} reference becomes part of the token, and a flow mapping
-// holding one does not parse. It points at no other file either: the shipped
-// example is named alertloop.example.yaml in the source tree only, and the file
-// an installed AlertLoop reads is the one the message already names.
+// The message prints no config line to copy: prose pasted next to a ${VAR}
+// reference becomes part of the token.
 func RequireCredential(cfg config.Config, mode string) error {
 	if !modeServesHTTP(mode) {
 		return nil
 	}
-	if cfg.SourceFile == "" || cfg.AdminToken != "" || len(cfg.APIKeys) > 0 {
+	if cfg.AdminToken != "" || len(cfg.APIKeys) > 0 {
 		return nil
 	}
-	return fmt.Errorf("config file %s sets neither admin_token nor api_keys: the JSON API and the admin "+
-		"console would accept every request from anyone who can reach this process, with full access.\n"+
-		"Set admin_token or api_keys in that file.", cfg.SourceFile)
+	return fmt.Errorf("neither admin_token nor api_keys is set: the JSON API and the admin console " +
+		"would accept every request from anyone who can reach this process.\n" +
+		"Set admin_token or api_keys in the config file passed with --config (or named by ALERTLOOP_CONFIG). " +
+		"An exported environment variable counts only where that file references it")
 }
 
 // modeServesHTTP reports whether a CLI mode puts an HTTP listener on the
@@ -220,32 +208,6 @@ func describeMatch(m routing.MatchView) string {
 	return strings.Join(parts, " ")
 }
 
-// warnOrphanedDeliveries logs a warning if the store has undelivered attempts
-// whose channel name is not in the current config (e.g. a channel was renamed
-// or removed) — those attempts cannot be delivered and will dead-letter.
-func (a *App) warnOrphanedDeliveries(ctx context.Context) {
-	names, err := a.store.ActiveChannelNames(ctx)
-	if err != nil {
-		a.log.Warn("could not check for orphaned deliveries", "error", err)
-		return
-	}
-	known := map[string]bool{}
-	for _, t := range a.registry.Targets() {
-		known[t.Name] = true
-	}
-	var orphaned []string
-	for _, n := range names {
-		if !known[n] {
-			orphaned = append(orphaned, n)
-		}
-	}
-	if len(orphaned) > 0 {
-		a.log.Warn("undelivered attempts reference channels not in the current config; "+
-			"they will dead-letter until the channels are restored",
-			"orphaned_channels", orphaned)
-	}
-}
-
 // Close releases the App's resources.
 func (a *App) Close() error { return a.store.Close() }
 
@@ -291,19 +253,6 @@ func buildRegistry(c config.Channels) (*channels.Registry, error) {
 
 // RunServer starts the HTTP server and blocks until ctx is cancelled.
 func (a *App) RunServer(ctx context.Context) error {
-	// Here rather than in New, because it is about a listener: a worker built
-	// from the same config has none, and told an operator its non-existent API
-	// was open to anyone — in the same output where the api container was
-	// refusing to start for exactly that reason. Both empty, not either:
-	// apiKeyAuth opens the API only when there is neither a key nor an admin
-	// token, and warning about a configuration that HAS one trains operators to
-	// ignore the message, and then they ignore the real one. With a config file
-	// this state does not get here at all (RequireCredential); what remains is
-	// a process started with no config file.
-	if len(a.cfg.APIKeys) == 0 && a.cfg.AdminToken == "" {
-		a.log.Warn("no API keys configured — the JSON API is open to anyone who can reach it")
-	}
-
 	keyScopes := make(map[string]string, len(a.cfg.APIKeys))
 	for _, k := range a.cfg.APIKeys {
 		keyScopes[k.Key] = k.Scope
@@ -327,7 +276,6 @@ func (a *App) RunServer(ctx context.Context) error {
 		AdminToken:     a.cfg.AdminToken,
 		Version:        a.version,
 		RateLimit:      a.cfg.RateLimit,
-		CORSOrigins:    a.cfg.CORSOrigins,
 		TrustedProxies: trusted,
 		Logger:         a.log,
 	})

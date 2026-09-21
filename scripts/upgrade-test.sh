@@ -87,9 +87,8 @@ run_scenario() {
   echo "=== $label: $FROM_TAG -> current ==="
 
   # --- the old release writes the database --------------------------------
-  # The old release was configured through the environment. Those variables are
-  # scoped to this one command: the current binary refuses to start while a
-  # leftover one is set, and that refusal is deliberate.
+  # The old release was configured through the environment; the variables are
+  # scoped to this one command. The current build below reads a config file.
   local old_log="$work/old-$label.log"
   env ALERTLOOP_ADDR=":$OLD_PORT" \
       ALERTLOOP_DB_DRIVER="$driver" \

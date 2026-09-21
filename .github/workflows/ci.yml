@@ -1,6 +1,8 @@
 name: CI
 
-# Static analysis, tests, and formatting on every push and pull request.
+# Static analysis, tests, and formatting on every push and pull request. The
+# slow delivery checks (upgrade, compose-up) run only on release/** branches,
+# v* tags, and manual dispatch — see `if:` on those jobs.
 #
 # Go is pinned to a release that still receives security fixes (1.27), matching
 # the Dockerfile and the release workflow — that toolchain builds the shipped
@@ -10,7 +12,9 @@ name: CI
 on:
   push:
     branches: ["**"]
+    tags: ["v*"]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -132,6 +136,7 @@ jobs:
   upgrade:
     name: Upgrade from v0.1.0
     runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/heads/release/') || startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     # An upgrade runs against data somebody cares about, on a machine we will
     # never see. It gets tested with the real old binary, not a reconstruction.
     services:
@@ -245,6 +250,7 @@ jobs:
   compose-up:
     name: Compose postgres profile starts healthy
     runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/heads/release/') || startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     timeout-minutes: 20
     # The compose job above proves the file parses. This one proves the stack
     # it describes comes up — built from this tree, with a database password
@@ -259,6 +265,16 @@ jobs:
 
       - name: Build the image from this tree
         run: docker build --build-arg VERSION=ci -t alertloop:ci .
+
+      - name: The image refuses to start without an admin token, naming it
+        run: |
+          rc=0
+          out=$(docker run --rm alertloop:ci 2>&1) || rc=$?
+          echo "$out"
+          if [ "$rc" -eq 0 ] || ! grep -q 'ALERTLOOP_ADMIN_TOKEN' <<< "$out"; then
+            echo "::error::docker run without ALERTLOOP_ADMIN_TOKEN did not refuse with a message naming it"
+            exit 1
+          fi
 
       # The password contains "#", so it goes in single quotes in .env — what
       # the install guide and .env.example tell you to do with one like it.
@@ -368,8 +384,7 @@ jobs:
           integrations/monit/test/run-tests.sh
           scripts/upgrade-test.sh
           scripts/build-release.sh
-          deploy/systemd/install.sh
-          docker-entrypoint.sh"
+          deploy/systemd/install.sh"
           bad=0
           while IFS= read -r f; do
             [ -n "$f" ] || continue

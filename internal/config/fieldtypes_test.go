@@ -47,9 +47,6 @@ addr: ":9100"
 admin_token: literal-token
 retention_days: 45
 notify_on_resolve: false
-cors_origins:
-  - https://console.example.com
-  - https://ops.example.com
 api_keys:
   - key: k-ingest
     scope: ingest
@@ -66,8 +63,6 @@ log:
   level: debug
   format: json
   file: /var/log/alertloop/api.log
-  max_size_mb: 10
-  max_files: 3
 rate_limit:
   enabled: false
   per_ip_per_second: 12.5
@@ -408,7 +403,7 @@ func TestTheMissingVariableErrorNamesTheField(t *testing.T) {
 	cases := []struct{ name, yaml, field string }{
 		{"a scalar", "admin_token: ${AL_NOT_SET}\n", "admin_token"},
 		{"a numeric field", "retention_days: ${AL_NOT_SET}\n", "retention_days"},
-		{"a list element", "cors_origins:\n  - ${AL_NOT_SET}\n", "cors_origins"},
+		{"a list element", "rate_limit:\n  trusted_proxies:\n    - ${AL_NOT_SET}\n", "rate_limit.trusted_proxies"},
 		{
 			"a field inside a list element",
 			"channels:\n  email:\n    - name: ops\n      password: ${AL_NOT_SET}\n",
@@ -729,30 +724,6 @@ func TestADottedKeyIsRefusedBecauseAKeyNameIsNotAPath(t *testing.T) {
 	}
 }
 
-// A leftover variable that carried a secret is answered by name: the message
-// goes to the log, and `dsn: postgres://u:hunter2@db/x` printed there is the
-// leak SECURITY.md says AlertLoop does not have. It names the variable and the
-// setting that replaced it and stops — the line to write lives in
-// alertloop.example.yaml, not in an error message.
-func TestTheRefusalForASecretCarryingVariableNeverPrintsItsValue(t *testing.T) {
-	for _, tc := range []struct{ variable, setting string }{
-		{"ALERTLOOP_ADMIN_TOKEN", "admin_token"},
-		{"ALERTLOOP_DB_DSN", "database.dsn"},
-	} {
-		const secret = "s3cr3t-value-that-must-not-be-logged"
-		t.Setenv(tc.variable, secret)
-
-		_, err := loadYAMLErr(t, "notify_on_resolve: true\n")
-		if err == nil {
-			t.Fatalf("%s: a leftover pre-0.3.0 variable must stop the load", tc.variable)
-		}
-		if strings.Contains(err.Error(), secret) {
-			t.Errorf("the refusal prints the value of %s:\n%v", tc.variable, err)
-		}
-		mustContain(t, err, tc.variable, tc.setting)
-	}
-}
-
 // Swapping two neighbouring letters is the commonest typo there is, and the
 // message promises a suggestion rather than sometimes offering one.
 func TestATransposedLetterStillGetsASuggestion(t *testing.T) {
@@ -809,31 +780,6 @@ func TestPathologicalAnchorsAreRefusedRatherThanFollowedForever(t *testing.T) {
 			}
 		})
 	}
-}
-
-// A large but perfectly ordinary file loads. The two walks over it must cover
-// the same ground: one told the operator to write a setting the file already
-// contained, because it stopped where the other had gone on.
-func TestALargeHonestFileIsWalkedToTheEndByBothPasses(t *testing.T) {
-	var b strings.Builder
-	b.WriteString("log:\n  level: debug\nchannels:\n  email:\n")
-	for i := 0; i < 20000; i++ {
-		fmt.Fprintf(&b, "    - name: ops-%d\n      host: smtp.example.com\n"+
-			"      from: a@example.com\n      to: [\"b@example.com\"]\n", i)
-	}
-
-	// The file sets log.level itself, so the leftover variable is a warning and
-	// the load succeeds. That is what breaks when the second walk stops early.
-	t.Setenv("ALERTLOOP_LOG_LEVEL", "debug")
-
-	cfg, err := loadYAMLErr(t, b.String())
-	if err != nil {
-		t.Fatalf("a large but perfectly ordinary config was refused: %v", err)
-	}
-	if len(cfg.Warnings) != 1 || !strings.Contains(cfg.Warnings[0], "ALERTLOOP_LOG_LEVEL") {
-		t.Fatalf("want one warning naming the shadowed variable, got %v", cfg.Warnings)
-	}
-	eq(t, "log.level", cfg.Log.Level, "debug")
 }
 
 // A key with no name to print is still pointed at by its line; printing

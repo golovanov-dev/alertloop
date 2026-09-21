@@ -36,13 +36,42 @@ signed off will not be merged. A CI check enforces this.
 
 ## Development
 
-Requirements and build steps are in the [README](./README.md). In short:
+Go 1.25 or newer; Node for the admin console. There is no CGO dependency.
 
 ```bash
-make test        # run the Go test suite
+make build       # build bin/alertloop with the admin console currently in internal/adminui/dist
+ALERTLOOP_ADMIN_TOKEN=dev-token make run   # all-in-one on :8080, local SQLite, alertloop.example.yaml
+make test        # run the Go test suite (PostgreSQL tests skip without a DSN)
 make vet         # static analysis
 make fmt         # format Go code
-make admin       # build the React admin console (if you touched web/admin)
+```
+
+### Admin console
+
+The React console lives in `web/admin`; the Go build embeds
+`internal/adminui/dist`.
+
+```bash
+cd web/admin
+npm install
+npm run dev      # http://localhost:5273, proxies /v1 to localhost:8080
+```
+
+`make admin` builds it into `internal/adminui/dist`. The Docker image build does
+this itself.
+
+### Release builds
+
+Pushing a version tag runs `.github/workflows/release.yml`: it builds the admin
+console, cross-compiles every target, and publishes the binaries with a signed
+`checksums_*.txt` to the GitHub Release. On the tag, `ci.yml` and `release.yml`
+run in parallel, so the slow CI jobs (`upgrade`, `compose-up`) must pass before
+the tag: push the release commit to a `release/**` branch, or run CI by hand
+(Actions → CI → Run workflow). To build the same artifacts locally:
+
+```bash
+make admin
+make release     # or: VERSION=v0.1.0 ./scripts/build-release.sh; output in dist/
 ```
 
 Please keep changes focused, include tests where it makes sense, and match the

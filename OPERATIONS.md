@@ -39,12 +39,21 @@ Under Compose every AlertLoop container has a Docker health check, run every
 10 seconds. The api (and the demo container) probe `/health/ready`. The worker
 serves no HTTP, so it runs `alertloop check-db`: load the config file, connect
 to the database, exit 0 if it answered. It migrates nothing and changes nothing
-in the database. Outside Docker it needs the service's user, environment and
-working directory — the README shows the call for a systemd install.
+in the database. It prints the version that answered.
 
 ```bash
 docker compose ps                                  # (healthy) / (unhealthy) per service
 docker compose up -d --wait --wait-timeout 120     # fails if one does not become healthy
+docker compose run --rm --no-deps api --config /etc/alertloop/alertloop.yaml check-db
+```
+
+Under systemd, run it as the service does — its user, environment file, and
+working directory:
+
+```bash
+sudo -u alertloop sh -c 'cd /var/lib/alertloop && set -a &&
+  . /etc/alertloop/alertloop.env &&
+  exec /usr/local/bin/alertloop --config /etc/alertloop/alertloop.yaml check-db'
 ```
 
 Use `--wait` for installs and upgrades. Plain `up -d` returns as soon as the
@@ -80,7 +89,14 @@ curl -s -H "X-API-Key: $KEY" http://127.0.0.1:8080/v1/stats
   human. Alert on any increase; investigate at the first one.
 - **`deliveries.pending` growing steadily** — events are arriving faster than
   they are sent, or no worker is running. A queue that never drains is a
-  worker that is not there.
+  worker that is not there. Not every `pending` row is waiting for the worker:
+  a recovery waits for its alert, and one whose alert dead-lettered (or whose
+  channel was removed from the config) stays `pending` until that alert is
+  replayed and sent, or until retention removes the incident. List them with
+  `/v1/delivery-attempts?kind=recovery&state=pending` and check the alert of
+  the same `event_id` and `channel_name`
+  (`?kind=alert&event_id=<id>`): if it is `dead_letter`, the recovery is
+  waiting on it, not on the worker.
 - **`deliveries.failed` staying non-zero** — retries are in flight. Occasional
   values are normal; a floor that never returns to zero is a channel that is
   down.
@@ -123,14 +139,11 @@ log:
   level: "info"
   format: "text"     # json if a collector reads it
   file: ""           # empty = stdout only
-  max_size_mb: 50    # rotate to <file>.1 at this size; 0 = no rotation
-  max_files: 5       # rotated files kept besides the active one
 ```
 
-Rotation is built in because nothing else rotates that file: at `max_size_mb`
-the active file becomes `<file>.1`, older generations shift up, and everything
-past `max_files` is deleted. Disk use is bounded by
-`max_size_mb × (max_files + 1)`.
+AlertLoop does not rotate that file; logrotate does (below). The file is opened
+for appending, so logrotate's `copytruncate` works without restarting the
+process.
 
 ### Binary and systemd
 
@@ -155,16 +168,28 @@ the directory yourself:
 sudo install -d -o alertloop -g alertloop -m 750 /var/log/alertloop
 ```
 
-AlertLoop creates a missing log directory when it can, and an unwritable path
-stops the process at startup naming the path — deliberately: a service that
-silently logs nowhere is worse than one that refuses to start.
+AlertLoop creates a missing log directory when it can; an unwritable path
+stops the process at startup, naming the path.
 
-A rotation that fails later — a full disk, a directory sitting where
-`<file>.1` belongs — does **not** stop logging. AlertLoop prints one line to
-stderr (visible in the journal and in `docker compose logs`), keeps writing to
-the file it has open, and retries the rotation after the file has grown by
-another `max_size_mb`. What is given up is the size limit, not the log; the
-stderr line says so, and it is worth alerting on.
+Rotation, on the host, as a user with `sudo`:
+
+```bash
+sudo tee /etc/logrotate.d/alertloop >/dev/null <<'EOF'
+/var/log/alertloop/*.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+EOF
+sudo logrotate -d /etc/logrotate.d/alertloop    # dry run: prints what it would do
+```
+
+`copytruncate` copies the file and empties it in place; a line written in
+between those two steps can be lost.
 
 ### Docker: what you get by default
 
@@ -194,8 +219,9 @@ The postgres profile mounts `./logs` into both containers and passes a
 per-service log path. Three steps:
 
 ```bash
-mkdir -p logs
+mkdir -p logs                        # already there, owned by root, if the stack has run
 sudo chown 10001:10001 logs          # the container runs as uid 10001
+sudo chmod 755 logs                  # logrotate skips a group-writable directory
 ```
 
 ```dotenv
@@ -205,7 +231,7 @@ ALERTLOOP_LOG_FILE_WORKER=/var/log/alertloop/worker.log
 ```
 
 ```bash
-docker compose up -d --wait --wait-timeout 120
+docker compose up -d --force-recreate --wait --wait-timeout 120 api worker
 sudo tail -f logs/worker.log        # the files belong to uid 10001
 ```
 
@@ -214,20 +240,47 @@ on any other file owned by the service — the files belong to uid 10001, so
 reading them from the host means `sudo` unless your user happens to be that uid.
 `docker compose logs` still shows the same lines.
 
+Rotation of `./logs`, on the host, as a user with `sudo`, from the directory with
+`docker-compose.yml` (`$PWD` is written into the file):
+
+```bash
+sudo tee /etc/logrotate.d/alertloop-compose >/dev/null <<EOF
+$PWD/logs/*.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+EOF
+sudo logrotate -d /etc/logrotate.d/alertloop-compose
+```
+
+The files stay owned by uid 10001 and the containers keep writing to them;
+nothing needs a restart. If `-d` says `skipping ... insecure permissions`, the
+directory is group-writable (umask 002): run `sudo chmod 755 logs`. Only
+`copytruncate` works:
+AlertLoop never reopens the file, so a rule that renames it leaves the process
+writing to the renamed copy. On a fresh install `-d` prints `log does not need
+rotating`, which is normal; `sudo logrotate -f /etc/logrotate.d/alertloop-compose`
+rotates now, and a new `api.log.1` next to `api.log` shows it worked.
+
 Things that bite here, all of them real:
 
 - **Ownership.** Compose creates a missing bind-mount source as `root`, and the
   container runs as uid 10001 with no capabilities. Without the `chown` the
-  container stops at startup with `permission denied` on the log file. Fix it
-  the same way and restart.
+  container stops at startup with `permission denied` on the log file. Run the
+  `chown` above, then the `up -d --force-recreate` command above.
 - **`read_only: true` stays.** The root filesystem remains read-only; the bind
   mount is the writable exception. Do not point `log.file` anywhere else — a
   path outside `/var/log/alertloop` (or `/data`, or `/tmp`) fails with
   `read-only file system`, which is the container doing its job.
 - **One file per service.** `api` and `worker` share one config file on purpose,
   so the path comes from the environment rather than from the file. Do not give
-  them the same file: both would append to it and both would rotate it, cutting
-  each other's history short. Most of what an incident needs — deliveries,
+  them the same file: their lines would interleave with nothing saying which
+  process wrote which. Most of what an incident needs — deliveries,
   retries, dead-letter, retention — is written by the **worker**.
 - **The demo profile is stdout-only.** It runs the config baked into the image,
   which has no `log:` section and does not read `ALERTLOOP_LOG_FILE`. Use
@@ -358,110 +411,25 @@ in that clone removes the check.
 
 ## Upgrades and downgrades
 
-**Upgrading** is: stop, replace the binary or pull the new image, start.
-Migrations run automatically at startup, in a transaction, and are recorded in
-`schema_migrations` so they never run twice.
+Read the [CHANGELOG.md](CHANGELOG.md) entries of every version after yours
+first: they name each change that needs an action. Skipping versions is fine.
 
-**Back up first anyway.** Automatic migrations are convenient precisely because
-they are irreversible in place.
+1. Back up ([Backup and restore](#backup-and-restore)). Migrations run at
+   startup and are irreversible in place.
+2. Put the new version in place without restarting.
+   **Compose:** check out the release tag, set `ALERTLOOP_IMAGE` in `.env` to
+   it, run `docker compose pull`.
+   **systemd:** `sudo bash deploy/systemd/install.sh <new binary>`.
+3. Run `check-db` ([Container health checks](#container-health-checks)): it
+   loads your config with the new version and names that version. Fix what it
+   reports.
+4. Restart. **Compose:** `docker compose up -d --wait --wait-timeout 120`.
+   **systemd:** `sudo systemctl restart alertloop`.
+5. Confirm the version with `GET /v1/info` and the counts with `GET /v1/stats`.
 
-**Downgrading is not supported.** A newer AlertLoop may have added columns and
-indexes that an older one does not know about; the older binary will not remove
-them, and an older `SELECT` against a newer schema is not something we test.
-The supported way back is: stop the new version, restore the backup taken before
-the upgrade, start the old version. This is why the upgrade procedure begins
-with a backup.
-
-Split deployments (`server` and `worker` as separate processes) must run the
-**same version**. Upgrade them together.
-
-### Upgrading to 0.6.0: three things in your config can now stop startup
-
-**1. A key AlertLoop does not read is refused.** It used to be ignored, so
-`retention_day: 5` ran on the built-in 30 days. All such keys are listed at once
-with their lines; a path on one line (`log.level: debug`) is one, `x-` is not.
-
-**2. A config file with neither `admin_token` nor `api_keys` no longer starts**,
-in the modes that serve HTTP (`server` and the default `all`): with neither, the
-API and the admin console accept every request from anyone who can reach the
-process. A `worker` is not stopped, and running with no config file is unchanged.
-
-**3. A variable holding `null`, `Null`, `NULL` or `~` no longer erases the
-field.** `admin_token: ${ALERTLOOP_ADMIN_TOKEN}` with that text used to start
-AlertLoop with an empty admin token and an open API. It now arrives as text in a
-string field, and stops the start in a numeric, boolean or duration one.
-
-Check the file first (this covers 1 and 3; the credential is checked at start):
-
-```bash
-docker compose run --rm --no-deps api --config /etc/alertloop/alertloop.yaml check-db  # Compose
-sudo -u alertloop /usr/local/bin/alertloop --config /etc/alertloop/alertloop.yaml check-db  # systemd
-#  ok: alertloop 0.6.0, the database answered
-#  Before the first start there is no database yet: the answer names the missing file, the config was still read
-```
-
-### Upgrading to 0.5.1: the Compose profile passes the database password differently
-
-The postgres profile used to build a URL from `POSTGRES_PASSWORD`, and a
-password containing `/`, `?` or `#` broke it: the api and the worker restarted
-in a loop with a parse error. It now builds a keyword/value DSN
-(`host=postgres ... password=...`) with the password exactly as written in
-`.env`. A password that worked before works unchanged, with two exceptions:
-
-- **A percent-encoded password.** If you wrote `%2F` for `/` (or any `%XX`) in
-  `POSTGRES_PASSWORD` to make the URL parse, the URL decoded it and the new DSN
-  does not: AlertLoop would send `%2F` literally and PostgreSQL would refuse it.
-  Put the decoded password — the one PostgreSQL has — into `.env` before you
-  upgrade. `grep '^POSTGRES_PASSWORD=.*%' .env` finds the case. If you miss
-  it, the refused login in the log carries a note pointing here.
-- **A password that begins with a single quote** no longer parses. AlertLoop
-  refuses to start and says why; change the password as described in
-  "Changing the database password" below.
-
-A DSN you write yourself is unaffected, with one exception: a URL with an
-unencoded `@` in the path (the database name), in the fragment, or in the name
-of a query parameter is now refused, because that is what a misplaced password
-looks like. Write it as `%40`. An `@` in a parameter's value
-(`?user=name@domain`) is fine.
-
-Also new, none of it needing action: a health check of its own for the worker
-(it used to inherit the image's HTTP check and show as `unhealthy` for good),
-checks every 10 seconds instead of 30, `docker compose up -d --wait
---wait-timeout 120` as the way to start (see "Container health checks"), and
-`ALERTLOOP_PORT` in `.env` for the host port.
-
-### Upgrading to 0.5.0: `ALERTLOOP_LOG_FILE` needs a line in your config
-
-The Compose file now passes `ALERTLOOP_LOG_FILE` to the api and the worker, and
-`alertloop.example.yaml` reads it as `file: ${ALERTLOOP_LOG_FILE:-}`. **Your
-existing `alertloop.yaml` does not**, because it was copied from an older
-example — so setting `ALERTLOOP_LOG_FILE_API` / `ALERTLOOP_LOG_FILE_WORKER` in
-`.env` would do nothing on its own.
-
-The environment is not a second configuration layer (0.3.0), and no exception is
-made here: a variable only takes effect where the config file asks for it by
-name. Add one line to your `alertloop.yaml`:
-
-```yaml
-log:
-  file: ${ALERTLOOP_LOG_FILE:-}
-  max_size_mb: 50
-  max_files: 5
-```
-
-Until you do, one of two things happens, and neither is silent:
-
-- your file **sets `log.file` itself** (even to `""`) — startup warns that
-  `ALERTLOOP_LOG_FILE` is set but configures nothing, and the value in the file
-  is what runs;
-- your file **does not mention `log.file`** — startup is refused, naming the
-  variable and the `log.file` setting that replaced it. That refusal is
-  deliberate (0.3.0): a variable the operator believes is in effect must never
-  be quietly ignored.
-
-Nothing else about the upgrade needs attention: `max_size_mb` and `max_files`
-default to 50 and 5 for configs that never heard of them, and logging to stdout
-is unchanged.
+`server` and `worker` run as separate processes must run the same version.
+**Downgrading is not supported**: the way back is to stop, restore the backup
+taken before the upgrade, and start the old version.
 
 ---
 
@@ -483,7 +451,7 @@ delivery separately for exactly this reason.
      "http://127.0.0.1:8080/v1/delivery-attempts?state=dead_letter&limit=100" | jq .
    ```
 
-   Or open `/deliveries` (built-in page) or the Deliveries screen in `/admin`.
+   Or open the Deliveries screen in `/admin`.
 
 2. **Read `last_error` on one of them.** It is stored verbatim, with secrets
    redacted. It usually names the cause outright: an expired SMTP credential, a
@@ -499,7 +467,7 @@ delivery separately for exactly this reason.
      "http://127.0.0.1:8080/v1/delivery-attempts/$ID/replay"
    ```
 
-   Both web interfaces have a Replay button. Replay one first and confirm it
+   The Deliveries screen in `/admin` has a Replay button. Replay one first and confirm it
    arrives before replaying a hundred.
 
 5. **Mind retention.** Events older than `retention_days` (default 30) are
@@ -532,8 +500,7 @@ side for what it tried to send.
    - the `-wal` file, if a long-running reader kept it from checkpointing;
    - the events table, if `retention_days` is very high or ingestion is far
      heavier than expected;
-   - the log file, if `log.file` is set with `max_size_mb: 0` and nothing else
-     rotates it (with the default 50 MB × 5 it cannot grow past ~300 MB);
+   - the log file, if `log.file` is set and no logrotate rule covers it;
    - the container log, on a Docker host older than this Compose file, where
      the `json-file` driver had no `max-size`. `docker system prune -f` and the
      `x-logging` anchor in `docker-compose.yml` deal with it.
@@ -548,9 +515,8 @@ side for what it tried to send.
    systemctl start alertloop
    ```
 
-4. **Then fix the cause.** Leave `log.max_size_mb` at a non-zero value (or hand
-   the file to logrotate), set a retention window that matches the disk, and
-   alert on disk usage.
+4. **Then fix the cause.** Add the logrotate rule from "Reading AlertLoop's own
+   logs", set a retention window that matches the disk, and alert on disk usage.
 
 ### The database is unreachable
 
@@ -651,9 +617,11 @@ This is a configuration problem, not a failure, and the log said so at startup.
    incident closes and at no other time. A monitoring source that only ever
    sends `status: firing` leaves it open forever. In Monit that is a rule
    missing its `else if succeeded` line.
-3. **Did the alert dead-letter?** A channel whose alert never arrived is
-   deliberately skipped: a bare "resolved" would be the only message it ever
-   received. Fix the channel and replay the alert.
+3. **Did the alert dead-letter?** A channel never receives a recovery before
+   its alert: the recovery is queued when the incident closes, whatever state
+   the alert is in, and stays `pending` until the alert of the same incident to
+   that channel is `sent`. Fix the channel and replay the alert; the recovery
+   follows it.
 4. **Look for the row.** Recovery notices are ordinary delivery attempts with
    `kind=recovery`:
 

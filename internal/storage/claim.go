@@ -13,6 +13,13 @@ import (
 // a due (or absent) next_retry_at. On PostgreSQL the claim uses
 // FOR UPDATE SKIP LOCKED so multiple workers never grab the same row; on SQLite
 // the single-writer connection provides the same guarantee.
+//
+// A recovery is not deliverable while the alert of the same event to the same
+// channel is anything but `sent`: otherwise an alert waiting for a retry
+// arrives after its own "resolved". Each occurrence of an incident is its own
+// event, so a recovery only ever waits for the alert of its own occurrence.
+// A dead-lettered alert keeps its recovery waiting until the alert is replayed
+// and sent, so no channel receives a recovery without the alert.
 func (s *sqlStore) ClaimDue(ctx context.Context, now time.Time, limit int) ([]domain.DeliveryAttempt, error) {
 	if limit <= 0 {
 		limit = 10
@@ -25,16 +32,23 @@ func (s *sqlStore) ClaimDue(ctx context.Context, now time.Time, limit int) ([]do
 	}
 
 	q := fmt.Sprintf(`UPDATE delivery_attempts
-		SET state = '%s', updated_at = ?
+		SET state = '%[1]s', updated_at = ?
 		WHERE id IN (
-			SELECT id FROM delivery_attempts
-			WHERE state IN ('%s', '%s')
-			  AND (next_retry_at IS NULL OR next_retry_at <= ?)
-			ORDER BY created_at ASC, id ASC
-			LIMIT ?%s
+			SELECT c.id FROM delivery_attempts c
+			WHERE c.state IN ('%[2]s', '%[3]s')
+			  AND (c.next_retry_at IS NULL OR c.next_retry_at <= ?)
+			  AND (c.kind <> '%[4]s' OR NOT EXISTS (
+				SELECT 1 FROM delivery_attempts a
+				WHERE a.event_id = c.event_id AND a.kind = '%[5]s'
+				  AND a.channel_name = c.channel_name AND a.state <> '%[6]s'
+			  ))
+			ORDER BY c.created_at ASC, c.id ASC
+			LIMIT ?%[7]s
 		)
-		RETURNING %s`,
-		domain.DeliverySending, domain.DeliveryPending, domain.DeliveryFailed, lock, deliveryColumns,
+		RETURNING %[8]s`,
+		domain.DeliverySending, domain.DeliveryPending, domain.DeliveryFailed,
+		domain.KindRecovery, domain.KindAlert, domain.DeliverySent,
+		lock, deliveryColumns,
 	)
 
 	rows, err := s.db.QueryContext(ctx, s.d.rebind(q), nowStr, nowStr, limit)

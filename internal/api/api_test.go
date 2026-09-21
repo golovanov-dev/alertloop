@@ -19,6 +19,11 @@ import (
 
 func newTestServer(t *testing.T, apiKeys map[string]string) (*httptest.Server, storage.Store) {
 	t.Helper()
+	return newTestServerWithToken(t, apiKeys, adminTok)
+}
+
+func newTestServerWithToken(t *testing.T, apiKeys map[string]string, adminToken string) (*httptest.Server, storage.Store) {
+	t.Helper()
 	store, err := storage.Open("sqlite", ":memory:")
 	if err != nil {
 		t.Fatalf("open: %v", err)
@@ -36,7 +41,7 @@ func newTestServer(t *testing.T, apiKeys map[string]string) (*httptest.Server, s
 		Events:     service.NewEventService(store, nil, time.Now),
 		Deliveries: service.NewDeliveryService(store, time.Now),
 		APIKeys:    apiKeys,
-		AdminToken: "admintok",
+		AdminToken: adminToken,
 	})
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
@@ -150,6 +155,26 @@ func TestAdminTokenAuthorizesAPI(t *testing.T) {
 	resp, _ = doJSON(t, "GET", ts.URL+"/v1/events", adminTok, "")
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("admin token = %d, want 200", resp.StatusCode)
+	}
+}
+
+// With neither API keys nor an admin token there is no open mode: every /v1
+// request is refused, whatever it presents. The process does not start in that
+// state, and this keeps the API closed should it ever get this far.
+func TestNoCredentialConfiguredRefusesEverything(t *testing.T) {
+	ts, _ := newTestServerWithToken(t, nil, "")
+	for _, key := range []string{"", "anything", adminTok} {
+		for _, path := range []string{"/v1/events", "/v1/stats", "/v1/info"} {
+			resp, _ := doJSON(t, "GET", ts.URL+path, key, "")
+			if resp.StatusCode != http.StatusUnauthorized {
+				t.Fatalf("GET %s with key %q = %d, want 401", path, key, resp.StatusCode)
+			}
+		}
+	}
+	resp, _ := doJSON(t, "POST", ts.URL+"/v1/events", "",
+		`{"status":"firing","type":"incident","dedupe_key":"k","message":"m","severity":"error"}`)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("POST /v1/events without credential = %d, want 401", resp.StatusCode)
 	}
 }
 
@@ -298,27 +323,5 @@ func TestRateLimitPerIP(t *testing.T) {
 				t.Fatalf("%s was rate limited; health probes must always answer", path)
 			}
 		}
-	}
-}
-
-func TestAdminPageAuth(t *testing.T) {
-	ts, _ := newTestServer(t, nil)
-
-	resp, err := http.Get(ts.URL + "/events")
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("events page without token = %d, want 401", resp.StatusCode)
-	}
-
-	resp, err = http.Get(ts.URL + "/events?token=admintok")
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("events page with token = %d, want 200", resp.StatusCode)
 	}
 }

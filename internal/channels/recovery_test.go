@@ -151,25 +151,6 @@ func TestWebhookPayloadCarriesTheKind(t *testing.T) {
 	}
 }
 
-// A notification built without a kind (an older row, a caller that forgot) must
-// render as an alert rather than as an empty string in the payload.
-func TestZeroKindRendersAsAlert(t *testing.T) {
-	var got map[string]any
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewDecoder(r.Body).Decode(&got)
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
-
-	wh := NewWebhook("hook", srv.URL, "", time.Second)
-	if err := wh.Send(context.Background(), domain.Notification{Event: sampleEvent()}); err != nil {
-		t.Fatalf("send: %v", err)
-	}
-	if got["kind"] != "alert" {
-		t.Fatalf("kind = %v, want \"alert\"", got["kind"])
-	}
-}
-
 // Gmail and Microsoft 365 both treat a missing Date or Message-ID as a spam
 // signal. For a product whose whole job is putting a notification in front of a
 // person, the spam folder is total failure - and it would look like "email does

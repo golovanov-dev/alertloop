@@ -21,13 +21,13 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/golovanov-dev/alertloop/internal/app"
 	"github.com/golovanov-dev/alertloop/internal/config"
-	"github.com/golovanov-dev/alertloop/internal/logging"
 )
 
 // version is overridden at build time via -ldflags "-X main.version=...".
@@ -70,15 +70,15 @@ func run() error {
 	}
 
 	// Before storage, the logger, or anything else is opened: a process that
-	// would serve HTTP with a config file naming no credential is refused.
-	// Which modes serve is app's to know, not this switch's.
+	// would serve HTTP with no credential configured is refused. Which modes
+	// serve is app's to know, not this switch's.
 	if err := app.RequireCredential(cfg, mode); err != nil {
 		return err
 	}
 
 	// Before the logger: a health check runs every few seconds next to the
-	// real process, and must neither append to nor rotate that process's log
-	// file, nor run migrations under it.
+	// real process, and must neither append to that process's log file nor run
+	// migrations under it.
 	if mode == "check-db" {
 		return checkDB(cfg)
 	}
@@ -145,9 +145,8 @@ func checkDB(cfg config.Config) error {
 // A configured file is written IN ADDITION to stdout, never instead of it.
 // Earlier versions let a file replace stdout, which under Docker silenced
 // `docker compose logs` and every shipper reading the container's output — so
-// the setting meant to make logs easier to read made them harder. The file
-// itself is created (with its directory) and rotated by size; see
-// internal/logging.
+// the setting meant to make logs easier to read made them harder. The file is
+// created with its directory and opened for appending; see openLogFile.
 //
 // The returned io.Closer, when non-nil, must be closed on shutdown to release
 // the log file.
@@ -167,7 +166,7 @@ func setupLogger(c config.Logging) (*slog.Logger, io.Closer, error) {
 	var out io.Writer = os.Stdout
 	var closer io.Closer
 	if c.File != "" {
-		f, err := logging.Open(c.File, c.MaxSizeMB, c.MaxFiles)
+		f, err := openLogFile(c.File)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -196,4 +195,21 @@ func setupLogger(c config.Logging) (*slog.Logger, io.Closer, error) {
 		handler = slog.NewTextHandler(out, opts)
 	}
 	return slog.New(handler), closer, nil
+}
+
+// openLogFile opens the log file for appending, creating it and its directory
+// if missing. Neither is world-readable: log lines carry event messages.
+//
+// O_APPEND is what keeps logrotate's copytruncate safe: after the file is
+// truncated, the next write lands at its new end rather than at the old offset
+// behind a run of zero bytes.
+func openLogFile(path string) (*os.File, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		return nil, fmt.Errorf("create log directory for %q: %w", path, err)
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o640)
+	if err != nil {
+		return nil, fmt.Errorf("open log file %q: %w", path, err)
+	}
+	return f, nil
 }

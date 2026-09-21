@@ -1,5 +1,5 @@
 // Package api implements AlertLoop's HTTP layer: the versioned JSON API, auth
-// middleware, health/readiness probes, the events web page, and OpenAPI/Swagger
+// middleware, health/readiness probes, the admin console, and OpenAPI/Swagger
 // serving.
 package api
 

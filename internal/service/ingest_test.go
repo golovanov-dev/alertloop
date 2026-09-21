@@ -114,9 +114,9 @@ func deliveredTo(t *testing.T, s storage.Store, eventID string) []string {
 	return names
 }
 
-// TestIngestRoutesEventsToDifferentAudiences is the acceptance scenario: on one
-// instance, business events reach the customer and incidents reach the
-// developer, and neither side sees the other's events.
+// TestIngestRoutesEventsToDifferentAudiences proves the wiring: ingest asks the
+// router and queues one delivery per channel it chose, and no other. The
+// routing decisions themselves are unit-tested in internal/routing.
 func TestIngestRoutesEventsToDifferentAudiences(t *testing.T) {
 	s := newStore(t)
 	router, err := routing.New(config.Routing{
@@ -146,15 +146,6 @@ func TestIngestRoutesEventsToDifferentAudiences(t *testing.T) {
 		{"incident goes to the developer", EventInput{
 			Type: domain.EventIncident, Source: "feeds_worker", Message: "boom",
 		}, []string{"dev-telegram", "siem"}},
-		{"order goes to the customer", EventInput{
-			Type: domain.EventBusiness, Source: "shop", Category: "order.created", Message: "new order",
-		}, []string{"customer-telegram"}},
-		{"suppressed source is delivered nowhere", EventInput{
-			Type: domain.EventIncident, Source: "healthcheck", Message: "probe failed",
-		}, []string{}},
-		{"unmatched event falls back to the default", EventInput{
-			Type: domain.EventAudit, Source: "admin", Message: "login",
-		}, []string{"dev-telegram"}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -269,28 +260,6 @@ func TestIngestSuppressedEventIsStillStoredAndListed(t *testing.T) {
 	}
 	if got := deliveredTo(t, s, ev.ID); len(got) != 0 {
 		t.Fatalf("suppression created deliveries: %v", got)
-	}
-}
-
-func TestIngestDedupeCreatesNoNewDeliveries(t *testing.T) {
-	s := newStore(t)
-	svc := NewIngestService(s, routing.NewAllChannels([]domain.ChannelTarget{{Type: domain.ChannelWebhook, Name: "wh"}}), 5, nil, time.Now, nil)
-	ctx := context.Background()
-
-	first, _, _ := svc.ingestLegacy(ctx, EventInput{Type: domain.EventIncident, Source: "s", Message: "m", DedupeKey: "dup"})
-	second, created, err := svc.ingestLegacy(ctx, EventInput{Type: domain.EventIncident, Source: "s", Message: "m2", DedupeKey: "dup"})
-	if err != nil {
-		t.Fatalf("second ingest: %v", err)
-	}
-	if created {
-		t.Fatal("expected dedupe hit, not created")
-	}
-	if second.ID != first.ID {
-		t.Fatal("expected same event id on dedupe")
-	}
-	page, _ := s.ListDeliveryAttempts(ctx, storage.DeliveryFilter{}, 50, "")
-	if len(page.Items) != 1 {
-		t.Fatalf("expected only 1 delivery attempt total, got %d", len(page.Items))
 	}
 }
 

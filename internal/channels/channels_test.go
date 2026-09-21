@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -85,10 +86,10 @@ func TestTelegramSend(t *testing.T) {
 	// A Telegram message has no separate subject: the header line carries the
 	// event message, so the body must not repeat it. Regression guard for the
 	// text being printed twice in a row.
-	if n := countOccurrences(req.Text, "Feed processing failed"); n != 1 {
+	if n := strings.Count(req.Text, "Feed processing failed"); n != 1 {
 		t.Fatalf("event message appears %d times in telegram text, want 1:\n%s", n, req.Text)
 	}
-	if !contains(req.Text, "[CRITICAL/incident] Feed processing failed\n\nType:     incident") {
+	if !strings.Contains(req.Text, "[CRITICAL/incident] Feed processing failed\n\nType:     incident") {
 		t.Fatalf("unexpected telegram text layout:\n%s", req.Text)
 	}
 }
@@ -129,20 +130,20 @@ func TestEmailBuildsMessage(t *testing.T) {
 		t.Fatalf("unexpected envelope from=%q to=%v", fm.from, fm.to)
 	}
 	for _, want := range []string{"Subject: [CRITICAL/incident] Feed processing failed", "Source:   feeds_worker", "Event ID: e1"} {
-		if !contains(msg, want) {
+		if !strings.Contains(msg, want) {
 			t.Fatalf("message missing %q:\n%s", want, msg)
 		}
 	}
 	// The subject already carries the event message; the body must not repeat
 	// it. Regression guard for subject and first body line being identical.
 	body := msg
-	if i := indexOf(msg, "\r\n\r\n"); i >= 0 {
+	if i := strings.Index(msg, "\r\n\r\n"); i >= 0 {
 		body = msg[i+4:]
 	}
-	if contains(body, "Feed processing failed") {
+	if strings.Contains(body, "Feed processing failed") {
 		t.Fatalf("event message repeated in the email body:\n%s", body)
 	}
-	if !hasPrefix(body, "Type:     incident\r\n") {
+	if !strings.HasPrefix(body, "Type:     incident\r\n") {
 		t.Fatalf("email body should start with the field block, got:\n%s", body)
 	}
 }
@@ -150,16 +151,16 @@ func TestEmailBuildsMessage(t *testing.T) {
 func TestPlainBodyOmitsMessage(t *testing.T) {
 	e := sampleEvent()
 	body := plainBody(domain.Alert(e))
-	if contains(body, e.Message) {
+	if strings.Contains(body, e.Message) {
 		t.Fatalf("plainBody must not repeat the event message (it is in subjectLine):\n%s", body)
 	}
-	if !hasPrefix(body, "Type:     incident\n") {
+	if !strings.HasPrefix(body, "Type:     incident\n") {
 		t.Fatalf("plainBody should start with the field block, got:\n%s", body)
 	}
 	// The body stays self-contained without the message: it still identifies the
 	// event so it can be opened in the console.
 	for _, want := range []string{"Severity: critical", "State:    new", "Event ID: e1", "Payload:"} {
-		if !contains(body, want) {
+		if !strings.Contains(body, want) {
 			t.Fatalf("plainBody missing %q:\n%s", want, body)
 		}
 	}
@@ -177,11 +178,11 @@ func TestEmailHeaderInjectionSanitized(t *testing.T) {
 	msg := string(fm.msg)
 	// Inspect only the header section (everything before the blank line).
 	headerPart := msg
-	if i := indexOf(msg, "\r\n\r\n"); i >= 0 {
+	if i := strings.Index(msg, "\r\n\r\n"); i >= 0 {
 		headerPart = msg[:i]
 	}
 	// A successful injection would appear as a new "\r\nBcc:" header line.
-	if contains(headerPart, "\r\nBcc:") {
+	if strings.Contains(headerPart, "\r\nBcc:") {
 		t.Fatalf("SMTP header injection not sanitized:\n%q", headerPart)
 	}
 }
@@ -194,43 +195,10 @@ func TestTelegramRedactsTokenOnNetworkError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected a network error")
 	}
-	if contains(err.Error(), "SUPERSECRETTOKEN") {
+	if strings.Contains(err.Error(), "SUPERSECRETTOKEN") {
 		t.Fatalf("bot token leaked in error: %v", err)
 	}
-	if !contains(err.Error(), "***") {
+	if !strings.Contains(err.Error(), "***") {
 		t.Fatalf("expected redaction marker in error: %v", err)
 	}
-}
-
-func contains(haystack, needle string) bool {
-	return len(haystack) >= len(needle) && (indexOf(haystack, needle) >= 0)
-}
-
-func hasPrefix(s, prefix string) bool {
-	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
-}
-
-func countOccurrences(s, sub string) int {
-	if sub == "" {
-		return 0
-	}
-	n := 0
-	for i := 0; i+len(sub) <= len(s); {
-		if s[i:i+len(sub)] == sub {
-			n++
-			i += len(sub)
-			continue
-		}
-		i++
-	}
-	return n
-}
-
-func indexOf(s, sub string) int {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return i
-		}
-	}
-	return -1
 }

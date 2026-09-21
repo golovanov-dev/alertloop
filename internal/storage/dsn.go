@@ -115,7 +115,7 @@ func passwordLooksPercentEncoded(dsn string) bool {
 // password itself.
 const percentPasswordHint = "the password in database.dsn contains percent-encoding (%XX)," +
 	" which a keyword/value DSN sends as written: if it was encoded to make a URL work," +
-	" write it decoded (see \"Upgrading to 0.5.1\" in OPERATIONS.md)"
+	" write it decoded (see the 0.5.1 upgrade note in CHANGELOG.md)"
 
 // explainAuthFailure adds percentPasswordHint to err when PostgreSQL refused the
 // password (SQLSTATE 28P01) and the password contains %XX.

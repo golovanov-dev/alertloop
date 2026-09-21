@@ -92,16 +92,6 @@ const (
 	StateEscalated    EventState = "escalated"
 )
 
-// ValidEventState reports whether s is a known event state.
-func ValidEventState(s EventState) bool {
-	switch s {
-	case StateNew, StateAcknowledged, StateResolved, StateMuted, StateEscalated:
-		return true
-	default:
-		return false
-	}
-}
-
 // Event is a stored record that something important happened.
 type Event struct {
 	ID         string          `json:"id"`

@@ -22,8 +22,7 @@ import (
 type Config struct {
 	// Addr is the HTTP listen address for the server mode.
 	Addr string `yaml:"addr"`
-	// AdminToken protects the events web page and grants full API access (it is
-	// the admin console credential).
+	// AdminToken signs in to the admin console and grants full API access.
 	AdminToken string `yaml:"admin_token"`
 	// APIKeys are the accepted service/API keys, each with a scope limiting what
 	// it can do. Configured in the YAML file only.
@@ -61,24 +60,10 @@ type Config struct {
 	// planned paid capability; the plain number is not.)
 	RetentionDays int `yaml:"retention_days"`
 
-	// CORSOrigins are allowed browser origins for the JSON API. Needed only when
-	// the admin console is served from a different origin (standalone). Use "*"
-	// to allow any origin. Empty disables CORS (same-origin only).
-	CORSOrigins []string `yaml:"cors_origins"`
-
 	// Warnings are notes produced while loading (never read from the file): a
-	// pre-0.3.0 environment variable that the config file overrides, for
+	// ${VAR:-default} that fell back because the variable was empty, for
 	// instance. The caller logs them at startup.
 	Warnings []string `yaml:"-"`
-
-	// SourceFile is the config file this Config came from, empty when the
-	// process was started without --config (or ALERTLOOP_CONFIG). Filled by
-	// Load, never read from the file.
-	//
-	// It exists because two situations that look identical in the struct are
-	// not the same decision: an operator who wrote a file said what this
-	// installation is, while `docker run` with no file is a demo of defaults.
-	SourceFile string `yaml:"-"`
 }
 
 // RateLimit configures in-process request rate limiting.
@@ -131,22 +116,13 @@ type Logging struct {
 	// Loki, Elasticsearch, or Vector).
 	Format string `yaml:"format"`
 	// File is the path to write logs to, IN ADDITION to stdout. Empty means
-	// stdout only. When set, logs are appended so external tools (tail,
-	// journald, log shippers) can read them, and the directory is created if it
-	// does not exist.
+	// stdout only. The file is opened for appending and its directory is
+	// created if missing; rotating it is left to logrotate (copytruncate).
 	//
 	// stdout is never given up for a file: under Docker that would silence
 	// `docker compose logs` and every log shipper reading the container's
 	// output, and under systemd it would empty the journal.
 	File string `yaml:"file"`
-	// MaxSizeMB is the size at which the log file is rotated to "<file>.1".
-	// Defaults to 50. Zero disables rotation, for installations that rotate
-	// externally (logrotate, a shipping agent).
-	MaxSizeMB int `yaml:"max_size_mb"`
-	// MaxFiles is how many rotated files are kept besides the active one.
-	// Defaults to 5; zero keeps none. Total disk use is bounded by
-	// max_size_mb * (max_files + 1).
-	MaxFiles int `yaml:"max_files"`
 }
 
 // Database configures the backing store.
@@ -265,7 +241,7 @@ func Default() Config {
 	return Config{
 		Addr:          ":8080",
 		RetentionDays: 30,
-		Log:           Logging{Level: "info", Format: "text", MaxSizeMB: 50, MaxFiles: 5},
+		Log:           Logging{Level: "info", Format: "text"},
 		Database: Database{
 			Driver: "sqlite",
 			DSN:    "alertloop.db",
@@ -347,16 +323,11 @@ func SafeProxyURL(u *url.URL) string {
 
 // Load builds a Config from built-in defaults overlaid with a YAML file, if one
 // is given. ${VAR} references in the file are resolved from the environment
-// first; a leftover pre-0.3.0 ALERTLOOP_* variable stops the load instead of
-// being ignored.
+// first.
 func Load(configPath string) (Config, error) {
 	cfg := Default()
-	referenced := map[string]bool{}
-	present := map[string]bool{}
-	var fallbacks []string
 
 	if configPath != "" {
-		cfg.SourceFile = configPath
 		data, err := os.ReadFile(configPath)
 		if err != nil {
 			return cfg, fmt.Errorf("read config file: %w", err)
@@ -379,7 +350,7 @@ func Load(configPath string) (Config, error) {
 		// alone are a valid configuration.
 		if doc.Kind != 0 {
 			s := configSchema()
-			subWarnings, subErr := substituteEnv(&doc, referenced)
+			warnings, subErr := substituteEnv(&doc)
 			// Decoded before the tree is walked: yaml.v3 bounds alias
 			// expansion here, so what the walks below cross is a tree it has
 			// already crossed itself, and they need no budget of their own.
@@ -403,18 +374,9 @@ func Load(configPath string) (Config, error) {
 			if decErr != nil {
 				return cfg, fmt.Errorf("parse config file: %w", decErr)
 			}
-			fallbacks = subWarnings
-			// Same schema and the same descent rule as the check above: this
-			// walk cannot see more of the file than that one did.
-			present = collectFields(&doc, s)
+			cfg.Warnings = warnings
 		}
 	}
-
-	warnings, err := checkLegacyEnv(referenced, present)
-	if err != nil {
-		return cfg, err
-	}
-	cfg.Warnings = append(warnings, fallbacks...)
 
 	normalizeChannels(&cfg.Channels)
 	for i := range cfg.APIKeys {
@@ -466,16 +428,6 @@ func (c Config) Validate() error {
 	}
 	if c.Database.DSN == "" {
 		return fmt.Errorf("database dsn is required")
-	}
-
-	// A negative rotation setting is a typo, not an intent. Accepting it would
-	// mean deciding on the operator's behalf whether it meant "unlimited" or
-	// "off", and both readings lose data or fill a disk.
-	if c.Log.MaxSizeMB < 0 {
-		return fmt.Errorf("log.max_size_mb must not be negative (got %d; use 0 to disable rotation)", c.Log.MaxSizeMB)
-	}
-	if c.Log.MaxFiles < 0 {
-		return fmt.Errorf("log.max_files must not be negative (got %d; use 0 to keep no rotated files)", c.Log.MaxFiles)
 	}
 
 	for _, k := range c.APIKeys {

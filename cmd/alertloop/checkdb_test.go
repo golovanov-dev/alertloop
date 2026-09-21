@@ -36,7 +36,7 @@ func writeConfig(t *testing.T, dir, dbPath, logPath string) string {
 // check-db is the worker container's health check: Docker runs it every ten
 // seconds next to the real worker, from the same config. It must answer about
 // the database and touch nothing the worker owns — in particular not the
-// worker's log file, which it would otherwise append to and rotate.
+// worker's log file, which it would otherwise append to.
 func TestCheckDBReportsAReachableDatabaseAndWritesNoLog(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "alertloop.db")

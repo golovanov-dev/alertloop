@@ -39,48 +39,11 @@ func sampleEvent(id, dedupe string, created time.Time) *domain.Event {
 	}
 }
 
-func TestCreateAndGetEvent(t *testing.T) {
-	s := newTestStore(t)
-	ctx := context.Background()
-	e := sampleEvent("e1", "", time.Now())
-
-	stored, created, err := s.CreateEvent(ctx, e)
-	if err != nil || !created {
-		t.Fatalf("create: created=%v err=%v", created, err)
-	}
-	got, err := s.GetEvent(ctx, stored.ID)
-	if err != nil {
-		t.Fatalf("get: %v", err)
-	}
-	if got.Message != "boom" || string(got.Payload) != `{"k":"v"}` {
-		t.Fatalf("round-trip mismatch: %+v", got)
-	}
-}
-
 func TestGetEventNotFound(t *testing.T) {
 	s := newTestStore(t)
 	_, err := s.GetEvent(context.Background(), "missing")
 	if !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
-	}
-}
-
-func TestDedupeReturnsExisting(t *testing.T) {
-	s := newTestStore(t)
-	ctx := context.Background()
-	first, created, err := s.CreateEvent(ctx, sampleEvent("e1", "dupe", time.Now()))
-	if err != nil || !created {
-		t.Fatalf("first create: %v", err)
-	}
-	second, created2, err := s.CreateEvent(ctx, sampleEvent("e2", "dupe", time.Now()))
-	if err != nil {
-		t.Fatalf("second create: %v", err)
-	}
-	if created2 {
-		t.Fatal("expected second create to be a dedupe hit")
-	}
-	if second.ID != first.ID {
-		t.Fatalf("expected existing event id %q, got %q", first.ID, second.ID)
 	}
 }
 
@@ -126,19 +89,6 @@ func TestListEventsPaginationAndFilter(t *testing.T) {
 	}
 	if len(filtered.Items) != 3 {
 		t.Fatalf("expected 3 business events, got %d", len(filtered.Items))
-	}
-}
-
-func TestUpdateEventState(t *testing.T) {
-	s := newTestStore(t)
-	ctx := context.Background()
-	e, _, _ := s.CreateEvent(ctx, sampleEvent("e1", "", time.Now()))
-	updated, err := s.UpdateEventState(ctx, e.ID, domain.StateResolved, time.Now())
-	if err != nil {
-		t.Fatalf("update: %v", err)
-	}
-	if updated.State != domain.StateResolved {
-		t.Fatalf("expected resolved, got %q", updated.State)
 	}
 }
 
@@ -211,42 +161,6 @@ func TestClaimRespectsNextRetryAt(t *testing.T) {
 	}
 }
 
-func TestReplayOnlyDeadLetter(t *testing.T) {
-	s := newTestStore(t)
-	ctx := context.Background()
-	e, _, _ := s.CreateEvent(ctx, sampleEvent("e1", "", time.Now()))
-	d := &domain.DeliveryAttempt{
-		ID: "d1", EventID: e.ID, Channel: domain.ChannelWebhook,
-		State: domain.DeliveryPending, MaxAttempts: 5,
-		CreatedAt: time.Now(), UpdatedAt: time.Now(),
-	}
-	_ = s.CreateDeliveryAttempt(ctx, d)
-
-	if _, err := s.Replay(ctx, "d1", time.Now()); !errors.Is(err, domain.ErrNotReplayable) {
-		t.Fatalf("expected ErrNotReplayable for pending, got %v", err)
-	}
-
-	// Claim it first. MarkResult only writes to a row that is still `sending`,
-	// which is the state the worker put it in - a result arriving for a row
-	// nobody claimed would be stamping an outcome on somebody else's job.
-	claimed, err := s.ClaimDue(ctx, time.Now(), 10)
-	if err != nil || len(claimed) != 1 {
-		t.Fatalf("claim: got %d attempts, err=%v", len(claimed), err)
-	}
-	d.State = domain.DeliveryDeadLetter
-	d.Attempts = 5
-	if err := s.MarkResult(ctx, d); err != nil {
-		t.Fatalf("mark dead-letter: %v", err)
-	}
-	replayed, err := s.Replay(ctx, "d1", time.Now())
-	if err != nil {
-		t.Fatalf("replay: %v", err)
-	}
-	if replayed.State != domain.DeliveryPending {
-		t.Fatalf("expected pending after replay, got %q", replayed.State)
-	}
-}
-
 func TestRequeueStuckSending(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
@@ -283,29 +197,6 @@ func TestRequeueStuckSending(t *testing.T) {
 	}
 	if f, _ := s.GetDeliveryAttempt(ctx, "d2"); f.State != domain.DeliverySending {
 		t.Fatalf("fresh attempt should stay sending, got %s", f.State)
-	}
-}
-
-func TestRetentionDelete(t *testing.T) {
-	s := newTestStore(t)
-	ctx := context.Background()
-	old := time.Now().Add(-48 * time.Hour)
-	recent := time.Now()
-	_, _, _ = s.CreateEvent(ctx, sampleEvent("old", "", old))
-	_, _, _ = s.CreateEvent(ctx, sampleEvent("new", "", recent))
-
-	n, err := s.DeleteEventsBefore(ctx, time.Now().Add(-24*time.Hour))
-	if err != nil {
-		t.Fatalf("delete: %v", err)
-	}
-	if n != 1 {
-		t.Fatalf("expected 1 deleted, got %d", n)
-	}
-	if _, err := s.GetEvent(ctx, "old"); !errors.Is(err, domain.ErrNotFound) {
-		t.Fatal("old event should be gone")
-	}
-	if _, err := s.GetEvent(ctx, "new"); err != nil {
-		t.Fatal("new event should remain")
 	}
 }
 

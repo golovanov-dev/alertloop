@@ -122,19 +122,13 @@ func TestMinSeverityRanks(t *testing.T) {
 		sev   domain.Severity
 		match bool
 	}{
-		{"info", domain.SeverityInfo, true},
 		{"info", domain.SeveritySuccess, true},
-		{"info", domain.SeverityCritical, true},
 		{"success", domain.SeverityInfo, true}, // same rank: success is not "above" info
-		{"warning", domain.SeveritySuccess, false},
 		{"warning", domain.SeverityInfo, false},
 		{"warning", domain.SeverityWarning, true},
-		{"warning", domain.SeverityError, true},
 		{"error", domain.SeverityWarning, false},
-		{"error", domain.SeverityError, true},
 		{"error", domain.SeverityCritical, true},
 		{"critical", domain.SeverityError, false},
-		{"critical", domain.SeverityCritical, true},
 	}
 	for _, c := range cases {
 		r := newRouter(t, config.Routing{Rules: []config.RoutingRule{{

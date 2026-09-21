@@ -8,8 +8,6 @@ import (
 	"sort"
 	"strings"
 	"testing"
-
-	"gopkg.in/yaml.v3"
 )
 
 // examplePath is the config file shipped with the release. It is the one every
@@ -189,35 +187,6 @@ func TestNotifyOnResolveDefaultsToOn(t *testing.T) {
 // product's security behaviour just as the config file is.
 func envExamplePath() string { return filepath.Join("..", "..", ".env.example") }
 
-// The 2026-08-24 defect, as a test. The refusal to start without an admin token
-// is real, but it never fired: the documented `cp .env.example .env` supplied a
-// non-empty placeholder, so `substituteEnv` found a value and the installation
-// came up on a credential published in this repository. The fix — an empty
-// value — is only one edit away from being undone, and nothing else would
-// notice.
-//
-// The rule: every variable the shipped config requires WITHOUT a `:-default`
-// must be empty in .env.example. Those are exactly the ones whose absence is
-// supposed to stop startup.
-func TestEnvExampleLeavesRequiredSecretsEmpty(t *testing.T) {
-	required := requiredEnvRefs(t, examplePath())
-	if len(required) == 0 {
-		t.Fatal("no variable in the example config is required without a fallback; the startup guard is gone")
-	}
-	values := parseDotenv(t, envExamplePath())
-
-	for _, name := range required {
-		v, ok := values[name]
-		if !ok {
-			continue // not offered in .env.example at all: nothing to hand out
-		}
-		if strings.TrimSpace(v) != "" {
-			t.Errorf(".env.example sets %s=%q. The config requires it with no fallback, so a copied "+
-				".env makes the startup guard pass on a credential published in this repository. Leave it empty.", name, v)
-		}
-	}
-}
-
 // nonSecretEnvExampleVars may carry a value in .env.example: they select a
 // deployment, they do not authenticate anything. Everything else must be empty.
 //
@@ -229,10 +198,11 @@ var nonSecretEnvExampleVars = map[string]bool{
 	"COMPOSE_PROFILES": true, // which deployment `docker compose up` starts
 }
 
-// The same defect from the other side. POSTGRES_PASSWORD is not referenced by
-// the config file at all (Compose builds the DSN from it), so the check above
-// cannot see it: nothing there requires it, yet a value here is a live database
-// password in a public file. The rule is therefore blunt — every assignment in
+// The 2026-08-24 defect, as a test: `cp .env.example .env` supplied a non-empty
+// admin token placeholder, so the refusal to start without a token never fired
+// and the installation came up on a credential published in this repository.
+// POSTGRES_PASSWORD is the same risk without a config reference (Compose builds
+// the DSN from it). The rule is therefore blunt — every assignment in
 // .env.example is empty unless it is on the allowlist. A variable that needs a
 // value belongs in a comment showing the value, not in an assignment supplying
 // one, because `cp .env.example .env` copies assignments and not intentions.
@@ -260,45 +230,6 @@ func keysOf(m map[string]bool) []string {
 		out = append(out, k)
 	}
 	sort.Strings(out)
-	return out
-}
-
-// requiredEnvRefs returns the variables a config file references as ${VAR} with
-// no `:-default`: the ones whose absence stops startup.
-func requiredEnvRefs(t *testing.T, path string) []string {
-	t.Helper()
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read %s: %v", path, err)
-	}
-	var doc yaml.Node
-	if err := yaml.Unmarshal(data, &doc); err != nil {
-		t.Fatalf("parse %s: %v", path, err)
-	}
-
-	var out []string
-	seen := map[string]bool{}
-	var walk func(*yaml.Node)
-	walk = func(n *yaml.Node) {
-		if n == nil {
-			return
-		}
-		if n.Kind == yaml.ScalarNode {
-			// Submatch indices tell "${VAR}" from "${VAR:-}", exactly as
-			// substituteEnv does — the second has a default and is not required.
-			if loc := envRef.FindStringSubmatchIndex(n.Value); loc != nil && loc[4] < 0 {
-				if name := n.Value[loc[2]:loc[3]]; !seen[name] {
-					seen[name] = true
-					out = append(out, name)
-				}
-			}
-			return
-		}
-		for _, c := range n.Content {
-			walk(c)
-		}
-	}
-	walk(&doc)
 	return out
 }
 
@@ -342,10 +273,10 @@ func TestExampleConfigShipsNoAPIKeys(t *testing.T) {
 	}
 }
 
-// The example logs to stdout unless a file is asked for, and the file it would
-// write is rotated. The Compose postgres profile relies on the reference: it
-// gives the api and the worker separate files without a second config file.
-func TestExampleConfigLogsToStdoutAndRotatesWhenGivenAFile(t *testing.T) {
+// The example logs to stdout unless a file is asked for. The Compose postgres
+// profile relies on the reference: it gives the api and the worker separate
+// files without a second config file.
+func TestExampleConfigLogsToStdoutUnlessGivenAFile(t *testing.T) {
 	t.Setenv("ALERTLOOP_ADMIN_TOKEN", "a-real-token")
 
 	cfg, err := Load(examplePath())
@@ -354,9 +285,6 @@ func TestExampleConfigLogsToStdoutAndRotatesWhenGivenAFile(t *testing.T) {
 	}
 	if cfg.Log.File != "" {
 		t.Fatalf("log.file = %q with ALERTLOOP_LOG_FILE unset, want stdout only", cfg.Log.File)
-	}
-	if cfg.Log.MaxSizeMB <= 0 || cfg.Log.MaxFiles <= 0 {
-		t.Fatalf("the example ships an unrotated log file: %+v", cfg.Log)
 	}
 
 	t.Setenv("ALERTLOOP_LOG_FILE", "/var/log/alertloop/worker.log")

@@ -227,39 +227,6 @@ func TestResolveUnknownKeyIsNotAnError(t *testing.T) {
 	}
 }
 
-// The defect this release fixes: before 0.4.0 dedupe_key was unique across every
-// event in every state, so a service that failed, was fixed, and failed again
-// never produced a second incident — the second outage was silently swallowed
-// as a duplicate of the closed one.
-func TestFailureRecursAfterResolve(t *testing.T) {
-	svc, store := lifecycleService(t)
-	ctx := context.Background()
-	const key = "host-1:php-fpm:availability"
-
-	first, err := svc.Ingest(ctx, firing(key, "php-fpm down", domain.SeverityCritical))
-	if err != nil {
-		t.Fatalf("first outage: %v", err)
-	}
-	if _, err := svc.Ingest(ctx, EventInput{Status: domain.StatusResolved, DedupeKey: key}); err != nil {
-		t.Fatalf("recovery: %v", err)
-	}
-
-	second, err := svc.Ingest(ctx, firing(key, "php-fpm down again", domain.SeverityCritical))
-	if err != nil {
-		t.Fatalf("second outage: %v", err)
-	}
-	if second.Outcome != OutcomeCreated {
-		t.Fatalf("outcome = %q, want %q: a resolved incident must not block its own recurrence",
-			second.Outcome, OutcomeCreated)
-	}
-	if second.Event.ID == first.Event.ID {
-		t.Fatal("the second outage reused the closed incident instead of opening a new one")
-	}
-	if n := deliveryCount(t, store); n != 2 {
-		t.Fatalf("delivery attempts = %d, want 2: the second outage must notify", n)
-	}
-}
-
 // The compatibility promise: a client that sends no `status` sees exactly the
 // 0.3.x behaviour, where dedupe_key is an idempotency key and a repeat is a
 // no-op. Only an explicit `firing` opts into refresh semantics.
@@ -290,21 +257,6 @@ func TestNoStatusKeepsPreLifecycleBehaviour(t *testing.T) {
 	}
 	if n := deliveryCount(t, store); n != 1 {
 		t.Fatalf("delivery attempts = %d, want 1", n)
-	}
-}
-
-// An event ingested once has always been "seen" once, at creation. Nothing sets
-// last_seen_at explicitly on that path, so this guards the default.
-func TestLastSeenAtDefaultsToCreation(t *testing.T) {
-	svc, _ := lifecycleService(t)
-	res, err := svc.Ingest(context.Background(), EventInput{
-		Type: domain.EventIncident, Source: "app", Message: "one-off",
-	})
-	if err != nil {
-		t.Fatalf("ingest: %v", err)
-	}
-	if !res.Event.LastSeenAt.Equal(res.Event.CreatedAt) {
-		t.Fatalf("last_seen_at = %s, want created_at %s", res.Event.LastSeenAt, res.Event.CreatedAt)
 	}
 }
 

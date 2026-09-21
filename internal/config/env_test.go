@@ -89,58 +89,7 @@ func TestEmptyDefaultIsAllowed(t *testing.T) {
 	}
 }
 
-// Pre-0.3.0 variables are refused, not ignored, when nothing else supplies the
-// setting: a stale ALERTLOOP_DB_DSN would otherwise let the process run on a
-// database its operator did not choose.
-func TestLegacyEnvVarIsRefused(t *testing.T) {
-	t.Setenv("ALERTLOOP_DB_DSN", "postgres://stale/db")
-	_, err := loadYAMLErr(t, "addr: \":8080\"\n") // the file says nothing about the database
-	if err == nil {
-		t.Fatal("expected startup to fail on a leftover ALERTLOOP_DB_DSN")
-	}
-	if !strings.Contains(err.Error(), "ALERTLOOP_DB_DSN") || !strings.Contains(err.Error(), "database.dsn") {
-		t.Fatalf("error must name the variable and its replacement: %v", err)
-	}
-}
-
-// When the config file sets the same field itself, the outcome is unambiguous —
-// the file wins — so the leftover variable is a warning, not a refusal.
-// Refusing there would block a correct configuration: a container that still
-// exports the variable while you mount your own config file.
-func TestLegacyEnvVarOverriddenByConfigOnlyWarns(t *testing.T) {
-	t.Setenv("ALERTLOOP_DB_DSN", "postgres://stale/db")
-	cfg, err := loadYAMLErr(t, "database:\n  driver: sqlite\n  dsn: file.db\n")
-	if err != nil {
-		t.Fatalf("the config file sets database.dsn, so this must load: %v", err)
-	}
-	if cfg.Database.DSN != "file.db" {
-		t.Fatalf("dsn = %q, want the file's value", cfg.Database.DSN)
-	}
-	if len(cfg.Warnings) != 1 || !strings.Contains(cfg.Warnings[0], "ALERTLOOP_DB_DSN") {
-		t.Fatalf("expected one warning naming the variable, got %v", cfg.Warnings)
-	}
-}
-
-// The same name is fine when the file actually uses it to inject a secret.
-func TestReferencedVariableIsNotLegacy(t *testing.T) {
-	t.Setenv("ALERTLOOP_ADMIN_TOKEN", "tok")
-	cfg := loadYAML(t, "admin_token: ${ALERTLOOP_ADMIN_TOKEN}\n")
-	if cfg.AdminToken != "tok" {
-		t.Fatalf("admin_token = %q", cfg.AdminToken)
-	}
-}
-
-// Compose clears variables by setting them empty (FOO: ${FOO:-}); that is not a
-// leftover configuration attempt.
-func TestEmptyLegacyVariableIsIgnored(t *testing.T) {
-	t.Setenv("ALERTLOOP_ADDR", "")
-	if _, err := loadYAMLErr(t, "addr: \":8080\"\n"); err != nil {
-		t.Fatalf("an empty legacy variable should not fail the load: %v", err)
-	}
-}
-
-// With no config file at all, defaults still load — and a leftover variable is
-// still refused.
+// With no config file at all, defaults still load.
 func TestNoConfigFile(t *testing.T) {
 	cfg, err := Load("")
 	if err != nil {
@@ -149,17 +98,12 @@ func TestNoConfigFile(t *testing.T) {
 	if cfg.Addr != ":8080" {
 		t.Fatalf("defaults not applied: %+v", cfg)
 	}
-
-	t.Setenv("ALERTLOOP_LOG_LEVEL", "debug")
-	if _, err := Load(""); err == nil {
-		t.Fatal("expected a leftover variable to fail even with no config file")
-	}
 }
 
 // Substitution must work for every field type, not just strings. Forcing the
 // !!str tag on substituted scalars made ${VAR} unusable for retention_days,
-// worker.*, rate_limit.*, SMTP ports and cors_origins — the documentation
-// promised otherwise.
+// worker.*, rate_limit.* and SMTP ports — the documentation promised
+// otherwise.
 func TestSubstitutionWorksForNonStringFields(t *testing.T) {
 	t.Setenv("RET", "45")
 	t.Setenv("CONC", "7")
@@ -204,44 +148,5 @@ func TestAdjacentReferencesAreLeftAlone(t *testing.T) {
 	cfg := loadYAML(t, "admin_token: ${A:-tok}${B}\n")
 	if cfg.AdminToken != "${A:-tok}${B}" {
 		t.Fatalf("admin_token = %q, want the value left verbatim", cfg.AdminToken)
-	}
-}
-
-// The 0.5.0 upgrade path, as a test. The Compose file now passes
-// ALERTLOOP_LOG_FILE, but an alertloop.yaml copied from an older example does
-// not reference it — and the environment is not a second configuration layer.
-// OPERATIONS.md tells operators exactly what happens in each case; this is that
-// promise, checked.
-func TestLogFileVariableNeedsAReferenceInTheConfigFile(t *testing.T) {
-	t.Setenv("ALERTLOOP_LOG_FILE", "/var/log/alertloop/api.log")
-
-	// The file references it: the supported way to inject the path.
-	cfg := loadYAML(t, "log:\n  file: ${ALERTLOOP_LOG_FILE:-}\n")
-	if cfg.Log.File != "/var/log/alertloop/api.log" {
-		t.Fatalf("log.file = %q, want the value from the environment", cfg.Log.File)
-	}
-	if len(cfg.Warnings) != 0 {
-		t.Fatalf("a referenced variable must not warn: %v", cfg.Warnings)
-	}
-
-	// The file sets log.file itself: the file wins, and the operator is told
-	// that the variable is doing nothing.
-	cfg = loadYAML(t, "log:\n  file: \"/opt/alertloop.log\"\n")
-	if cfg.Log.File != "/opt/alertloop.log" {
-		t.Fatalf("log.file = %q, want the value from the file", cfg.Log.File)
-	}
-	if len(cfg.Warnings) == 0 || !strings.Contains(strings.Join(cfg.Warnings, "\n"), "ALERTLOOP_LOG_FILE") {
-		t.Fatalf("no warning naming the shadowed variable: %v", cfg.Warnings)
-	}
-
-	// The file says nothing about log.file: startup is refused, naming the
-	// variable and the setting that replaced it, and nothing else: there is no
-	// line in the message for anyone to paste into a config file.
-	_, err := loadYAMLErr(t, "addr: \":8080\"\n")
-	if err == nil {
-		t.Fatal("a leftover ALERTLOOP_LOG_FILE was accepted")
-	}
-	if !strings.Contains(err.Error(), "ALERTLOOP_LOG_FILE") || !strings.Contains(err.Error(), "log.file") {
-		t.Fatalf("the error does not name the variable and the setting that replaced it: %v", err)
 	}
 }

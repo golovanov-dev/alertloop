@@ -25,17 +25,14 @@ import (
 var envRef = regexp.MustCompile(`^\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}$`)
 
 // noFallbackField is the one field a ${VAR:-default} must never be offered
-// for. An empty admin_token with no api_keys leaves the JSON API open, so the
-// shipped example forbids a fallback there in so many words; the loader must
-// not advise the opposite.
+// for: the shipped example forbids a fallback for admin_token in so many
+// words, and the loader must not advise the opposite.
 const noFallbackField = "admin_token"
 
 // substituteEnv walks a parsed YAML tree and resolves every ${VAR} scalar VALUE
-// in place. Names that were resolved are recorded in seen (the caller uses them
-// to tell a referenced variable from a leftover pre-0.3.0 one). A reference with
-// no value and no default is an error naming the field and the variable: an
-// empty admin_token caused by a typo in a variable name would leave the API
-// open.
+// in place. A reference with no value and no default is an error naming the
+// field and the variable: a setting emptied by a typo in a variable name must
+// not run as if it had been left empty on purpose.
 //
 // Values only. A key is not a place to inject a secret: substitution is defined
 // over "a value equal to exactly ${VAR}", and a reference standing in a key
@@ -43,7 +40,7 @@ const noFallbackField = "admin_token"
 //
 // The returned warnings report the fallbacks that actually fired: see
 // fallbackWarning.
-func substituteEnv(n *yaml.Node, seen map[string]bool) ([]string, error) {
+func substituteEnv(n *yaml.Node) ([]string, error) {
 	type ref struct {
 		field, name string
 		line        int
@@ -65,7 +62,6 @@ func substituteEnv(n *yaml.Node, seen map[string]bool) ([]string, error) {
 				return
 			}
 			name := n.Value[loc[2]:loc[3]]
-			seen[name] = true
 			switch v, ok := os.LookupEnv(name); {
 			case ok && v != "":
 				resolveScalar(n, v, true)
@@ -108,8 +104,8 @@ func substituteEnv(n *yaml.Node, seen map[string]bool) ([]string, error) {
 	b.WriteString("config references environment variable(s) that are unset or empty and have no default:\n")
 	mayFallBack, noFallback := false, false
 	for _, r := range missing {
-		switch {
-		case r.field == "":
+		switch r.field {
+		case "":
 			fmt.Fprintf(&b, "  line %d: ${%s}\n", r.line, r.name)
 		default:
 			fmt.Fprintf(&b, "  line %d: %s — ${%s}\n", r.line, r.field, r.name)
@@ -215,88 +211,13 @@ func joinPath(prefix, name string) string {
 	return prefix + "." + name
 }
 
-// legacyEnvVars maps each pre-0.3.0 configuration variable to the name of the
-// config file setting that replaced it. The variables are gone, and a
-// leftover one is refused rather than ignored: silently dropping a stale
-// ALERTLOOP_DB_DSN would let a process run on SQLite while its operator is
-// certain it runs on PostgreSQL — the 0.1.1 failure, in reverse.
-var legacyEnvVars = map[string]string{
-	"ALERTLOOP_ADDR":                "addr",
-	"ALERTLOOP_ADMIN_TOKEN":         "admin_token",
-	"ALERTLOOP_DB_DRIVER":           "database.driver",
-	"ALERTLOOP_DB_DSN":              "database.dsn",
-	"ALERTLOOP_RETENTION_DAYS":      "retention_days",
-	"ALERTLOOP_LOG_LEVEL":           "log.level",
-	"ALERTLOOP_LOG_FORMAT":          "log.format",
-	"ALERTLOOP_LOG_FILE":            "log.file",
-	"ALERTLOOP_CORS_ORIGINS":        "cors_origins",
-	"ALERTLOOP_WORKER_CONCURRENCY":  "worker.concurrency",
-	"ALERTLOOP_WORKER_MAX_ATTEMPTS": "worker.max_attempts",
-	"ALERTLOOP_RATELIMIT_ENABLED":   "rate_limit.enabled",
-}
-
-// checkLegacyEnv reports what to do about pre-0.3.0 variables still present in
-// the environment.
-//
-// A variable is REFUSED when nothing else supplies its setting: the operator
-// believes it is in effect, and starting anyway is how a process ends up on a
-// database nobody chose. It is only WARNED about when the config file sets the
-// same field itself — the file wins, the outcome is unambiguous, and refusing
-// there would block a perfectly correct configuration (mounting your own file
-// into a container that still exports the variable).
-//
-// A variable the file references via ${VAR} is a secret being injected, which
-// is the supported use. An empty value counts as unset: Compose blanks
-// variables (FOO: ${FOO:-}) as a way of clearing them.
-func checkLegacyEnv(referenced, present map[string]bool) ([]string, error) {
-	var refused, shadowed []string
-	for name, setting := range legacyEnvVars {
-		if referenced[name] {
-			continue
-		}
-		if v, ok := os.LookupEnv(name); !ok || v == "" {
-			continue
-		}
-		if present[setting] {
-			shadowed = append(shadowed, name)
-			continue
-		}
-		refused = append(refused, name)
-	}
-	sort.Strings(refused)
-	sort.Strings(shadowed)
-
-	var warnings []string
-	for _, name := range shadowed {
-		warnings = append(warnings, fmt.Sprintf(
-			"%s is set but no longer configures anything; %s from the config file is what runs",
-			name, legacyEnvVars[name]))
-	}
-	if len(refused) == 0 {
-		return warnings, nil
-	}
-
-	var b strings.Builder
-	b.WriteString("these environment variables no longer configure AlertLoop (0.3.0 made the YAML file the single source):\n")
-	for _, name := range refused {
-		fmt.Fprintf(&b, "  %s — replaced by the %s setting in the config file\n", name, legacyEnvVars[name])
-	}
-	b.WriteString("Refusing to start rather than ignoring them, so the process cannot run on settings you believe are in effect. " +
-		"Unset each variable once the config file carries its setting.")
-	return warnings, fmt.Errorf("%s", b.String())
-}
-
 // walkKeys calls visit for every key/value pair in a parsed config file, with
 // its dotted path ("rate_limit.trusted_proxies", "channels.email.host"); visit
 // reports whether the value should be descended into. Elements of a list carry
-// no index — a list of structs has one shape, and both callers care about the
+// no index — a list of structs has one shape, and the caller cares about the
 // shape rather than the position. visit receives plain=false when some segment
 // of the path is not a plain key name, so the dotted string does not mean what
 // it looks like.
-//
-// One walk, used by both readers of the tree (collectFields and
-// checkUnknownKeys): two walks written separately would drift, and the one that
-// drifted would be the one deciding whether a key is known.
 //
 // It carries no budget of its own, because it runs AFTER the document has been
 // decoded. yaml.v3 bounds alias expansion at Decode, so a file whose anchors
@@ -359,7 +280,7 @@ func keyName(n *yaml.Node) (name string, plain bool) {
 }
 
 // schema is what the Config types say a file may contain, derived once per
-// load and shared by both readers of the tree.
+// load.
 type schema struct {
 	known      map[string]bool // every path yaml.v3 can decode
 	containers map[string]bool // the ones with keys below them
@@ -371,8 +292,7 @@ func configSchema() schema {
 	return schema{known: known, containers: containers, freeform: freeform}
 }
 
-// descend reports whether a walk should look below this key. Both walks use
-// this one rule, so neither can see more of the file than the other.
+// descend reports whether the key walk should look below this key.
 func (s schema) descend(path string, plain bool) bool {
 	// A top-level "x-" key holds YAML anchors and nothing else — the convention
 	// Compose uses for the same purpose. It is the only way to declare a
@@ -386,22 +306,6 @@ func (s schema) descend(path string, plain bool) bool {
 	// would. An unknown or non-plain key is a mistake reported once, not once
 	// per line under it.
 	return plain && s.known[path] && s.containers[path]
-}
-
-// collectFields records the dotted paths a config file actually sets, so a
-// leftover variable can be told from one the file overrides. A path that is not
-// plain is not recorded: "log.level: x" in the root does not set log.level, and
-// treating it as if it did would turn a refused leftover variable into a
-// warning.
-func collectFields(n *yaml.Node, s schema) map[string]bool {
-	out := map[string]bool{}
-	walkKeys(n, func(path string, _, _ *yaml.Node, plain bool) bool {
-		if plain {
-			out[path] = true
-		}
-		return s.descend(path, plain)
-	})
-	return out
 }
 
 // --- unknown keys ---------------------------------------------------------

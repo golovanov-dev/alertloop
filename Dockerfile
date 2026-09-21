@@ -48,18 +48,9 @@ RUN apk add --no-cache ca-certificates tzdata && \
 WORKDIR /data
 COPY --from=build /out/alertloop /usr/local/bin/alertloop
 
-# Built-in configuration, so the image runs with no files supplied. Since
-# 0.3.0 the config file is the only source of settings; the environment just
-# fills the ${VAR} references in it, which is how the admin token gets in
-# without being baked into the image. Mount your own file over this path — or
-# point ALERTLOOP_CONFIG elsewhere — to replace it entirely.
-#
-# ${ALERTLOOP_ADMIN_TOKEN} carries NO default. With an empty token and no API
-# keys the API accepts everything with full scope, so `docker run` with no
-# environment used to hand out an unauthenticated service that can create,
-# read, and modify events and replay deliveries. Now it refuses to start and
-# names the variable. The entrypoint below turns that into an instruction
-# rather than a stack trace.
+# Built-in configuration, so the image runs with no files supplied. The admin
+# token has no default: without ALERTLOOP_ADMIN_TOKEN the process refuses to
+# start and names the variable. Mount your own file over this path to replace it.
 RUN mkdir -p /etc/alertloop && { \
       echo '# Default configuration shipped inside the AlertLoop image.'; \
       echo 'admin_token: ${ALERTLOOP_ADMIN_TOKEN}'; \
@@ -67,12 +58,6 @@ RUN mkdir -p /etc/alertloop && { \
       echo '  driver: sqlite'; \
       echo '  dsn: /data/alertloop.db'; \
     } > /etc/alertloop/alertloop.yaml
-
-# A first-run check that explains itself. Without it the failure is a config
-# error about an unset variable, which is correct but tells a newcomer nothing
-# about what to do.
-COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
 
 USER alertloop
 EXPOSE 8080
@@ -82,5 +67,5 @@ VOLUME ["/data"]
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s \
     CMD wget -qO- http://127.0.0.1:8080/health/ready || exit 1
 
-ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+ENTRYPOINT ["/usr/local/bin/alertloop"]
 CMD ["all"]

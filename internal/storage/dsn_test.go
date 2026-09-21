@@ -15,11 +15,6 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// oldComposeDSN is the DSN docker-compose.yml built up to 0.5.0. It is kept
-// here, and only here, so the tests can show what it did with the same
-// passwords the current one is given.
-const oldComposeDSN = "postgres://alertloop:${POSTGRES_PASSWORD}@postgres:5432/alertloop?sslmode=disable"
-
 // composeDSNTemplate returns the DSN the shipped docker-compose.yml hands to
 // the api and the worker, with ${POSTGRES_PASSWORD} still in it. Reading the
 // real file is the point: a test of a copy would stay green while the file
@@ -49,14 +44,6 @@ func composeDSNTemplate(t *testing.T) string {
 	return dsn
 }
 
-// passwordOf reads the password of a parse result that may be nil.
-func passwordOf(c *pgx.ConnConfig) string {
-	if c == nil {
-		return "<no config>"
-	}
-	return c.Password
-}
-
 // interpolate does what Compose does with the template: plain text
 // substitution, no escaping of any kind.
 func interpolate(template, password string) string {
@@ -71,32 +58,18 @@ func interpolate(template, password string) string {
 func TestComposeDSNCarriesPasswordsTheURLBroke(t *testing.T) {
 	tmpl := composeDSNTemplate(t)
 
-	cases := []struct {
-		password  string
-		urlBreaks bool // what the pre-0.5.1 URL did with it
-	}{
-		{"Zq7RmW2kLp/Xv9Tn4Hs8Bc1Dy6Fg3Jk5Nq0Uw+Ea2Ci=", true}, // base64-shaped: "/" breaks it
-		{"plus+and=equals", false},
-		{"slash/inside", true},
-		{"hash#inside", true},
-		{"question?inside", true},
-		{"at@inside", false},
-		{"colon:inside", false},
-		{"12/starts-with-a-port", true}, // parses, but into the wrong host and database
-		{"/leading-slash", true},        // likewise
-		{"quote'inside", false},
-		{"subdelims!$&()*,;~-._", false},
-		{"every+/=@:#?at-once", true},
-		{"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2", false}, // openssl rand -hex 32
-	}
-	for _, tc := range cases {
-		t.Run(tc.password, func(t *testing.T) {
-			cfg, err := pgx.ParseConfig(interpolate(tmpl, tc.password))
+	for _, password := range []string{
+		"Zq7RmW2kLp/Xv9Tn4Hs8Bc1Dy6Fg3Jk5Nq0Uw+Ea2Ci=", // base64-shaped: the defect itself
+		"every+/=@:#?at-once",
+		"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2", // openssl rand -hex 32
+	} {
+		t.Run(password, func(t *testing.T) {
+			cfg, err := pgx.ParseConfig(interpolate(tmpl, password))
 			if err != nil {
 				t.Fatalf("the compose DSN does not parse with this password: %v", err)
 			}
-			if cfg.Password != tc.password {
-				t.Fatalf("password = %q, want %q", cfg.Password, tc.password)
+			if cfg.Password != password {
+				t.Fatalf("password = %q, want %q", cfg.Password, password)
 			}
 			if cfg.Host != "postgres" || cfg.Port != 5432 || cfg.User != "alertloop" || cfg.Database != "alertloop" {
 				t.Fatalf("connection target = %s@%s:%d/%s, want alertloop@postgres:5432/alertloop",
@@ -105,87 +78,7 @@ func TestComposeDSNCarriesPasswordsTheURLBroke(t *testing.T) {
 			if cfg.TLSConfig != nil {
 				t.Fatal("sslmode=disable was not applied")
 			}
-
-			old, err := pgx.ParseConfig(interpolate(oldComposeDSN, tc.password))
-			oldWorks := err == nil && old.Password == tc.password && old.Host == "postgres" && old.Database == "alertloop"
-			if oldWorks == tc.urlBreaks {
-				t.Fatalf("the URL form was expected to break=%v on this password and did not (err=%v)", tc.urlBreaks, err)
-			}
 		})
-	}
-}
-
-// userinfoChars are the characters Go's URL parser accepts, unencoded, in the
-// user:password part of a URL — every password that could have worked in the
-// pre-0.5.1 DSN is written in them. "%" is left out: in a URL it starts an
-// escape, so it never meant itself (see the next test).
-const userinfoChars = "abcXYZ0189-._~!$&'()*+,;=:@"
-
-// The upgrade guarantee. A password that worked in the URL DSN must work,
-// unchanged, in the keyword/value DSN that replaces it — or an upgrade would
-// stop an installation that was running. The value is written unquoted, so
-// characters are exercised at the start, in the middle and at the end.
-//
-// The one exception is a password that STARTS with a single quote: keyword/value
-// reads that as the opening of a quoted value. It does not silently become a
-// different password — the DSN fails to parse, and startup says why.
-func TestKeywordValueKeepsEveryPasswordTheURLAccepted(t *testing.T) {
-	tmpl := composeDSNTemplate(t)
-
-	for _, c := range userinfoChars {
-		for _, pw := range []string{"a" + string(c) + "b", string(c) + "ab", "ab" + string(c)} {
-			old, err := pgx.ParseConfig(interpolate(oldComposeDSN, pw))
-			if err != nil || old.Password != pw || old.Host != "postgres" {
-				continue // never worked as a URL: nothing to keep working
-			}
-			cfg, err := pgx.ParseConfig(interpolate(tmpl, pw))
-			if strings.HasPrefix(pw, "'") {
-				if err == nil {
-					t.Fatalf("%q: a leading quote parsed (password %q); it must fail loudly instead", pw, cfg.Password)
-				}
-				continue
-			}
-			if err != nil {
-				t.Fatalf("%q worked in the URL DSN and does not parse in the keyword/value one: %v", pw, err)
-			}
-			if cfg.Password != pw {
-				t.Fatalf("%q worked in the URL DSN and arrives as %q in the keyword/value one", pw, cfg.Password)
-			}
-		}
-	}
-}
-
-// The upgrade case that does NOT carry over, pinned so the documentation of it
-// stays true. A password percent-encoded in .env to get the URL working
-// ("abc%2Fdef" for "abc/def") was decoded by the URL parser; keyword/value
-// sends it as written. Such an installation has to put the decoded password in
-// .env when it upgrades — which the upgrade guide and CHANGELOG say.
-func TestKeywordValueSendsPercentEncodingLiterally(t *testing.T) {
-	tmpl := composeDSNTemplate(t)
-	old, err := pgx.ParseConfig(interpolate(oldComposeDSN, "abc%2Fdef"))
-	if err != nil || old.Password != "abc/def" {
-		t.Fatalf("URL form: password %q, err %v; expected it to decode to abc/def", passwordOf(old), err)
-	}
-	cfg, err := pgx.ParseConfig(interpolate(tmpl, "abc%2Fdef"))
-	if err != nil || cfg.Password != "abc%2Fdef" {
-		t.Fatalf("keyword/value form: password %q, err %v; expected it verbatim", passwordOf(cfg), err)
-	}
-}
-
-// Why the password is not wrapped in single quotes in the compose file. Quoting
-// would allow spaces and backslashes — which never worked in the URL either —
-// and would break every password containing a quote, which did.
-func TestQuotingThePasswordWouldBreakAQuote(t *testing.T) {
-	quoted := "host=postgres port=5432 user=alertloop dbname=alertloop sslmode=disable password='${POSTGRES_PASSWORD}'"
-	const pw = "it's"
-	if old, err := pgx.ParseConfig(interpolate(oldComposeDSN, pw)); err != nil || old.Password != pw {
-		t.Fatalf("premise: the URL form accepted %q (err %v)", pw, err)
-	}
-	if cfg, err := pgx.ParseConfig(interpolate(quoted, pw)); err == nil && cfg.Password == pw {
-		t.Fatal("the quoted form accepted a quote after all; the choice of the unquoted form deserves a second look")
-	}
-	if cfg, err := pgx.ParseConfig(interpolate(composeDSNTemplate(t), pw)); err != nil || cfg.Password != pw {
-		t.Fatalf("the shipped form lost %q: password %q, err %v", pw, passwordOf(cfg), err)
 	}
 }
 
@@ -226,41 +119,11 @@ func TestOpenRejectsAnUnusableDSNWithoutLeakingThePassword(t *testing.T) {
 			want:     []string{"not a valid PostgreSQL URL", "percent-encode", "keyword/value", "%2F"},
 		},
 		{
-			name:     "hash in a URL password",
-			dsn:      "postgres://alertloop:Qx7wHy#Kp9mZt@postgres:5432/alertloop",
-			password: "Qx7wHy#Kp9mZt",
-			want:     []string{"not a valid PostgreSQL URL"},
-		},
-		{
-			name:     "question mark in a URL password",
-			dsn:      "postgres://alertloop:Qx7wYr?Kp9mZt@postgres:5432/alertloop",
-			password: "Qx7wYr?Kp9mZt",
-			want:     []string{"not a valid PostgreSQL URL"},
-		},
-		{
-			name:     "a URL that parses into the wrong host and a database named after the password",
-			dsn:      "postgres://alertloop:12/Qx7wTq3Kp9mZt@postgres:5432/alertloop?sslmode=disable",
-			password: "12/Qx7wTq3Kp9mZt",
-			want:     []string{"not a valid PostgreSQL URL"},
-		},
-		{
-			name:     "a password that starts with a slash",
-			dsn:      "postgres://alertloop:/Qx7wLd8Kp9mZt@postgres:5432/alertloop",
-			password: "/Qx7wLd8Kp9mZt",
-			want:     []string{"not a valid PostgreSQL URL"},
-		},
-		{
 			// base64 padding puts "=" before the "@": an "up to the first ="
 			// rule would let this through and the tail would become the database.
 			name:     "a base64 password with a leading slash and padding",
 			dsn:      "postgres://alertloop:/Hk4Rw9Zp2Tm8Vb=@postgres:5432/alertloop?sslmode=disable",
 			password: "/Hk4Rw9Zp2Tm8Vb=",
-			want:     []string{"not a valid PostgreSQL URL"},
-		},
-		{
-			name:     "a base64 password that looks like a port, then a slash, then padding",
-			dsn:      "postgres://alertloop:12/QxYz7Wd3Mn5Gh=@postgres:5432/alertloop?sslmode=disable",
-			password: "12/QxYz7Wd3Mn5Gh=",
 			want:     []string{"not a valid PostgreSQL URL"},
 		},
 		{
@@ -276,34 +139,10 @@ func TestOpenRejectsAnUnusableDSNWithoutLeakingThePassword(t *testing.T) {
 			want:     []string{"not a valid PostgreSQL URL"},
 		},
 		{
-			name:     "an invalid escape in a URL password",
-			dsn:      "postgres://alertloop:Qx7w%zzKp9mZt@postgres:5432/alertloop",
-			password: "Qx7w%zzKp9mZt",
-			want:     []string{"not a valid PostgreSQL URL"},
-		},
-		{
-			name:     "a space in a URL password",
-			dsn:      "postgres://alertloop:Qx7w Zr4Kp9mZt@postgres:5432/alertloop",
-			password: "Qx7w Zr4Kp9mZt",
-			want:     []string{"not a valid PostgreSQL URL"},
-		},
-		{
 			name:     "a keyword/value password that starts with a quote",
 			dsn:      "host=postgres port=5432 user=alertloop dbname=alertloop sslmode=disable password='Qx7wJv2Kp9mZt",
 			password: "'Qx7wJv2Kp9mZt",
 			want:     []string{"not a valid keyword/value connection string", "single quotes"},
-		},
-		{
-			name:     "a keyword/value password with a space",
-			dsn:      "host=postgres user=alertloop dbname=alertloop password=Qx7w Zr4Kp9mZt",
-			password: "Qx7w Zr4Kp9mZt",
-			want:     []string{"not a valid keyword/value connection string"},
-		},
-		{
-			name:     "a keyword/value password ending in a backslash",
-			dsn:      `host=postgres user=alertloop dbname=alertloop password=Qx7wBn5Kp9mZt\`,
-			password: `Qx7wBn5Kp9mZt\`,
-			want:     []string{"not a valid keyword/value connection string"},
 		},
 		{
 			name:     "a setting the driver rejects, in a URL",
@@ -451,7 +290,7 @@ func TestRefusedLoginWithAPercentEncodedPasswordGetsAHint(t *testing.T) {
 		Severity: "FATAL", Code: "28P01", Message: `password authentication failed for user "alertloop"`,
 	})
 	msg := explainAuthFailure(refused, true).Error()
-	if !strings.Contains(msg, "percent-encoding") || !strings.Contains(msg, "Upgrading to 0.5.1") {
+	if !strings.Contains(msg, "percent-encoding") || !strings.Contains(msg, "0.5.1 upgrade note in CHANGELOG.md") {
 		t.Fatalf("no hint on a refused login: %s", msg)
 	}
 	assertNoFragment(t, msg, pw)

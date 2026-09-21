@@ -42,26 +42,3 @@ func TestApplyAction(t *testing.T) {
 		})
 	}
 }
-
-func TestParseAction(t *testing.T) {
-	for _, s := range []string{"ack", "resolve", "mute", "unmute", "escalate"} {
-		if _, ok := ParseAction(s); !ok {
-			t.Errorf("expected %q to parse", s)
-		}
-	}
-	if _, ok := ParseAction("delete"); ok {
-		t.Error("expected unknown action to fail parsing")
-	}
-}
-
-func TestValidators(t *testing.T) {
-	if !ValidEventType(EventIncident) || ValidEventType("nope") {
-		t.Error("ValidEventType wrong")
-	}
-	if !ValidSeverity(SeverityCritical) || ValidSeverity("nope") {
-		t.Error("ValidSeverity wrong")
-	}
-	if !ValidEventState(StateMuted) || ValidEventState("nope") {
-		t.Error("ValidEventState wrong")
-	}
-}

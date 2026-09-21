@@ -483,19 +483,19 @@ func scanDelivery(sc interface{ Scan(...any) error }) (*domain.DeliveryAttempt, 
 	return &d, nil
 }
 
-// AlertedChannels lists the channels that were told, or are still going to be
-// told, about eventID. It is who a recovery notice goes to: exactly the
-// recipients of the alert, and nobody else.
+// AlertedChannels lists the channels an alert for eventID was queued to, in any
+// state. It is who a recovery notice goes to: exactly the recipients of the
+// alert, and nobody else.
 //
-// A dead-lettered attempt is excluded — that channel never received the alert
-// and never will, so a bare "resolved" would be the only thing it ever saw. An
-// attempt still pending, sending, or retrying IS included: it will be delivered,
-// and the recipient would otherwise be left with a problem that never ended.
+// A dead-lettered alert IS included. Its recovery is created anyway and waits:
+// ClaimDue does not release a recovery until its alert is sent, so after the
+// alert is replayed both go out, in order. Leaving that channel out would make
+// a replay deliver "down" with no "back up" ever following it.
 func (s *sqlStore) AlertedChannels(ctx context.Context, eventID string) ([]domain.ChannelTarget, error) {
 	q := s.d.rebind(`SELECT DISTINCT channel, channel_name FROM delivery_attempts
-		WHERE event_id = ? AND kind = ? AND state <> ?
+		WHERE event_id = ? AND kind = ?
 		ORDER BY channel_name`)
-	rows, err := s.db.QueryContext(ctx, q, eventID, domain.KindAlert, domain.DeliveryDeadLetter)
+	rows, err := s.db.QueryContext(ctx, q, eventID, domain.KindAlert)
 	if err != nil {
 		return nil, fmt.Errorf("list alerted channels: %w", err)
 	}
@@ -706,26 +706,6 @@ func (s *sqlStore) countByColumn(ctx context.Context, table, column string) (map
 		out[k] = n
 	}
 	return out, rows.Err()
-}
-
-func (s *sqlStore) ActiveChannelNames(ctx context.Context) ([]string, error) {
-	q := s.d.rebind(`SELECT DISTINCT channel_name FROM delivery_attempts
-		WHERE state IN (?, ?, ?)`)
-	rows, err := s.db.QueryContext(ctx, q,
-		domain.DeliveryPending, domain.DeliveryFailed, domain.DeliverySending)
-	if err != nil {
-		return nil, fmt.Errorf("active channel names: %w", err)
-	}
-	defer rows.Close()
-	var names []string
-	for rows.Next() {
-		var n string
-		if err := rows.Scan(&n); err != nil {
-			return nil, err
-		}
-		names = append(names, n)
-	}
-	return names, rows.Err()
 }
 
 // --- Helpers --------------------------------------------------------------

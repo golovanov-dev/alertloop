@@ -23,8 +23,8 @@ admin-clean: ## Remove built admin assets
 
 all-build: admin build ## Build the admin UI and then the binary that embeds it
 
-run: build ## Run all-in-one mode against a local SQLite database
-	./bin/alertloop all
+run: build ## Run all-in-one mode against a local SQLite database (needs ALERTLOOP_ADMIN_TOKEN)
+	./bin/alertloop --config alertloop.example.yaml all
 
 test: ## Run the full test suite (PostgreSQL tests skip without a DSN)
 	go test ./...

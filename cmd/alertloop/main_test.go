@@ -45,7 +45,7 @@ func TestSetupLoggerWritesToBothStdoutAndFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "var", "log", "alertloop", "alertloop.log")
 
 	out := captureStdout(t, func() {
-		log, closer, err := setupLogger(config.Logging{Level: "info", Format: "text", File: path, MaxSizeMB: 50, MaxFiles: 5})
+		log, closer, err := setupLogger(config.Logging{Level: "info", Format: "text", File: path})
 		if err != nil {
 			t.Fatalf("setupLogger: %v", err)
 		}
@@ -88,29 +88,32 @@ func TestSetupLoggerWithoutAFileWritesToStdoutOnly(t *testing.T) {
 	}
 }
 
-// The rotation settings must reach the file writer: a log.file that grows
-// without bound is one of the three causes in the "disk filled up" runbook.
-func TestSetupLoggerRotatesTheFile(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "alertloop.log")
+// logrotate's copytruncate copies the file and truncates it in place while
+// AlertLoop keeps it open. The next line must start the truncated file, not
+// land at the old offset behind a run of zero bytes.
+func TestTheLogFileSurvivesCopytruncate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "alertloop.log")
 
 	captureStdout(t, func() {
-		log, closer, err := setupLogger(config.Logging{Level: "info", Format: "text", File: path, MaxSizeMB: 1, MaxFiles: 1})
+		log, closer, err := setupLogger(config.Logging{Level: "info", Format: "text", File: path})
 		if err != nil {
 			t.Fatalf("setupLogger: %v", err)
 		}
 		defer closer.Close()
-		filler := strings.Repeat("x", 1024)
-		for i := 0; i < 1500; i++ {
-			log.Info("noise", "filler", filler)
+		log.Info("before rotation")
+		if err := os.Truncate(path, 0); err != nil {
+			t.Fatalf("truncate: %v", err)
 		}
+		log.Info("after rotation")
 	})
 
-	if _, err := os.Stat(path + ".1"); err != nil {
-		t.Fatalf("the log file was never rotated: %v", err)
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := os.Stat(path + ".2"); !os.IsNotExist(err) {
-		t.Fatal("more generations kept than max_files allows")
+	if !strings.HasPrefix(string(b), "time=") || !strings.Contains(string(b), "after rotation") ||
+		strings.Contains(string(b), "before rotation") {
+		t.Fatalf("after truncation the file holds %q", b)
 	}
 }
 
