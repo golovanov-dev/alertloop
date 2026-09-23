@@ -12,6 +12,7 @@ package channels
 
 import (
 	"context"
+	"time"
 
 	"github.com/golovanov-dev/alertloop/internal/domain"
 )
@@ -22,6 +23,9 @@ type Channel interface {
 	Type() domain.ChannelType
 	// Name is the unique identifier of this configured channel instance.
 	Name() string
+	// Timeout is how long one Send may take. The worker gives each attempt
+	// exactly this long; zero means the worker's default.
+	Timeout() time.Duration
 	// Send delivers the notification. A non-nil error means the attempt failed
 	// and is eligible for retry. Send must respect ctx cancellation/deadlines.
 	Send(ctx context.Context, n domain.Notification) error

@@ -19,7 +19,7 @@ admin-dev: ## Run the admin console dev server (proxies /v1 to localhost:8080)
 	cd $(ADMIN_DIR) && npm run dev
 
 admin-clean: ## Remove built admin assets
-	rm -rf internal/adminui/dist/assets internal/adminui/dist/config.js
+	rm -rf internal/adminui/dist/assets
 
 all-build: admin build ## Build the admin UI and then the binary that embeds it
 

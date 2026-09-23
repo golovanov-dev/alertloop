@@ -94,8 +94,9 @@ The message arrives in Telegram within a few seconds. If it does not, see
 - Switch profiles by editing `COMPOSE_PROFILES` in `.env`, not with `--profile`:
   the flag replaces the value for that one command.
 - Port 8080 taken on the host: set `ALERTLOOP_PORT` in `.env`.
-- Pin the image in production: uncomment `ALERTLOOP_IMAGE` in `.env` and set the
-  release you run (`0.6.1`, without the `v`).
+- The image is pinned: `ALERTLOOP_IMAGE` in `.env` names the release you run
+  (`0.6.1`, without the `v`); without it Compose runs the release of the
+  checked-out tag, never `:latest`.
 - After editing `alertloop.yaml`, apply it with
   `docker compose up -d --force-recreate --wait --wait-timeout 120 api worker`.
 
@@ -123,8 +124,8 @@ The installer creates the `alertloop` user, `/etc/alertloop/alertloop.yaml`,
 `/etc/alertloop/alertloop.env` with a generated admin token. Logs:
 `journalctl -u alertloop -f`.
 
-The binary listens on `:8080` on every interface. Change `addr` in the config
-(`addr: "127.0.0.1:8080"`) to keep it local behind a reverse proxy.
+The binary listens on `127.0.0.1:8080` (`addr` in the config); reach it from
+outside through the reverse proxy below.
 
 ### Try it without configuring anything
 
@@ -139,13 +140,19 @@ docker compose up -d --wait --wait-timeout 120
 
 One container on SQLite. Open <http://localhost:8080/admin> and sign in with
 `change-me-admin`. The demo takes no channels: it stores events and delivers
-nothing.
+nothing. This public token works only from loopback or a private network: from a
+public address, or through a reverse proxy that sends `X-Forwarded-For` or
+`X-Real-IP` (the examples in `deploy/proxy/` do), it gets 403. Beyond a local
+try, set `ALERTLOOP_ADMIN_TOKEN` in `.env` to the output of
+`openssl rand -hex 32`.
 
 ## Admin console and HTTPS
 
 The admin console is at `/admin`, served by the same process as the API; sign
-in with the admin token. On a server, reach it through an HTTPS reverse proxy:
-both Compose profiles publish the port on `127.0.0.1` only.
+in with the admin token or an API key with scope `full`. A `read` or `ingest`
+key is refused. On a server, reach it through an HTTPS reverse proxy:
+the binary and the Compose `postgres` profile are reachable on `127.0.0.1` only.
+The demo token does not work through a proxy (see above).
 
 AlertLoop speaks plain HTTP. Put an HTTPS reverse proxy in front; one rule
 covers the API, `/admin`, and `/swagger`. Ready-to-adapt configs:
@@ -165,7 +172,9 @@ docker network inspect alertloop_default -f '{{range .IPAM.Config}}{{.Gateway}}{
 The API accepts the admin token (full access) or an API key. For each event
 source, create a key with the least scope it needs — `ingest` to send events,
 `read` for dashboards, `full` for trusted tools — under `api_keys` in the
-config (see `alertloop.example.yaml`). The full reference is Swagger UI at
+config (see `alertloop.example.yaml`). Limit an `ingest` key to its sources
+with `sources: [web-01]`: it then cannot touch other sources' events. An
+`ingest` key gets back only `id`, `state` and `outcome`. The full reference is Swagger UI at
 `/swagger`; the contract is `api/openapi.yaml`, also served at `/openapi.yaml`.
 
 ### Incident lifecycle
@@ -192,20 +201,34 @@ curl -X POST http://127.0.0.1:8080/v1/events \
 - `dedupe_key` is the incident's identity: keep it stable for one check
   (`host:service:check`), with no timestamps, ids, or measured values in it.
 - After a resolve, the same failure opens a new incident and notifies again.
+- A `firing` with a higher severity alerts the channels the new severity routes
+  to that have not had an alert for this incident; a muted incident alerts
+  nobody, and a rise during mute is not sent after unmute either. The same or
+  a lower severity notifies nobody.
 - A resolve for a key AlertLoop has never seen returns `204`.
 - The recovery notice goes to the channels that received the alert and to no
   others. Turn it off with `notify_on_resolve: false`.
-- Without `status`, `dedupe_key` is a plain idempotency key: a repeat returns the
-  stored event unchanged.
+- Mute stops notifications about an incident: alerts not sent yet are
+  `cancelled`, and an incident closed while muted gets no recovery notice,
+  whoever closes it. An alert
+  being sent at the moment of mute is cancelled too if that send fails; one
+  that already went out is delivered. That send is cancelled only while the
+  incident is still muted when it fails: acknowledged or resolved in the
+  meantime, the alert is retried, and after a resolve no recovery follows it.
+  A `dead_letter` alert is not cancelled: replaying it sends it.
+- Without `status`, `dedupe_key` is a plain idempotency key while the event is
+  open: a repeat returns the stored event unchanged. Once the event is resolved,
+  the same key creates a new event.
 
 ### Event state is not delivery state
 
-Delivery state (`sent`, `failed`, `dead_letter`) says whether a message was
+Delivery state (`sent`, `failed`, `dead_letter`, `cancelled`) says whether a message was
 delivered; see it per channel in the console or at `GET /v1/delivery-attempts`.
 Event state says whether anyone has dealt with the event, and it changes only
 when a person acts on it or a source sends `status: resolved`. A delivered event
-stays `new`; for a `business_event` or an `audit` entry that is the normal
-resting state.
+stays `new`. Actions apply to incidents only, so for a `business_event` or an
+`audit` entry `new` is the normal resting state. `escalate` only marks an
+incident as escalated; it sends no notifications.
 
 Do not send `status: firing` for a stream of business events under one
 `dedupe_key`: only the first one would notify. Send them without `status`, or
@@ -252,6 +275,13 @@ mirror:
 
 MTProto proxies do not work for the Bot API. Without `proxy`, the standard
 `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` variables apply.
+
+A webhook channel POSTs JSON `{"event": {...}, "kind": "alert"|"recovery",
+"timestamp": "<RFC 3339>"}`. With `secret` set, each request carries
+`X-AlertLoop-Signature-Version: v1` and `X-AlertLoop-Signature`: the lowercase
+hex HMAC-SHA256 of the raw request body, keyed by the secret, with no prefix.
+The receiver computes the same over the bytes it received and compares in
+constant time.
 
 ### Routing rules
 
@@ -339,7 +369,9 @@ rotation: [Reading AlertLoop's own logs](OPERATIONS.md#reading-alertloops-own-lo
 - `all` — API and delivery worker in one process (default);
 - `server` — HTTP API and admin console;
 - `worker` — delivery and retention cleanup;
-- `check-db` — load the config, ping the database, exit 0 if it answered.
+- `check-db` — check what `server` and `all` check at startup (config,
+  credential, database reachable and not newer than the binary, log file
+  writable), exit 0 if all pass. It changes nothing.
 
 With `server` and `worker` separate, both must load the same config file and run
 the same version. The Compose postgres profile mounts one `alertloop.yaml` into
@@ -359,8 +391,9 @@ finding becomes an incident that opens and closes by itself. Details:
 ## Production notes
 
 - Serve it over HTTPS: the admin token travels with each request.
-- Alert on `deliveries.dead_letter` from `/v1/stats`, and check `/health/ready`
-  from another host: see [OPERATIONS.md](OPERATIONS.md).
+- Alert on `worker_last_tick_at`, `oldest_due_delivery_age_seconds` and
+  `dead_letter_last_24h` from `/v1/stats`, and check `/health/ready` from
+  another host: see [OPERATIONS.md](OPERATIONS.md).
 - Back up before upgrading: migrations run at startup, and downgrading is not
   supported.
 

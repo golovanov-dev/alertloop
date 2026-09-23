@@ -161,3 +161,15 @@ func TestSetupLoggerHonoursFormatAndLevel(t *testing.T) {
 		t.Fatalf("time %q is not UTC", ts)
 	}
 }
+
+// A log file that does not exist yet passes when its directory can be created,
+// and the check leaves nothing behind: neither the file nor its probe.
+func TestCheckLogFileMissingFileLeavesNothing(t *testing.T) {
+	dir := t.TempDir()
+	if err := checkLogFile(filepath.Join(dir, "logs", "alertloop.log")); err != nil {
+		t.Fatalf("checkLogFile: %v", err)
+	}
+	if left, _ := os.ReadDir(dir); len(left) != 0 {
+		t.Fatalf("the check left %d entries in %s", len(left), dir)
+	}
+}

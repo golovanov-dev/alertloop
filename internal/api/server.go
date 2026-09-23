@@ -19,7 +19,8 @@ type Server struct {
 	events         *service.EventService
 	deliveries     *service.DeliveryService
 	routing        *routing.Router
-	apiKeys        map[string]string // key -> scope
+	apiKeys        map[string]string   // key -> scope
+	apiKeySources  map[string][]string // key -> allowed sources
 	adminToken     string
 	version        string
 	trustedProxies *TrustedProxies
@@ -38,12 +39,15 @@ type Config struct {
 	Deliveries *service.DeliveryService
 	// Routing backs the routing preview endpoints. Nil is treated as "routing
 	// not configured".
-	Routing    *routing.Router
-	APIKeys    map[string]string // key -> scope (ingest|read|full)
-	AdminToken string
-	Version    string
-	RateLimit  config.RateLimit
-	Logger     *slog.Logger
+	Routing *routing.Router
+	APIKeys map[string]string // key -> scope (ingest|read|full)
+	// APIKeySources limits ingest keys to their sources: key -> allowed
+	// `source` values. A key absent from it may report every source.
+	APIKeySources map[string][]string
+	AdminToken    string
+	Version       string
+	RateLimit     config.RateLimit
+	Logger        *slog.Logger
 	// TrustedProxies decides whose X-Forwarded-For is believed when the per-IP
 	// limiter identifies a client. Nil trusts nothing.
 	TrustedProxies *TrustedProxies
@@ -66,6 +70,7 @@ func NewServer(c Config) *Server {
 		deliveries:     c.Deliveries,
 		routing:        router,
 		apiKeys:        c.APIKeys,
+		apiKeySources:  c.APIKeySources,
 		adminToken:     c.AdminToken,
 		version:        c.Version,
 		trustedProxies: c.TrustedProxies,
@@ -99,7 +104,7 @@ func (s *Server) Handler() http.Handler {
 	api.HandleFunc("POST /v1/routing/preview", requireScope(config.ScopeFull, s.handleRoutingPreview))
 	api.HandleFunc("GET /v1/stats", requireScope(config.ScopeRead, s.handleStats))
 	api.HandleFunc("GET /v1/info", requireScope(config.ScopeRead, s.handleInfo))
-	mux.Handle("/v1/", apiKeyAuth(s.apiKeys, s.adminToken, api))
+	mux.Handle("/v1/", apiKeyAuth(s.apiKeys, s.apiKeySources, s.adminToken, api))
 
 	// Admin console SPA (static, unguarded assets — the app authenticates via
 	// the API using the admin token).
@@ -131,7 +136,7 @@ func (s *Server) Handler() http.Handler {
 	if s.ipLimiter != nil {
 		h = perIPLimit(s.ipLimiter, s.trustedProxies, h)
 	}
-	return logging(s.log, securityHeaders(h))
+	return logging(s.log, s.trustedProxies, securityHeaders(h))
 }
 
 // maybeIngestLimit applies the global ingest token bucket when rate limiting is

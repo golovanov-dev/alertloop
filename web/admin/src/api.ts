@@ -7,16 +7,8 @@ import type {
   Stats,
 } from "./types";
 
-declare global {
-  interface Window {
-    __ALERTLOOP__?: { apiBase?: string };
-  }
-}
-
-// apiBase is resolved at runtime from config.js (empty = same origin).
-function apiBase(): string {
-  return (window.__ALERTLOOP__?.apiBase ?? "").replace(/\/$/, "");
-}
+// The console is served by the AlertLoop binary, so the API is on the same
+// origin and every path below is absolute.
 
 const TOKEN_KEY = "alertloop.adminToken";
 
@@ -28,6 +20,13 @@ export function setToken(token: string): void {
 }
 export function clearToken(): void {
   sessionStorage.removeItem(TOKEN_KEY);
+}
+
+// onUnauthorized runs when the server rejects the session token (401) in the
+// middle of a session: the token was changed or the key removed.
+let onUnauthorized: (() => void) | null = null;
+export function setUnauthorizedHandler(fn: (() => void) | null): void {
+  onUnauthorized = fn;
 }
 
 export class ApiError extends Error {
@@ -50,7 +49,7 @@ async function request<T>(
 
   let resp: Response;
   try {
-    resp = await fetch(apiBase() + path, {
+    resp = await fetch(path, {
       method,
       headers,
       body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
@@ -63,6 +62,7 @@ async function request<T>(
   const text = await resp.text();
   const data = text ? safeJSON(text) : undefined;
   if (!resp.ok) {
+    if (resp.status === 401 && opts.token === undefined) onUnauthorized?.();
     const msg =
       (data && (data as any).error?.message) ||
       `Request failed (${resp.status})`;
@@ -95,9 +95,12 @@ function query(params: Record<string, string | number | undefined>): string {
 }
 
 export const api = {
-  // Verifies a token by calling an authenticated endpoint.
+  // verify checks that a token opens the whole console. /v1/info needs scope
+  // read; /v1/routing needs full, which the console's actions need, and has no
+  // side effects. A read or ingest key gets 403 from one of the two.
   async verify(token: string): Promise<void> {
     await request<Info>("GET", "/v1/info", { token });
+    await request<unknown>("GET", "/v1/routing", { token });
   },
   info(): Promise<Info> {
     return request<Info>("GET", "/v1/info");
@@ -110,6 +113,8 @@ export const api = {
     severity?: string;
     state?: string;
     source?: string;
+    /** Substring of the message, matched on the server ignoring case. */
+    q?: string;
     limit?: number;
     cursor?: string;
   }): Promise<Page<AlertEvent>> {
@@ -144,7 +149,7 @@ export const api = {
   },
   async health(): Promise<boolean> {
     try {
-      const r = await fetch(apiBase() + "/health");
+      const r = await fetch("/health");
       return r.ok;
     } catch {
       return false;

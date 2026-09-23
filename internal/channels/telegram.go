@@ -47,7 +47,7 @@ type TelegramConfig struct {
 // and an empty APIBase falls back to the public Bot API host.
 func NewTelegram(c TelegramConfig) *Telegram {
 	if c.Timeout <= 0 {
-		c.Timeout = 10 * time.Second
+		c.Timeout = domain.DefaultChannelTimeout
 	}
 	if c.APIBase == "" {
 		c.APIBase = "https://api.telegram.org"
@@ -88,6 +88,7 @@ func newTransport(proxy *url.URL) *http.Transport {
 
 func (t *Telegram) Type() domain.ChannelType { return domain.ChannelTelegram }
 func (t *Telegram) Name() string             { return t.name }
+func (t *Telegram) Timeout() time.Duration   { return t.client.Timeout }
 
 type telegramRequest struct {
 	ChatID    string `json:"chat_id"`
@@ -124,7 +125,13 @@ func (t *Telegram) Send(ctx context.Context, n domain.Notification) error {
 		// url.Error includes the full request URL, which contains the bot token;
 		// proxy dial and SOCKS handshake errors can quote the proxy URL with its
 		// credentials.
-		return fmt.Errorf("telegram request failed: %s", t.redact(err.Error()))
+		msg := t.redact(err.Error())
+		// The text is redacted, so err cannot be wrapped; carry the cancellation
+		// instead, so the worker sees a send cut short at shutdown for what it is.
+		if ctx.Err() != nil {
+			return fmt.Errorf("telegram request failed: %s (%w)", msg, context.Cause(ctx))
+		}
+		return fmt.Errorf("telegram request failed: %s", msg)
 	}
 	defer resp.Body.Close()
 

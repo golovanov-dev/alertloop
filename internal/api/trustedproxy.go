@@ -4,6 +4,8 @@ import (
 	"net"
 	"net/http"
 	"strings"
+
+	"github.com/golovanov-dev/alertloop/internal/config"
 )
 
 // TrustedProxies decides whether X-Forwarded-For may be believed, and turns a
@@ -26,31 +28,16 @@ type TrustedProxies struct {
 	nets []*net.IPNet
 }
 
-// NewTrustedProxies parses CIDR blocks and bare IPs. An empty list means no
-// proxy is trusted and X-Forwarded-For is ignored entirely, which is the
-// correct default for a directly exposed instance.
+// NewTrustedProxies builds the trusted set from rate_limit.trusted_proxies (see
+// config.ParseTrustedProxies). An empty list means no proxy is trusted and
+// X-Forwarded-For is ignored entirely, which is the correct default for a
+// directly exposed instance.
 func NewTrustedProxies(entries []string) (*TrustedProxies, error) {
-	t := &TrustedProxies{}
-	for _, raw := range entries {
-		raw = strings.TrimSpace(raw)
-		if raw == "" {
-			continue
-		}
-		if _, block, err := net.ParseCIDR(raw); err == nil {
-			t.nets = append(t.nets, block)
-			continue
-		}
-		ip := net.ParseIP(raw)
-		if ip == nil {
-			return nil, &net.ParseError{Type: "trusted proxy address", Text: raw}
-		}
-		bits := 32
-		if ip.To4() == nil {
-			bits = 128
-		}
-		t.nets = append(t.nets, &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)})
+	nets, err := config.ParseTrustedProxies(entries)
+	if err != nil {
+		return nil, err
 	}
-	return t, nil
+	return &TrustedProxies{nets: nets}, nil
 }
 
 // Configured reports whether any proxy is trusted.
@@ -114,10 +101,15 @@ func (t *TrustedProxies) ClientIP(r *http.Request) string {
 	return peer
 }
 
+// hostOnly returns the IP of a host:port address without its IPv6 zone
+// ("fe80::1%eth0" -> "fe80::1"): net.ParseIP rejects a zoned address.
 func hostOnly(addr string) string {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
-		return addr
+		host = addr
+	}
+	if i := strings.IndexByte(host, '%'); i >= 0 {
+		host = host[:i]
 	}
 	return host
 }

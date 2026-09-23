@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"log/slog"
 	"time"
 
 	"github.com/golovanov-dev/alertloop/internal/domain"
@@ -14,7 +13,6 @@ type EventService struct {
 	store    storage.Store
 	recovery *RecoveryNotifier
 	now      Clock
-	log      *slog.Logger
 }
 
 // NewEventService builds an EventService. recovery may be nil, which disables
@@ -23,7 +21,7 @@ func NewEventService(store storage.Store, recovery *RecoveryNotifier, now Clock)
 	if now == nil {
 		now = time.Now
 	}
-	return &EventService{store: store, recovery: recovery, now: now, log: slog.Default()}
+	return &EventService{store: store, recovery: recovery, now: now}
 }
 
 // Get returns an event by ID.
@@ -37,42 +35,24 @@ func (s *EventService) List(ctx context.Context, f storage.EventFilter, limit in
 }
 
 // Apply performs a manual state transition on an event and returns the updated
-// event. Invalid transitions return domain.ErrInvalidTransition.
+// event. Actions apply to incidents only; a disallowed transition, including
+// resolving an event that is already resolved, returns
+// domain.ErrInvalidTransition. Repeating an action whose target is the current
+// state (acknowledging an acknowledged event) returns the event unchanged.
+//
+// Closing an incident by hand notifies exactly as an ingested recovery does,
+// through the same transition; see RecoveryNotifier.attemptsFor.
 func (s *EventService) Apply(ctx context.Context, id string, action domain.EventAction) (*domain.Event, error) {
 	e, err := s.store.GetEvent(ctx, id)
 	if err != nil {
 		return nil, err
 	}
-	next, err := domain.ApplyAction(e.State, action)
-	if err != nil {
+	if err := domain.CheckActionAllowed(e.Type); err != nil {
 		return nil, err
 	}
-	if next == e.State {
-		// No-op transition (e.g. re-muting a muted event); return as-is.
-		return e, nil
-	}
-	at := s.now().UTC()
-	updated, err := s.store.UpdateEventState(ctx, id, next, at)
-	if err != nil {
-		return nil, err
-	}
-
-	// Closing an incident by hand notifies exactly as an ingested recovery
-	// does. The operator who clicked Resolve knows; the Telegram group that was
-	// told the database was down does not, and it is the same group either way.
-	// The guard is `next == resolved && e.State != resolved`, so re-resolving an
-	// already-closed incident stays silent.
-	//
-	// A MUTED incident is the exception. Mute means "stop telling me about
-	// this"; sending a channel the end of a story it was deliberately not told
-	// the beginning of is the opposite of what was asked for.
-	if next == domain.StateResolved {
-		if e.State == domain.StateMuted {
-			s.log.Info("incident resolved while muted; no recovery notice sent",
-				"event_id", id, "dedupe_key", updated.DedupeKey)
-		} else {
-			s.recovery.Notify(ctx, updated, at)
-		}
-	}
-	return updated, nil
+	updated, _, err := transition(ctx, s.store, s.recovery, e, s.now().UTC(),
+		func(current domain.EventState) (domain.EventState, error) {
+			return domain.ApplyAction(current, action)
+		})
+	return updated, err
 }

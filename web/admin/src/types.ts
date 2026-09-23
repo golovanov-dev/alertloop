@@ -11,7 +11,9 @@ export type DeliveryState =
   | "sending"
   | "sent"
   | "failed"
-  | "dead_letter";
+  | "dead_letter"
+  /** Stopped by mute before it was sent; never replayed. */
+  | "cancelled";
 
 export interface AlertEvent {
   id: string;
@@ -56,8 +58,14 @@ export interface Page<T> {
 }
 
 export interface Stats {
+  /** Counts by state; a state with no rows is absent, not 0. */
   events: Record<string, number>;
   deliveries: Record<string, number>;
+  /** Incidents that are not resolved. */
+  open_incidents: number;
+  oldest_due_delivery_age_seconds: number | null;
+  dead_letter_last_24h: number;
+  worker_last_tick_at: string | null;
 }
 
 export interface Info {

@@ -10,8 +10,10 @@ export const c = {
   text: "#e6e6e6",
   text2: "#c3c8d1",
   muted: "#8b93a1",
-  muted2: "#565c68",
-  muted3: "#4d5361",
+  // muted2 and muted3 are text too (PRO items, disabled actions, "—"), so both
+  // keep 4.5:1 against the card and the sidebar (WCAG AA).
+  muted2: "#80889a",
+  muted3: "#7c8492",
   accent: "#a78bfa",
   accentInk: "#0f1115",
   danger: "#fca5a5",
@@ -36,7 +38,7 @@ export const sevMeta: Record<string, Pill> = {
 export const stateMeta: Record<string, Pill> = {
   new: { bg: "#1f2937", color: "#cbd5e1" },
   acknowledged: { bg: "#1e3a34", color: "#6ee7b7" },
-  resolved: { bg: "#1a1d24", color: "#6b7280" },
+  resolved: { bg: "#1a1d24", color: "#838b99" },
   muted: { bg: "#23262c", color: "#8b93a1" },
   escalated: { bg: "#4c1d1d", color: "#fecaca" },
 };
@@ -47,25 +49,13 @@ export const deliveryStateMeta: Record<string, Pill> = {
   sent: { bg: "#14311f", color: "#86efac" },
   failed: { bg: "#3a2f14", color: "#fcd34d" },
   dead_letter: { bg: "#3a1b1b", color: "#fca5a5" },
+  cancelled: { bg: "#23262c", color: "#8b93a1" },
 };
 
 export const typeLabels: Record<string, string> = {
   incident: "Incident",
   business_event: "Business event",
   audit: "Audit",
-};
-
-// Which manual actions are allowed from each event state (mirrors the backend
-// state machine in internal/domain/event.go).
-export const eventActionRules: Record<
-  string,
-  { ack: boolean; resolve: boolean; mute: boolean; unmute: boolean; escalate: boolean }
-> = {
-  new: { ack: true, resolve: false, mute: true, unmute: false, escalate: true },
-  acknowledged: { ack: false, resolve: true, mute: true, unmute: false, escalate: true },
-  escalated: { ack: true, resolve: true, mute: true, unmute: false, escalate: false },
-  muted: { ack: false, resolve: false, mute: false, unmute: true, escalate: false },
-  resolved: { ack: false, resolve: false, mute: false, unmute: false, escalate: false },
 };
 
 export function sev(name: string): Pill {

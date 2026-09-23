@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,10 +15,13 @@ import (
 
 // clockAt returns a Clock that advances by a minute on every call, so a test
 // can tell "the timestamp moved" from "the timestamp was rewritten with the
-// same value".
+// same value". Safe for concurrent use.
 func clockAt(start time.Time) Clock {
+	var mu sync.Mutex
 	n := 0
 	return func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
 		t := start.Add(time.Duration(n) * time.Minute)
 		n++
 		return t
@@ -32,7 +36,7 @@ func lifecycleService(t *testing.T) (*IngestService, storage.Store) {
 	s := newStore(t)
 	svc := NewIngestService(s,
 		routing.NewAllChannels([]domain.ChannelTarget{{Type: domain.ChannelWebhook, Name: "wh"}}),
-		5, NewRecoveryNotifier(s, true, 5, quietLogger()),
+		5, NewRecoveryNotifier(true, 5, quietLogger()),
 		clockAt(time.Date(2026, 8, 22, 10, 0, 0, 0, time.UTC)), quietLogger())
 	return svc, s
 }
@@ -132,7 +136,9 @@ func TestFiringDoesNotResetAcknowledgedState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("firing: %v", err)
 	}
-	if _, err := store.UpdateEventState(ctx, res.Event.ID, domain.StateAcknowledged, time.Now().UTC()); err != nil {
+	if _, err := store.TransitionEvent(ctx, res.Event.ID, storage.StateChange{
+		From: domain.StateNew, To: domain.StateAcknowledged, At: time.Now().UTC(),
+	}); err != nil {
 		t.Fatalf("acknowledge: %v", err)
 	}
 

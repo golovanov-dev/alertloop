@@ -56,3 +56,14 @@ export function useAsync<T>(loader: () => Promise<T>, deps: unknown[]): AsyncSta
   const reload = useCallback(() => setNonce((n) => n + 1), []);
   return { data, loading, error, reload };
 }
+
+// useDebounced returns value once it has stopped changing for ms, so a text
+// filter sends one request per pause in typing rather than one per key.
+export function useDebounced<T>(value: T, ms = 300): T {
+  const [settled, setSettled] = useState(value);
+  useEffect(() => {
+    const t = window.setTimeout(() => setSettled(value), ms);
+    return () => window.clearTimeout(t);
+  }, [value, ms]);
+  return settled;
+}

@@ -24,6 +24,16 @@ func newTestServer(t *testing.T, apiKeys map[string]string) (*httptest.Server, s
 
 func newTestServerWithToken(t *testing.T, apiKeys map[string]string, adminToken string) (*httptest.Server, storage.Store) {
 	t.Helper()
+	return newTestServerWith(t, func(c *Config) {
+		c.APIKeys = apiKeys
+		c.AdminToken = adminToken
+	})
+}
+
+// newTestServerWith builds a test server on an in-memory store with one
+// webhook channel; configure sets the credentials.
+func newTestServerWith(t *testing.T, configure func(*Config)) (*httptest.Server, storage.Store) {
+	t.Helper()
 	store, err := storage.Open("sqlite", ":memory:")
 	if err != nil {
 		t.Fatalf("open: %v", err)
@@ -34,16 +44,15 @@ func newTestServerWithToken(t *testing.T, apiKeys map[string]string, adminToken 
 	t.Cleanup(func() { store.Close() })
 
 	targets := []domain.ChannelTarget{{Type: domain.ChannelWebhook, Name: "webhook"}}
-	srv := NewServer(Config{
+	c := Config{
 		Store:      store,
 		Ingest:     service.NewIngestService(store, routing.NewAllChannels(targets), 5, nil, time.Now, nil),
 		Routing:    routing.NewAllChannels(targets),
 		Events:     service.NewEventService(store, nil, time.Now),
 		Deliveries: service.NewDeliveryService(store, time.Now),
-		APIKeys:    apiKeys,
-		AdminToken: adminToken,
-	})
-	ts := httptest.NewServer(srv.Handler())
+	}
+	configure(&c)
+	ts := httptest.NewServer(NewServer(c).Handler())
 	t.Cleanup(ts.Close)
 	return ts, store
 }
@@ -158,6 +167,39 @@ func TestAdminTokenAuthorizesAPI(t *testing.T) {
 	}
 }
 
+// The public demo token works only straight from a private network: under
+// Docker a request from the host arrives from the bridge gateway (172.x).
+// Through a reverse proxy or from a public address it is refused; a token of
+// the operator's own is not affected.
+func TestDemoAdminTokenRefusedThroughProxyOrFromPublicAddress(t *testing.T) {
+	ok := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	cases := []struct {
+		name, token, remote, header string
+		want                        int
+	}{
+		{"demo from Docker bridge", config.DemoAdminToken, "172.17.0.1:40000", "", http.StatusOK},
+		{"demo from IPv6 loopback", config.DemoAdminToken, "[::1]:40000", "", http.StatusOK},
+		{"demo from IPv6 ULA", config.DemoAdminToken, "[fd00::5]:40000", "", http.StatusOK},
+		{"demo from zoned link-local", config.DemoAdminToken, "[fe80::1%eth0]:40000", "", http.StatusOK},
+		{"demo through a proxy (XFF)", config.DemoAdminToken, "127.0.0.1:40000", "X-Forwarded-For", http.StatusForbidden},
+		{"demo through a proxy (Forwarded)", config.DemoAdminToken, "127.0.0.1:40000", "Forwarded", http.StatusForbidden},
+		{"demo through a proxy (X-Real-IP)", config.DemoAdminToken, "127.0.0.1:40000", "X-Real-IP", http.StatusForbidden},
+		{"demo from a public address", config.DemoAdminToken, "203.0.113.5:40000", "", http.StatusForbidden},
+		{"own token through a proxy", adminTok, "127.0.0.1:40000", "X-Forwarded-For", http.StatusOK},
+	}
+	for _, c := range cases {
+		r := req(c.remote, map[string]string{"X-API-Key": c.token})
+		if c.header != "" {
+			r.Header.Set(c.header, "203.0.113.5")
+		}
+		w := httptest.NewRecorder()
+		apiKeyAuth(nil, nil, c.token, ok).ServeHTTP(w, r)
+		if w.Code != c.want {
+			t.Errorf("%s: status %d, want %d (%s)", c.name, w.Code, c.want, w.Body.String())
+		}
+	}
+}
+
 // With neither API keys nor an admin token there is no open mode: every /v1
 // request is refused, whatever it presents. The process does not start in that
 // state, and this keeps the API closed should it ever get this far.
@@ -232,6 +274,19 @@ func TestAPIKeyScopes(t *testing.T) {
 	// full key can.
 	if r, _ := doJSON(t, "POST", ts.URL+"/v1/events/"+id+"/ack", "full-key", ""); r.StatusCode != http.StatusOK {
 		t.Fatalf("full ack = %d, want 200", r.StatusCode)
+	}
+}
+
+// The admin console tells a read or ingest key apart from other 403s by this
+// text (web/admin/src/screens/Login.tsx): rewording requireScope must change
+// the console too.
+func TestScopeRefusalTextTheConsoleMatches(t *testing.T) {
+	ts, _ := newTestServer(t, map[string]string{"read-key": config.ScopeRead})
+	r, body := doJSON(t, "GET", ts.URL+"/v1/routing", "read-key", "")
+	errObj, _ := body["error"].(map[string]any)
+	msg, _ := errObj["message"].(string)
+	if r.StatusCode != http.StatusForbidden || !strings.Contains(msg, "lacks the required scope") {
+		t.Fatalf("read key on /v1/routing = %d %q, want 403 containing %q", r.StatusCode, msg, "lacks the required scope")
 	}
 }
 
@@ -323,5 +378,56 @@ func TestRateLimitPerIP(t *testing.T) {
 				t.Fatalf("%s was rate limited; health probes must always answer", path)
 			}
 		}
+	}
+}
+
+// The credential may come as `Authorization: Bearer <key>` instead of
+// X-API-Key.
+func TestBearerAuthorization(t *testing.T) {
+	ts, _ := newTestServer(t, nil)
+	req, _ := http.NewRequest("GET", ts.URL+"/v1/events", nil)
+	req.Header.Set("Authorization", "Bearer "+adminTok)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Bearer admin token = %d, want 200", resp.StatusCode)
+	}
+}
+
+// 404 and 500 answer with a fixed text: no id echoed, no database error.
+func TestErrorsDoNotLeakDetails(t *testing.T) {
+	ts, store := newTestServer(t, nil)
+
+	resp, got := doJSON(t, "GET", ts.URL+"/v1/events/no-such-event", adminTok, "")
+	if errBody, _ := got["error"].(map[string]any); resp.StatusCode != http.StatusNotFound || errBody["message"] != "resource not found" {
+		t.Fatalf("missing event = %d %v, want 404 resource not found", resp.StatusCode, got)
+	}
+
+	store.Close() // every query now fails inside the driver
+	resp, got = doJSON(t, "GET", ts.URL+"/v1/events", adminTok, "")
+	if errBody, _ := got["error"].(map[string]any); resp.StatusCode != http.StatusInternalServerError || errBody["message"] != "internal server error" {
+		t.Fatalf("failing store = %d %v, want 500 internal server error", resp.StatusCode, got)
+	}
+}
+
+// Ingest has a process-wide limit on top of the per-IP one; other endpoints
+// are not counted against it.
+func TestGlobalIngestLimit(t *testing.T) {
+	ts, _ := newTestServerWith(t, func(c *Config) {
+		c.AdminToken = adminTok
+		c.RateLimit = config.RateLimit{Enabled: true, PerIPPerSecond: 1000, PerIPBurst: 1000,
+			IngestPerSecond: 0.001, IngestBurst: 2}
+	})
+	ev := `{"type":"incident","source":"s","message":"m"}`
+	for i, want := range []int{http.StatusCreated, http.StatusCreated, http.StatusTooManyRequests} {
+		if resp, _ := doJSON(t, "POST", ts.URL+"/v1/events", adminTok, ev); resp.StatusCode != want {
+			t.Fatalf("ingest %d = %d, want %d", i+1, resp.StatusCode, want)
+		}
+	}
+	if resp, _ := doJSON(t, "GET", ts.URL+"/v1/events", adminTok, ""); resp.StatusCode != http.StatusOK {
+		t.Fatalf("listing after the ingest limit = %d, want 200", resp.StatusCode)
 	}
 }

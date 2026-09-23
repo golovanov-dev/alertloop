@@ -8,8 +8,8 @@ please report it privately first.
 
 | Version | Supported |
 |---|---|
-| 0.5.x | ✅ current |
-| ≤ 0.4.x | ❌ upgrade |
+| 0.6.x | ✅ current |
+| ≤ 0.5.x | ❌ upgrade |
 
 Before 1.0.0 only the latest minor line is supported. A fix ships as a patch
 release of that line and is not backported: upgrading within 0.x is the fix.
@@ -63,8 +63,8 @@ These are deliberate, tested behaviours. A break in any of them **is** a
 vulnerability:
 
 - Secrets never reach logs, stored delivery errors, the API, or the admin
-  console. Telegram bot tokens and proxy passwords are redacted at every
-  boundary.
+  console. Telegram bot tokens, proxy passwords and the path and query of
+  webhook URLs are redacted at every boundary.
 - The admin token is compared in constant time.
 - Outbound webhooks are HMAC-SHA256 signed.
 - TLS verification cannot be disabled. There is no `--insecure`.
@@ -77,13 +77,35 @@ vulnerability:
   credential and the API refuses requests without it, but it is published in
   this repository, so change it before that container is reachable by anyone
   else.
+- The demo admin token `change-me-admin` is refused with 403 when the request
+  carries `X-Forwarded-For`, `Forwarded` or `X-Real-IP` (it came through a
+  reverse proxy), or when the connecting address is neither loopback nor
+  private (RFC 1918, IPv6 `fc00::/7`, link-local). Other tokens and keys are
+  not affected.
 - The published container runs as a non-root user with no capabilities, on a
   read-only root filesystem.
+- An `ingest` key with `sources` creates, refreshes and resolves only events
+  whose `source` is in that list. A request from another source, or one whose
+  `dedupe_key` belongs to an event of another source, gets 403
+  `source_not_allowed`, changes nothing and is logged as a warning. An
+  `ingest` key without `sources` works with every source. An `ingest` key gets
+  back only the event's `id`, `state` and `outcome`.
+
+  Limitation: `dedupe_key` is one namespace for the installation. A key can
+  open an incident under a `dedupe_key` that another source uses; while that
+  incident is open, the other source's reports under that key get 403, and
+  its `resolved` reports keep getting 403 after the incident is closed, until
+  retention deletes it. Put the host in the key (`host:service:check`). For
+  the same reason a limited key can tell that another source has used a
+  `dedupe_key` within the retention period: it gets 403 where an unknown key
+  gets 201 or 204.
 
 ## Keeping your installation safe
 
 - Put HTTPS in front of it. The admin token is sent on every request.
-- Give each event source its own `ingest`-scoped API key, not the admin token.
+- Give each event source its own `ingest`-scoped API key with `sources`, not
+  the admin token. With more than one `ingest` key, each one without `sources`
+  is logged as a warning at startup.
 - Do not publish the database port. The Compose profile does not.
 - Pin the container image to a version tag; `latest` moves under you.
 - Watch the releases page: this is a pre-1.0 product and fixes ship in patch

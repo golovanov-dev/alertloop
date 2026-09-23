@@ -1,5 +1,86 @@
 # Changelog
 
+## 0.7.0 - Unreleased
+
+### Added
+
+- `GET /v1/stats` reports `open_incidents`, `oldest_due_delivery_age_seconds`,
+  `dead_letter_last_24h` and `worker_last_tick_at`, so AlertLoop itself can be
+  monitored from one reading; OPERATIONS.md, "What to alert on", has the
+  thresholds and a check script. Migration 0005 adds the worker's tick table.
+- `GET /v1/events?q=<text>` searches event messages, ignoring case.
+- The access log carries `client_ip` and, for an authenticated request,
+  `credential` (`admin` or the key id: the first 8 hex digits of the key's
+  SHA-256) and `scope`. The key itself is never logged.
+- A backup script with a systemd timer and a Compose crontab line
+  (`deploy/backup/`); OPERATIONS.md, "Backup and restore". `install.sh` keeps
+  the binary and unit it replaces as `.prev`.
+- Admin console: Overview shows open incidents and delivery problems; message
+  search runs on the server; actions follow the server's rules, with
+  confirmations; the console works from the keyboard and on a phone.
+
+### Security
+
+- An `ingest` key can be limited to its sources: `sources: [web-01]` under the
+  key in `api_keys`. It then touches only those sources' events; anything else
+  gets 403 `source_not_allowed`. Until now any `ingest` key could refresh,
+  resolve and read any incident by `dedupe_key`. A key without `sources` works
+  as before; `sources:` with no value is a config error. Moving Monit hosts
+  from one shared `source: monit` to their own keys, keep this order: add the
+  host names next to `monit` in routing rules and give each host its own key
+  without `sources`; switch `ALERTLOOP_SOURCE` on each host; add `sources` only
+  after the incidents opened as `monit` have closed. The adapter does not retry
+  a 403, so an event refused in between is lost.
+- `POST /v1/events` answers an `ingest` key with only `id`, `state` and
+  `outcome` instead of the whole event.
+- The demo token `change-me-admin` is refused with 403 through a reverse proxy
+  or from a public address. Set your own `ALERTLOOP_ADMIN_TOKEN`.
+- A failed webhook delivery no longer stores the webhook URL in `last_error`.
+  Errors stored before the upgrade keep it until retention removes them: if
+  the URL carries a secret, change it at the receiver.
+
+### Changed
+
+- Event actions apply to incidents only: for `business_event` and `audit` they
+  return 409. Resolving an already resolved incident returns 409.
+- Muting an incident cancels its unsent alerts: new delivery state `cancelled`.
+- A `firing` that raises an open incident's severity alerts the channels the
+  new severity routes to that have not had an alert yet.
+- Replaying a dead-lettered delivery starts a new cycle of retries.
+- `POST /v1/events` returns `outcome`. A body over 512 KiB gets 413.
+- `GET /v1/events` and `GET /v1/delivery-attempts` return 400 for a filter
+  value outside its enum, a `limit` that is not a positive integer, and text
+  that is not valid UTF-8.
+- The worker's delivery log lines: `channel` is the channel type, the name is
+  in `channel_name`.
+- Config: an unknown `log.level` or `log.format` is an error, and the worker
+  loads the config as strictly as `server`. `check-db` refuses everything a
+  start would refuse, including a missing credential — a worker's own config
+  needs one too. An unknown mode is refused before migrations run.
+- Every role refuses a database with migrations the binary does not know.
+  Going back from 0.7.0 to 0.6.1 still works.
+- `alertloop.example.yaml` listens on `127.0.0.1:8080`; the image sets
+  `ALERTLOOP_ADDR=:8080`. An existing `alertloop.yaml` keeps its `addr`.
+- Compose runs the release it belongs to, not `:latest`, and `.env.example`
+  pins `ALERTLOOP_IMAGE`.
+- `deploy/proxy/nginx.conf` uses one rate-limit zone for every path.
+- The Monit self-check example no longer waits for a pidfile the unit does not
+  write (it restarted a healthy AlertLoop in a loop). Copy it again if you use it.
+
+### Removed
+
+- Admin console `config.js` and its undocumented `apiBase` setting.
+
+### Fixed
+
+- One channel that hangs or is down no longer delays notifications to the other
+  channels. The 0.4.0 entry called this fixed; it was not.
+- Two earlier entries claimed more than the code did: a muted incident closed
+  by its source sent a recovery notice (0.4.0), and `check-db` missed several
+  startup refusals (0.6.0). Both now hold.
+- 30 smaller fixes: 3 security, 9 reliability, 13 in the admin console,
+  5 in the documentation.
+
 ## 0.6.1 - 2026-09-21
 
 The first container image of the 0.6 line. AlertLoop itself is the same as in

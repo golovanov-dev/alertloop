@@ -1,13 +1,11 @@
-import { useNavigate } from "react-router-dom";
+import { Link } from "react-router-dom";
 import { api } from "../api";
-import { Badge, Card, ErrorState, Loading } from "../ui";
+import { Badge, Card, ErrorState, Loading, Time } from "../ui";
 import { useAsync } from "../hooks";
-import { dateTime } from "../format";
 import { c, mono } from "../theme";
 import type { AlertEvent, Stats } from "../types";
 
 export function Overview() {
-  const nav = useNavigate();
   const { data, loading, error, reload } = useAsync<{ stats: Stats; critical: AlertEvent[] }>(
     async () => {
       const [stats, critical] = await Promise.all([
@@ -19,39 +17,50 @@ export function Overview() {
     [],
   );
 
-  const newCount = data?.stats.events["new"] ?? 0;
-  const escalatedCount = data?.stats.events["escalated"] ?? 0;
-  const deadLetterCount = data?.stats.deliveries["dead_letter"] ?? 0;
+  // Business events and audit entries stay `new` for good, so open incidents
+  // come from the server's own count, not from events["new"]. While the stats
+  // load, or when they fail, the cards show "—", not 0. A state absent from a
+  // count map has no rows, so it is 0.
+  const stats = data?.stats;
+  const openIncidents = stats ? stats.open_incidents : null;
+  const escalatedCount = stats ? (stats.events["escalated"] ?? 0) : null;
+  const pending = stats ? (stats.deliveries["pending"] ?? 0) : null;
+  const failed = stats ? (stats.deliveries["failed"] ?? 0) : null;
+  const deadLetterCount = stats ? (stats.deliveries["dead_letter"] ?? 0) : null;
 
   return (
     <div>
       <h1 style={{ margin: 0, fontSize: 26, fontWeight: 600, letterSpacing: "-0.01em" }}>
         Overview
       </h1>
-      <div style={{ marginTop: 6, fontSize: 14, color: c.muted }}>
-        Community edition — single project, single global channel set.
-      </div>
 
       <div className="al-cards" style={{ marginTop: 28 }}>
         <StatCard
-          value={newCount}
-          label="New events"
-          cta="View events →"
-          onClick={() => nav("/events?state=new")}
+          value={openIncidents}
+          label="Open incidents"
+          cta="All incidents, incl. resolved →"
+          to="/events?type=incident"
         />
         <StatCard
           value={escalatedCount}
           label="Escalated"
           color="#dc6c6c"
           cta="View events →"
-          onClick={() => nav("/events?state=escalated")}
+          to="/events?state=escalated"
+        />
+        <StatCard
+          value={pending === null || failed === null ? null : pending + failed}
+          label="Delivery problems"
+          detail={pending === null ? undefined : `pending ${pending} · failed ${failed}`}
+          cta="View deliveries →"
+          to={`/deliveries?state=${failed ? "failed" : "pending"}`}
         />
         <StatCard
           value={deadLetterCount}
           label="Dead-letter deliveries"
           color="#c99a2e"
           cta="View deliveries →"
-          onClick={() => nav("/deliveries?state=dead_letter")}
+          to="/deliveries?state=dead_letter"
         />
       </div>
 
@@ -76,23 +85,29 @@ export function Overview() {
         ) : data && data.critical.length > 0 ? (
           <Card style={{ overflow: "hidden" }}>
             {data.critical.map((ev) => (
-              <div
+              <Link
                 key={ev.id}
-                onClick={() => nav(`/events/${ev.id}`)}
+                to={`/events/${ev.id}`}
+                className="al-crit-row"
                 style={{
                   display: "flex",
                   alignItems: "center",
                   gap: 16,
                   padding: "13px 18px",
                   borderBottom: `1px solid ${c.rowBorder}`,
-                  cursor: "pointer",
+                  color: c.text,
+                  textDecoration: "none",
                 }}
               >
-                <span style={{ fontFamily: mono, fontSize: 12.5, color: c.muted, width: 150, flexShrink: 0, whiteSpace: "nowrap" }}>
-                  {dateTime(ev.created_at)}
+                <span
+                  className="al-crit-time"
+                  style={{ fontFamily: mono, fontSize: 12.5, color: c.muted, width: 150, flexShrink: 0, whiteSpace: "nowrap" }}
+                >
+                  <Time ts={ev.created_at} />
                 </span>
                 <Badge kind="severity" value={ev.severity} />
                 <span
+                  className="al-crit-msg"
                   style={{
                     flex: 1,
                     fontSize: 14,
@@ -104,8 +119,10 @@ export function Overview() {
                 >
                   {ev.message}
                 </span>
-                <span style={{ fontSize: 12.5, color: c.muted, flexShrink: 0 }}>{ev.source}</span>
-              </div>
+                <span style={{ fontSize: 12.5, color: c.muted, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {ev.source}
+                </span>
+              </Link>
             ))}
           </Card>
         ) : (
@@ -121,24 +138,36 @@ export function Overview() {
 function StatCard({
   value,
   label,
+  detail,
   cta,
-  onClick,
+  to,
   color,
 }: {
-  value: number;
+  value: number | null;
   label: string;
+  detail?: string;
   cta: string;
-  onClick: () => void;
+  to: string;
   color?: string;
 }) {
   return (
-    <Card
-      onClick={onClick}
-      style={{ flex: 1, padding: "20px 22px", cursor: "pointer" }}
+    <Link
+      to={to}
+      style={{
+        flex: 1,
+        display: "block",
+        padding: "20px 22px",
+        background: c.card,
+        border: `1px solid ${c.border}`,
+        borderRadius: 10,
+        color: c.text,
+        textDecoration: "none",
+      }}
     >
-      <div style={{ fontSize: 32, fontWeight: 600, color: color ?? c.text }}>{value}</div>
+      <div style={{ fontSize: 32, fontWeight: 600, color: value === null ? c.muted : (color ?? c.text) }}>{value ?? "—"}</div>
       <div style={{ marginTop: 6, fontSize: 13, color: c.muted }}>{label}</div>
+      {detail && <div style={{ marginTop: 2, fontSize: 12, color: c.muted2 }}>{detail}</div>}
       <div style={{ marginTop: 10, fontSize: 12.5, color: c.accent }}>{cta}</div>
-    </Card>
+    </Link>
   );
 }

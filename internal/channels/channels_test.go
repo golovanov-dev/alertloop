@@ -3,6 +3,7 @@ package channels
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -28,10 +29,11 @@ func sampleEvent() *domain.Event {
 
 func TestWebhookSignsAndPosts(t *testing.T) {
 	var gotBody []byte
-	var gotSig string
+	var gotSig, gotVersion string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotBody, _ = io.ReadAll(r.Body)
 		gotSig = r.Header.Get(SignatureHeader)
+		gotVersion = r.Header.Get(SignatureVersionHeader)
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()
@@ -43,11 +45,50 @@ func TestWebhookSignsAndPosts(t *testing.T) {
 	if err := wh.Send(context.Background(), domain.Alert(sampleEvent())); err != nil {
 		t.Fatalf("send: %v", err)
 	}
-	if !Verify("topsecret", gotBody, gotSig) {
-		t.Fatal("signature did not verify")
+	// Sign itself is pinned by TestSignKnownAnswer; here: the header carries
+	// the signature of exactly the bytes that were posted.
+	if gotSig != Sign("topsecret", gotBody) {
+		t.Fatalf("%s = %q does not sign the posted body", SignatureHeader, gotSig)
 	}
-	if Verify("wrongsecret", gotBody, gotSig) {
-		t.Fatal("signature verified under wrong secret")
+	if gotVersion != "v1" {
+		t.Fatalf("%s = %q, want v1", SignatureVersionHeader, gotVersion)
+	}
+}
+
+// The signature format is a contract with receivers: bare lowercase hex of
+// HMAC-SHA256(secret, raw body). The expected value was computed outside Go
+// (openssl dgst -sha256 -hmac topsecret).
+func TestSignKnownAnswer(t *testing.T) {
+	body := []byte(`{"event":{"id":"e1"},"kind":"alert","timestamp":"2026-09-22T10:00:00Z"}`)
+	const want = "ab6668b770b65d2612787f469b863ca9cd0b9716a63287bc59dfb45fb2023970"
+	if got := Sign("topsecret", body); got != want {
+		t.Fatalf("Sign = %s, want %s", got, want)
+	}
+}
+
+// A Slack or Discord webhook URL carries its secret in the path; the delivery
+// error lands in last_error, the read API, the console and the log.
+func TestWebhookRedactsURLOnNetworkError(t *testing.T) {
+	wh := NewWebhook("wh", "http://127.0.0.1:1/services/SECRETPATH?token=SECRETQUERY", "", 500*time.Millisecond)
+	err := wh.Send(context.Background(), domain.Alert(sampleEvent()))
+	if err == nil {
+		t.Fatal("expected a network error")
+	}
+	if strings.Contains(err.Error(), "SECRETPATH") || strings.Contains(err.Error(), "SECRETQUERY") {
+		t.Fatalf("webhook URL leaked in error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "http://127.0.0.1:1") {
+		t.Fatalf("error should still name the endpoint origin: %v", err)
+	}
+}
+
+// A URL the request cannot even be built from is redacted too: its parse error
+// quotes it whole.
+func TestWebhookRedactsUnparsableURL(t *testing.T) {
+	wh := NewWebhook("wh", "https://hooks.example/services/SECRETPATH\x7f", "", time.Second)
+	err := wh.Send(context.Background(), domain.Alert(sampleEvent()))
+	if err == nil || strings.Contains(err.Error(), "SECRETPATH") {
+		t.Fatalf("error = %v, want one without the URL", err)
 	}
 }
 
@@ -200,5 +241,41 @@ func TestTelegramRedactsTokenOnNetworkError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "***") {
 		t.Fatalf("expected redaction marker in error: %v", err)
+	}
+}
+
+// The worker returns a send cut short at shutdown to the queue uncounted only
+// when the channel's error says it was cancelled. Telegram redacts its error
+// text (the URL carries the bot token), so it must still carry the
+// cancellation; a webhook wraps the transport error directly.
+func TestHTTPChannelsReportCancellation(t *testing.T) {
+	block := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-block:
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+	defer close(block)
+
+	chans := map[string]Channel{
+		"telegram": NewTelegram(TelegramConfig{Name: "tg", BotToken: "SECRET", ChatID: "c", APIBase: srv.URL, Timeout: time.Minute}),
+		"webhook":  NewWebhook("wh", srv.URL+"/hook", "", time.Minute),
+	}
+	for name, ch := range chans {
+		ctx, cancel := context.WithCancel(context.Background())
+		time.AfterFunc(100*time.Millisecond, cancel)
+		err := ch.Send(ctx, domain.Alert(sampleEvent()))
+		cancel()
+		if err == nil {
+			t.Fatalf("%s: send to a server that never answers succeeded", name)
+		}
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("%s: error does not say the send was cancelled: %v", name, err)
+		}
+		if strings.Contains(err.Error(), "SECRET") {
+			t.Fatalf("%s: error leaks the bot token: %v", name, err)
+		}
 	}
 }

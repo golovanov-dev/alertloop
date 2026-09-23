@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -97,5 +98,26 @@ func TestHealthEndpointAliases(t *testing.T) {
 				t.Fatalf("status field = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// Actions apply to incidents only: an audit entry has nothing to acknowledge.
+// The refusal is a 409 that says why.
+func TestActionOnNonIncidentIsConflict(t *testing.T) {
+	ts, _ := newTestServer(t, nil)
+	resp, ev := doJSON(t, http.MethodPost, ts.URL+"/v1/events", adminTok,
+		`{"type":"audit","source":"admin","message":"user logged in"}`)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("ingest status = %d", resp.StatusCode)
+	}
+	id, _ := ev["id"].(string)
+
+	resp, body := doJSON(t, http.MethodPost, ts.URL+"/v1/events/"+id+"/ack", adminTok, "")
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("ack on audit: status = %d, want 409", resp.StatusCode)
+	}
+	errObj, _ := body["error"].(map[string]any)
+	if msg, _ := errObj["message"].(string); !strings.Contains(msg, "incidents only") {
+		t.Fatalf("message = %q, want it to say actions apply to incidents only", msg)
 	}
 }

@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/golovanov-dev/alertloop/internal/domain"
 )
 
 // What the config loader does between the file and the struct: substitution,
@@ -250,13 +252,13 @@ routing:
 	// Element 0 takes the normalized defaults while element 1 keeps its own
 	// values: defaults are applied per element, not to the list as a whole.
 	eq(t, "email[0].port", cfg.Channels.Email[0].Port, defaultSMTPPort)
-	eq(t, "email[0].timeout", cfg.Channels.Email[0].Timeout, defaultChanTimeout)
+	eq(t, "email[0].timeout", cfg.Channels.Email[0].Timeout, domain.DefaultChannelTimeout)
 	eq(t, "email[1].port", cfg.Channels.Email[1].Port, 465)
 	eq(t, "email[1].timeout", cfg.Channels.Email[1].Timeout, 5*time.Second)
 	eq(t, "email[1].tls", cfg.Channels.Email[1].TLS, true)
 	eq(t, "telegram[0].api_base", cfg.Channels.Telegram[0].APIBase, defaultTelegramBase)
 	eq(t, "telegram[1].api_base", cfg.Channels.Telegram[1].APIBase, "https://tg.internal")
-	eq(t, "webhook[0].timeout", cfg.Channels.Webhook[0].Timeout, defaultChanTimeout)
+	eq(t, "webhook[0].timeout", cfg.Channels.Webhook[0].Timeout, domain.DefaultChannelTimeout)
 	eq(t, "webhook[1].timeout", cfg.Channels.Webhook[1].Timeout, time.Minute)
 
 	// A struct nested two levels inside a list element (rules[].match).

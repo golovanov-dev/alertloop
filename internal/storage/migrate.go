@@ -27,27 +27,22 @@ func migrate(ctx context.Context, db *sql.DB, d dialect) error {
 	if err != nil {
 		return err
 	}
-
-	dir := "migrations/" + d.name
-	entries, err := fs.ReadDir(migrationFS, dir)
+	names, err := migrationNames(d)
 	if err != nil {
-		return fmt.Errorf("read migrations dir %q: %w", dir, err)
+		return err
 	}
-
-	names := make([]string, 0, len(entries))
-	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".sql") {
-			names = append(names, e.Name())
-		}
+	// Before anything is applied: a binary older than the schema would run
+	// against tables it does not know.
+	if err := refuseNewerSchema(applied, names); err != nil {
+		return err
 	}
-	sort.Strings(names)
 
 	for _, name := range names {
 		version := strings.TrimSuffix(name, ".sql")
 		if applied[version] {
 			continue
 		}
-		body, err := migrationFS.ReadFile(dir + "/" + name)
+		body, err := migrationFS.ReadFile("migrations/" + d.name + "/" + name)
 		if err != nil {
 			return fmt.Errorf("read migration %q: %w", name, err)
 		}
@@ -56,6 +51,70 @@ func migrate(ctx context.Context, db *sql.DB, d dialect) error {
 		}
 	}
 	return nil
+}
+
+// migrationNames lists the dialect's migration files in the order they apply.
+func migrationNames(d dialect) ([]string, error) {
+	dir := "migrations/" + d.name
+	entries, err := fs.ReadDir(migrationFS, dir)
+	if err != nil {
+		return nil, fmt.Errorf("read migrations dir %q: %w", dir, err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".sql") {
+			names = append(names, e.Name())
+		}
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+// refuseNewerSchema fails when the database records a migration this binary
+// does not ship, which means a newer AlertLoop has upgraded it.
+func refuseNewerSchema(applied map[string]bool, names []string) error {
+	known := make(map[string]bool, len(names))
+	for _, n := range names {
+		known[strings.TrimSuffix(n, ".sql")] = true
+	}
+	var unknown []string
+	for v := range applied {
+		if !known[v] {
+			unknown = append(unknown, v)
+		}
+	}
+	if len(unknown) == 0 {
+		return nil
+	}
+	sort.Strings(unknown)
+	return fmt.Errorf("the database was migrated by a newer AlertLoop (migrations %s are unknown to this binary); "+
+		"downgrading is not supported: run the newer version, or restore the backup taken before the upgrade",
+		strings.Join(unknown, ", "))
+}
+
+// checkSchemaVersion is refuseNewerSchema for a database that is only being
+// checked: a database with no migration ledger yet passes.
+func checkSchemaVersion(ctx context.Context, db *sql.DB, d dialect) error {
+	ledger := `SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'`
+	if d.name == "postgres" {
+		ledger = `SELECT count(*) FROM pg_tables WHERE tablename = 'schema_migrations' AND schemaname = current_schema()`
+	}
+	var n int
+	if err := db.QueryRowContext(ctx, ledger).Scan(&n); err != nil {
+		return fmt.Errorf("look for schema_migrations: %w", err)
+	}
+	if n == 0 {
+		return nil
+	}
+	applied, err := appliedVersions(ctx, db)
+	if err != nil {
+		return err
+	}
+	names, err := migrationNames(d)
+	if err != nil {
+		return err
+	}
+	return refuseNewerSchema(applied, names)
 }
 
 func appliedVersions(ctx context.Context, db *sql.DB) (map[string]bool, error) {

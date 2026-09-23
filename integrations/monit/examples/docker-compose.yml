@@ -22,7 +22,7 @@ name: alertloop
 
 services:
   alertloop:
-    image: ghcr.io/golovanov-dev/alertloop:latest
+    image: ${ALERTLOOP_IMAGE:-ghcr.io/golovanov-dev/alertloop:0.6.1}
     ports:
       - "127.0.0.1:8080:8080"
     environment:

@@ -3,10 +3,23 @@ package storage
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/golovanov-dev/alertloop/internal/domain"
 )
+
+// deliverableCond selects the attempts, aliased c, that ClaimDue may take: it
+// is also what "due" means in Monitoring. Its one placeholder is now.
+var deliverableCond = fmt.Sprintf(`c.state IN ('%[1]s', '%[2]s')
+			  AND (c.next_retry_at IS NULL OR c.next_retry_at <= ?)
+			  AND (c.kind <> '%[3]s' OR NOT EXISTS (
+				SELECT 1 FROM delivery_attempts a
+				WHERE a.event_id = c.event_id AND a.kind = '%[4]s'
+				  AND a.channel_name = c.channel_name AND a.state <> '%[5]s'
+			  ))`,
+	domain.DeliveryPending, domain.DeliveryFailed,
+	domain.KindRecovery, domain.KindAlert, domain.DeliverySent)
 
 // ClaimDue atomically transitions up to limit deliverable attempts to
 // `sending` and returns them. "Deliverable" means state pending or failed with
@@ -20,11 +33,24 @@ import (
 // event, so a recovery only ever waits for the alert of its own occurrence.
 // A dead-lettered alert keeps its recovery waiting until the alert is replayed
 // and sent, so no channel receives a recovery without the alert.
-func (s *sqlStore) ClaimDue(ctx context.Context, now time.Time, limit int) ([]domain.DeliveryAttempt, error) {
+//
+// Attempts to the channels named in skipChannels are left in the queue: the
+// worker passes the channels whose share of its slots is used up.
+func (s *sqlStore) ClaimDue(ctx context.Context, now time.Time, limit int, skipChannels ...string) ([]domain.DeliveryAttempt, error) {
 	if limit <= 0 {
 		limit = 10
 	}
 	nowStr := formatTime(now)
+	args := []any{nowStr, nowStr}
+
+	skip := ""
+	if len(skipChannels) > 0 {
+		skip = " AND c.channel_name NOT IN (?" + strings.Repeat(", ?", len(skipChannels)-1) + ")"
+		for _, name := range skipChannels {
+			args = append(args, name)
+		}
+	}
+	args = append(args, limit)
 
 	lock := ""
 	if s.d.supportsSkipLocked() {
@@ -35,23 +61,15 @@ func (s *sqlStore) ClaimDue(ctx context.Context, now time.Time, limit int) ([]do
 		SET state = '%[1]s', updated_at = ?
 		WHERE id IN (
 			SELECT c.id FROM delivery_attempts c
-			WHERE c.state IN ('%[2]s', '%[3]s')
-			  AND (c.next_retry_at IS NULL OR c.next_retry_at <= ?)
-			  AND (c.kind <> '%[4]s' OR NOT EXISTS (
-				SELECT 1 FROM delivery_attempts a
-				WHERE a.event_id = c.event_id AND a.kind = '%[5]s'
-				  AND a.channel_name = c.channel_name AND a.state <> '%[6]s'
-			  ))
+			WHERE %[2]s%[5]s
 			ORDER BY c.created_at ASC, c.id ASC
-			LIMIT ?%[7]s
+			LIMIT ?%[3]s
 		)
-		RETURNING %[8]s`,
-		domain.DeliverySending, domain.DeliveryPending, domain.DeliveryFailed,
-		domain.KindRecovery, domain.KindAlert, domain.DeliverySent,
-		lock, deliveryColumns,
+		RETURNING %[4]s`,
+		domain.DeliverySending, deliverableCond, lock, deliveryColumns, skip,
 	)
 
-	rows, err := s.db.QueryContext(ctx, s.d.rebind(q), nowStr, nowStr, limit)
+	rows, err := s.db.QueryContext(ctx, s.d.rebind(q), args...)
 	if err != nil {
 		return nil, fmt.Errorf("claim due deliveries: %w", err)
 	}

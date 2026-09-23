@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily AlertLoop database backup
+
+[Timer]
+OnCalendar=*-*-* 03:15:00
+RandomizedDelaySec=15m
+# A run missed while the host was off happens at the next boot.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

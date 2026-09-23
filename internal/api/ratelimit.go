@@ -1,6 +1,7 @@
 package api
 
 import (
+	"net"
 	"net/http"
 	"strconv"
 	"sync"
@@ -92,35 +93,38 @@ func (k *keyedLimiter) allow(key string, now time.Time) bool {
 	return e.bucket.allow(now)
 }
 
-// healthPaths are exempt from the per-IP limit.
-//
-// The Docker HEALTHCHECK fires every 30 seconds, an orchestrator probe more
-// often, and an external uptime check on top of that - all from the same
-// address, all spending tokens from the bucket that real clients need. Worse,
-// they would be the first thing throttled during an incident, which is exactly
-// when "is it up?" has to keep answering. They touch no database beyond a ping
-// and return a fixed body, so there is nothing here to abuse.
-var healthPaths = map[string]bool{
-	"/health":       true,
-	"/health/live":  true,
-	"/health/ready": true,
-	"/ready":        true,
-}
-
 // perIPLimit rejects requests from a client IP that exceeds the limiter's rate,
 // bounding brute-force of API keys / admin token and general abuse.
 func perIPLimit(k *keyedLimiter, trusted *TrustedProxies, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if healthPaths[r.URL.Path] {
+		// Health and readiness probes are exempt from the per-IP limit.
+		//
+		// The Docker HEALTHCHECK fires every 30 seconds, an orchestrator probe more
+		// often, and an external uptime check on top of that - all from the same
+		// address, all spending tokens from the bucket that real clients need. Worse,
+		// they would be the first thing throttled during an incident, which is exactly
+		// when "is it up?" has to keep answering. They touch no database beyond a ping
+		// and return a fixed body, so there is nothing here to abuse.
+		if probePaths[r.URL.Path] {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if !k.allow(trusted.ClientIP(r), time.Now()) {
+		if !k.allow(limiterKey(trusted.ClientIP(r)), time.Now()) {
 			tooManyRequests(w)
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// limiterKey groups IPv6 clients by /64: one host usually holds a whole /64,
+// so keying per address would give it unlimited buckets. IPv4 stays per address.
+func limiterKey(ip string) string {
+	parsed := net.ParseIP(ip)
+	if parsed == nil || parsed.To4() != nil {
+		return ip
+	}
+	return parsed.Mask(net.CIDRMask(64, 128)).String() + "/64"
 }
 
 // globalLimit rejects requests once the shared bucket is empty (used to cap the

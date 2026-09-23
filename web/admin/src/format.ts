@@ -1,42 +1,46 @@
 // Formatting helpers for timestamps and identifiers.
 
-// dateTime renders "YYYY-MM-DD HH:MM:SS" in the viewer's timezone, from an
-// ISO/RFC3339 or "... UTC" string. It is what every list shows.
-//
-// The date is always there. Lists hold up to retention_days of events, and a
-// time of day alone cannot tell today's 14:32 from last Tuesday's; a retry can
-// be scheduled for tomorrow. The zone is not: columns using this are headed
-// "(local)", and a zone name on every row would be noise. The format is fixed
-// rather than the browser's locale, so rows line up and sort by eye. It is the
-// same format as the built-in pages at /events, but not the same zone: those
-// show UTC, this shows the viewer's own — each column header says which.
+// Every time in the console reads "YYYY-MM-DD HH:MM:SS" in the browser's time
+// zone. The date is always there: lists hold up to retention_days of events,
+// and a retry can be due tomorrow. The zone is named once, on About; the exact
+// instant, with its offset and in UTC, is the title of each time (exactTime).
+// A fixed format rather than the browser's locale, so rows line up.
 export function dateTime(ts: string): string {
   const d = parseDate(ts);
-  if (!d) return ts;
-  const p = (n: number) => String(n).padStart(2, "0");
-  return (
-    `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ` +
-    `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
-  );
+  return d ? localParts(d).join(" ") : ts;
 }
 
-// fullTime renders an absolute timestamp in the viewer's own timezone. The API
-// serves UTC; each viewer should read times in their zone, so the zone name is
-// shown to make clear which one that is — the built-in pages at /events label
-// theirs as UTC, and the two must not be silently mistaken for each other.
-export function fullTime(ts: string): string {
+// exactTime is "2026-09-22T16:41:07-03:00 (2026-09-22 19:41:07 UTC)".
+export function exactTime(ts: string): string {
   const d = parseDate(ts);
   if (!d) return ts;
-  return d.toLocaleString([], {
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-    timeZoneName: "short",
-  });
+  const [date, time] = localParts(d);
+  const utc = d.toISOString().slice(0, 19).replace("T", " ");
+  return `${date}T${time}${offset(d)} (${utc} UTC)`;
+}
+
+// timeZone names the browser's zone and today's offset, shown on About as
+// "America/Sao_Paulo (now UTC-03:00)". In a zone with daylight saving an older
+// time may have another offset; each time's own offset is in its title.
+export function timeZone(): { name: string; offset: string } {
+  return { name: Intl.DateTimeFormat().resolvedOptions().timeZone ?? "", offset: "UTC" + offset(new Date()) };
+}
+
+function localParts(d: Date): [string, string] {
+  return [
+    `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}`,
+    `${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`,
+  ];
+}
+
+function offset(d: Date): string {
+  const m = -d.getTimezoneOffset();
+  const a = Math.abs(m);
+  return `${m < 0 ? "-" : "+"}${p2(Math.floor(a / 60))}:${p2(a % 60)}`;
+}
+
+function p2(n: number): string {
+  return String(n).padStart(2, "0");
 }
 
 function parseDate(ts: string): Date | null {
@@ -50,9 +54,4 @@ function parseDate(ts: string): Date | null {
 
 export function shortId(id: string): string {
   return id.length > 8 ? id.slice(0, 8) : id;
-}
-
-export function relToLabel(ts?: string | null): string {
-  if (!ts) return "—";
-  return dateTime(ts);
 }

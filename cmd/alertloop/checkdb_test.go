@@ -83,3 +83,46 @@ func TestCheckDBFailsWhenTheDatabaseIsMissing(t *testing.T) {
 		t.Fatal("check-db created the database it was asked to check")
 	}
 }
+
+// check-db passes only a config the start of `server` or `all` would accept:
+// here, one with no credential, and one whose log file cannot be opened.
+func TestCheckDBRefusesWhatStartWouldRefuse(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "alertloop.db")
+	s, err := storage.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Migrate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	noCredential := filepath.Join(dir, "no-credential.yaml")
+	if err := os.WriteFile(noCredential, []byte("database:\n  dsn: '"+filepath.ToSlash(dbPath)+"'\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := runArgs(t, "--config", noCredential, "check-db"); err == nil || !strings.Contains(err.Error(), "admin_token") {
+		t.Errorf("check-db with no credential: err = %v, want the refusal server and all give", err)
+	}
+
+	// A directory where the log file should be: it cannot be opened for writing.
+	if err := runArgs(t, "--config", writeConfig(t, dir, dbPath, dir), "check-db"); err == nil || !strings.Contains(err.Error(), "log file") {
+		t.Errorf("check-db with an unwritable log file: err = %v, want one naming the log file", err)
+	}
+}
+
+// A mistyped mode is refused before the config is read, so it migrates
+// nothing: check_db for check-db must not upgrade a production database.
+func TestAnUnknownModeTouchesNoDatabase(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "alertloop.db")
+	cfgPath := writeConfig(t, dir, dbPath, filepath.Join(dir, "alertloop.log"))
+
+	if err := runArgs(t, "--config", cfgPath, "check_db"); err == nil || !strings.Contains(err.Error(), "unknown mode") {
+		t.Fatalf("err = %v, want an unknown-mode refusal", err)
+	}
+	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
+		t.Fatalf("an unknown mode created or opened the database (stat err %v)", err)
+	}
+}

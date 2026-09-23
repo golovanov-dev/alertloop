@@ -11,6 +11,16 @@ const (
 	ChannelWebhook  ChannelType = "webhook"
 )
 
+// ValidChannelType reports whether t is a known channel type.
+func ValidChannelType(t ChannelType) bool {
+	switch t {
+	case ChannelEmail, ChannelTelegram, ChannelWebhook:
+		return true
+	default:
+		return false
+	}
+}
+
 // DeliveryState is the lifecycle state of a single delivery attempt. It is kept
 // separate from EventState on purpose.
 type DeliveryState string
@@ -21,7 +31,21 @@ const (
 	DeliverySent       DeliveryState = "sent"
 	DeliveryFailed     DeliveryState = "failed"
 	DeliveryDeadLetter DeliveryState = "dead_letter"
+	// DeliveryCancelled is an alert that was still waiting to be sent when its
+	// incident was muted. It is final: the worker does not take it, replay does
+	// not apply to it, and unmute does not queue it again.
+	DeliveryCancelled DeliveryState = "cancelled"
 )
+
+// ValidDeliveryState reports whether s is a known delivery state.
+func ValidDeliveryState(s DeliveryState) bool {
+	switch s {
+	case DeliveryPending, DeliverySending, DeliverySent, DeliveryFailed, DeliveryDeadLetter, DeliveryCancelled:
+		return true
+	default:
+		return false
+	}
+}
 
 // DeliveryKind is what a delivery attempt is announcing. The queue is
 // self-describing on purpose: a channel cannot tell an alert from a recovery by
@@ -39,6 +63,19 @@ const (
 	KindRecovery DeliveryKind = "recovery"
 )
 
+// OrAlert is k, or KindAlert when k is empty: a delivery that does not say what
+// it announces is an alert, as every delivery was before recovery notices.
+func (k DeliveryKind) OrAlert() DeliveryKind {
+	if k == "" {
+		return KindAlert
+	}
+	return k
+}
+
+// DefaultChannelTimeout bounds one send to a channel whose configuration sets
+// no timeout of its own.
+const DefaultChannelTimeout = 10 * time.Second
+
 // ValidDeliveryKind reports whether k is a known delivery kind.
 func ValidDeliveryKind(k DeliveryKind) bool {
 	switch k {
@@ -52,7 +89,7 @@ func ValidDeliveryKind(k DeliveryKind) bool {
 // DeliveryAttempt is a single attempt to deliver an event through a channel.
 // A row represents one channel instance's delivery job for one event; the
 // attempt count increments as the worker retries, and terminal outcomes are
-// `sent` or `dead_letter`.
+// `sent`, `dead_letter`, or `cancelled`.
 type DeliveryAttempt struct {
 	ID      string      `json:"id"`
 	EventID string      `json:"event_id"`

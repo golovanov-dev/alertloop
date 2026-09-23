@@ -24,7 +24,18 @@ fi
 echo "==> Creating alertloop system user"
 id alertloop &>/dev/null || useradd --system --home "$DATA_DIR" --shell /usr/sbin/nologin alertloop
 
+# One previous copy of the binary and the unit, for going back after an upgrade
+# (OPERATIONS.md, "Upgrades and downgrades"). Re-running with the same files
+# keeps the copy of the older version.
+keep_previous() {
+  if [[ -f "$2" ]] && ! cmp -s "$1" "$2"; then
+    cp -p "$2" "$2.prev"
+    echo "    previous version kept as $2.prev"
+  fi
+}
+
 echo "==> Installing binary to $PREFIX/alertloop"
+keep_previous "$BINARY" "$PREFIX/alertloop"
 install -m 0755 "$BINARY" "$PREFIX/alertloop"
 
 echo "==> Creating directories"
@@ -63,6 +74,7 @@ else
 fi
 
 echo "==> Installing systemd unit"
+keep_previous "$SERVICE_SRC" /etc/systemd/system/alertloop.service
 install -m 0644 "$SERVICE_SRC" /etc/systemd/system/alertloop.service
 systemctl daemon-reload
 

@@ -153,3 +153,29 @@ func TestPerIPLimitSeparatesClientsBehindAProxy(t *testing.T) {
 		t.Fatalf("second client got %d; one noisy client must not lock out the rest", code)
 	}
 }
+
+// One IPv6 host usually holds a whole /64. Rotating through it must not buy a
+// fresh bucket per address; a neighbouring /64 is a different client.
+func TestPerIPLimitGroupsIPv6By64(t *testing.T) {
+	limiter := newKeyedLimiter(1, 2)
+	h := perIPLimit(limiter, &TrustedProxies{}, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	send := func(remote string) int {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req(remote, nil))
+		return rec.Code
+	}
+
+	for _, remote := range []string{"[2001:db8:1:2::1]:1000", "[2001:db8:1:2::2]:1000"} {
+		if code := send(remote); code != http.StatusOK {
+			t.Fatalf("%s got %d within the burst", remote, code)
+		}
+	}
+	if code := send("[2001:db8:1:2:ffff::3]:1000"); code != http.StatusTooManyRequests {
+		t.Fatalf("a third address in the same /64 got %d; the /64 must share one bucket", code)
+	}
+	if code := send("[2001:db8:1:3::1]:1000"); code != http.StatusOK {
+		t.Fatalf("a neighbouring /64 got %d; it is a different client", code)
+	}
+}

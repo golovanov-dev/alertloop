@@ -23,6 +23,9 @@ func TestApplyAction(t *testing.T) {
 		{"escalate resolved rejected", StateResolved, ActionEscalate, "", ErrInvalidTransition},
 		{"unmute non-muted rejected", StateNew, ActionUnmute, "", ErrInvalidTransition},
 		{"resolve from any state", StateEscalated, ActionResolve, StateResolved, nil},
+		{"resolve resolved rejected", StateResolved, ActionResolve, "", ErrInvalidTransition},
+		{"ack muted", StateMuted, ActionAck, StateAcknowledged, nil},
+		{"escalate muted", StateMuted, ActionEscalate, StateEscalated, nil},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

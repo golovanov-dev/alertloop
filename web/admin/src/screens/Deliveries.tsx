@@ -1,17 +1,22 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { api } from "../api";
 import { useApp } from "../context";
-import { relToLabel, dateTime } from "../format";
-import { c, mono } from "../theme";
+import { useDebounced } from "../hooks";
+import { c } from "../theme";
 import type { DeliveryAttempt } from "../types";
-import { Badge, Card, ErrorState, Loading, td, tdMono, th } from "../ui";
+import { alertStates, Button, Card, DeliveriesTable, ErrorState, focusIfLost, Loading } from "../ui";
 
 export function Deliveries() {
   const { showToast } = useApp();
   const [params] = useSearchParams();
 
   const [state, setState] = useState(params.get("state") ?? "");
+  // A link to this screen (the menu, an Overview card) sets the state again:
+  // the screen stays mounted when only the address changes.
+  useEffect(() => {
+    setState(params.get("state") ?? "");
+  }, [params]);
   const [channel, setChannel] = useState("");
   const [channelName, setChannelName] = useState("");
   const [eventId, setEventId] = useState("");
@@ -21,19 +26,30 @@ export function Deliveries() {
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [moreError, setMoreError] = useState<string | null>(null);
   const [replayed, setReplayed] = useState<Record<string, boolean>>({});
+  const [replaying, setReplaying] = useState<string | null>(null);
+  // Dead-lettered attempts beyond the loaded page: a recovery on this page may
+  // be held by an alert that the page does not show.
+  const [deadLetters, setDeadLetters] = useState<DeliveryAttempt[]>([]);
   const seq = useRef(0);
+  const firstFilter = useRef<HTMLButtonElement>(null);
+  const noMore = useRef<HTMLDivElement>(null);
+
+  const channelNameQ = useDebounced(channelName.trim());
+  const eventIdQ = useDebounced(eventId.trim());
 
   const load = useCallback(async () => {
     const mySeq = ++seq.current;
     setLoading(true);
     setError(null);
+    setMoreError(null);
     try {
       const page = await api.listDeliveries({
         state,
         channel,
-        channel_name: channelName,
-        event_id: eventId,
+        channel_name: channelNameQ,
+        event_id: eventIdQ,
         limit: 50,
       });
       if (seq.current !== mySeq) return;
@@ -41,38 +57,64 @@ export function Deliveries() {
       setCursor(page.next_cursor);
     } catch (e) {
       if (seq.current !== mySeq) return;
+      setItems([]);
+      setCursor(undefined);
       setError(e instanceof Error ? e.message : "Failed to load");
     } finally {
       if (seq.current === mySeq) setLoading(false);
     }
-  }, [state, channel, channelName, eventId]);
+  }, [state, channel, channelNameQ, eventIdQ]);
 
   useEffect(() => {
     load();
   }, [load]);
 
+  // The dead-letter lookup runs once per visit (Retry repeats it), not on every
+  // filter change. It only adds "waits for its alert" to recoveries whose alert
+  // is not on the page, so when it fails the screen works without that hint.
+  const loadDeadLetters = useCallback(() => {
+    api
+      .listDeliveries({ state: "dead_letter", limit: 200 })
+      .then((p) => setDeadLetters(p.items))
+      .catch(() => setDeadLetters([]));
+  }, []);
+  useEffect(loadDeadLetters, [loadDeadLetters]);
+
   const loadMore = async () => {
-    if (!cursor) return;
+    // While the first page reloads, the cursor belongs to the old list.
+    if (!cursor || loadingMore || loading) return;
     setLoadingMore(true);
+    setMoreError(null);
+    const mySeq = seq.current;
     try {
       const page = await api.listDeliveries({
         state,
         channel,
-        channel_name: channelName,
-        event_id: eventId,
+        channel_name: channelNameQ,
+        event_id: eventIdQ,
         limit: 50,
         cursor,
       });
+      if (seq.current !== mySeq) return;
       setItems((prev) => [...prev, ...page.items]);
       setCursor(page.next_cursor);
-    } catch {
-      /* keep existing */
+    } catch (e) {
+      if (seq.current === mySeq) setMoreError(e instanceof Error ? e.message : "Failed to load more");
     } finally {
       setLoadingMore(false);
     }
   };
+  // On the last page Load more gives way to "No more deliveries", which takes
+  // the focus if the button had it.
+  useEffect(() => {
+    if (!cursor) focusIfLost(noMore.current);
+  }, [cursor]);
+
+  // Loaded rows are fresher than the dead-letter lookup, so they win.
+  const alerts = useMemo(() => alertStates([...deadLetters, ...items]), [deadLetters, items]);
 
   const replay = async (id: string) => {
+    setReplaying(id);
     try {
       const updated = await api.replay(id);
       setItems((prev) => prev.map((d) => (d.id === id ? updated : d)));
@@ -80,6 +122,8 @@ export function Deliveries() {
       showToast("Delivery re-queued");
     } catch (e) {
       showToast(e instanceof Error ? e.message : "Replay failed");
+    } finally {
+      setReplaying(null);
     }
   };
 
@@ -89,6 +133,8 @@ export function Deliveries() {
     setChannel("");
     setChannelName("");
     setEventId("");
+    // The button goes away with the filters; the focus goes to the first one.
+    firstFilter.current?.focus();
   };
   const isDeadLetterPreset = state === "dead_letter";
 
@@ -100,7 +146,9 @@ export function Deliveries() {
       </div>
 
       <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center", marginTop: 24 }}>
-        <div
+        <Button
+          ref={firstFilter}
+          aria-pressed={isDeadLetterPreset}
           onClick={() => setState((s) => (s === "dead_letter" ? "" : "dead_letter"))}
           style={{
             display: "flex",
@@ -117,16 +165,16 @@ export function Deliveries() {
           }}
         >
           Dead letter
-        </div>
-        <select value={state} onChange={(e) => setState(e.target.value)} style={{ minWidth: 130 }}>
+        </Button>
+        <select aria-label="State" value={state} onChange={(e) => setState(e.target.value)} style={{ minWidth: 130 }}>
           <option value="">All states</option>
-          {["pending", "sending", "sent", "failed", "dead_letter"].map((s) => (
+          {["pending", "sending", "sent", "failed", "dead_letter", "cancelled"].map((s) => (
             <option key={s} value={s}>
               {s}
             </option>
           ))}
         </select>
-        <select value={channel} onChange={(e) => setChannel(e.target.value)} style={{ minWidth: 130 }}>
+        <select aria-label="Channel type" value={channel} onChange={(e) => setChannel(e.target.value)} style={{ minWidth: 130 }}>
           <option value="">All channel types</option>
           {["email", "telegram", "webhook"].map((s) => (
             <option key={s} value={s}>
@@ -134,12 +182,26 @@ export function Deliveries() {
             </option>
           ))}
         </select>
-        <input value={channelName} onChange={(e) => setChannelName(e.target.value)} placeholder="Channel name…" style={{ width: 150 }} />
-        <input value={eventId} onChange={(e) => setEventId(e.target.value)} placeholder="Event ID…" style={{ width: 150 }} />
+        <input
+          value={channelName}
+          onChange={(e) => setChannelName(e.target.value)}
+          aria-label="Channel name"
+          placeholder="Channel name (exact)…"
+          title="Matches the whole channel name exactly"
+          style={{ width: 170 }}
+        />
+        <input
+          value={eventId}
+          onChange={(e) => setEventId(e.target.value)}
+          aria-label="Event ID"
+          placeholder="Full event ID…"
+          title="The full event ID, as on the event page"
+          style={{ width: 170 }}
+        />
         {filtersActive && (
-          <div onClick={clearFilters} style={{ fontSize: 13, color: c.accent, cursor: "pointer", padding: "8px 4px" }}>
+          <Button onClick={clearFilters} style={{ fontSize: 13, color: c.accent, padding: "8px 4px" }}>
             Clear filters
-          </div>
+          </Button>
         )}
       </div>
 
@@ -150,89 +212,47 @@ export function Deliveries() {
           </div>
         ) : error ? (
           <div style={{ padding: 20 }}>
-            <ErrorState message={error} onRetry={load} />
+            <ErrorState
+              message={error}
+              onRetry={() => {
+                loadDeadLetters();
+                load();
+              }}
+            />
           </div>
         ) : items.length > 0 ? (
-          <div style={{ overflowX: "auto" }}>
-            <table style={{ width: "100%", minWidth: 920, fontSize: 13.5 }}>
-              <thead>
-                <tr>
-                  {["Channel", "Kind", "Event", "State", "Attempts", "Next retry (local)", "Last error", "Updated (local)", ""].map((h, i) => (
-                    <th key={i} style={th}>
-                      {h}
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {items.map((d) => (
-                  <tr key={d.id}>
-                    <td style={{ ...td, color: c.text2, whiteSpace: "nowrap" }}>
-                      {d.channel} <span style={{ color: c.muted }}>/</span>{" "}
-                      <code style={{ fontFamily: mono, fontSize: 12.5 }}>{d.channel_name}</code>
-                    </td>
-                    {/* An alert and its recovery are two rows for the same event.
-                        Without this column they are indistinguishable, and a
-                        recovery reads as a duplicate notification. */}
-                    <td style={{ ...td, whiteSpace: "nowrap", color: d.kind === "recovery" ? c.text2 : c.muted }}>
-                      {d.kind === "recovery" ? "recovery" : "alert"}
-                    </td>
-                    <td style={tdMono}>{d.event_id.slice(0, 8)}</td>
-                    <td style={td}>
-                      <Badge kind="delivery" value={d.state} />
-                    </td>
-                    <td style={{ ...tdMono, color: c.text2 }}>
-                      {d.attempts} / {d.max_attempts}
-                    </td>
-                    <td style={tdMono}>{relToLabel(d.next_retry_at)}</td>
-                    <td
-                      style={{ ...tdMono, maxWidth: 220, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}
-                      title={d.last_error}
-                    >
-                      {d.last_error || "—"}
-                    </td>
-                    <td style={tdMono}>{dateTime(d.updated_at)}</td>
-                    <td style={{ ...td, textAlign: "right" }}>
-                      {replayed[d.id] ? (
-                        <span style={{ fontSize: 12, color: c.ok }}>Queued ✓</span>
-                      ) : d.state === "dead_letter" ? (
-                        <div
-                          onClick={() => replay(d.id)}
-                          style={{
-                            display: "inline-block",
-                            padding: "5px 12px",
-                            borderRadius: 6,
-                            background: c.accent,
-                            color: c.accentInk,
-                            fontSize: 12.5,
-                            fontWeight: 600,
-                            cursor: "pointer",
-                          }}
-                        >
-                          Replay
-                        </div>
-                      ) : null}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+          <DeliveriesTable
+            items={items}
+            alerts={alerts}
+            replayed={replayed}
+            replaying={replaying}
+            onReplay={replay}
+            showEvent
+          />
         ) : (
           <div style={{ padding: "60px 20px", textAlign: "center" }}>
-            <div style={{ fontSize: 14, color: c.muted }}>Nothing found for this filter.</div>
+            <div style={{ fontSize: 14, color: c.muted }}>
+              {filtersActive
+                ? "Nothing found for this filter."
+                : "No deliveries yet. One appears for each channel an event is routed to."}
+            </div>
             {filtersActive && (
-              <div onClick={clearFilters} style={{ marginTop: 14, fontSize: 13, color: c.accent, cursor: "pointer" }}>
+              <Button onClick={clearFilters} style={{ marginTop: 14, fontSize: 13, color: c.accent }}>
                 Clear filters
-              </div>
+              </Button>
             )}
           </div>
         )}
       </Card>
 
-      {cursor && (
+      {!cursor && !loading && items.length > 0 && (
+        <div ref={noMore} tabIndex={-1} style={{ marginTop: 18, textAlign: "center", fontSize: 13, color: c.muted2, outline: "none" }}>
+          No more deliveries
+        </div>
+      )}
+      {cursor && !loading && (
         <div style={{ marginTop: 18, textAlign: "center" }}>
-          <div
+          <Button
             onClick={loadMore}
             style={{
               display: "inline-block",
@@ -242,12 +262,14 @@ export function Deliveries() {
               background: c.card,
               color: c.text2,
               fontSize: 13.5,
-              cursor: "pointer",
             }}
           >
             {loadingMore ? "Loading…" : "Load more"}
-          </div>
+          </Button>
         </div>
+      )}
+      {moreError && (
+        <div style={{ marginTop: 10, textAlign: "center", fontSize: 13, color: c.danger }}>{moreError}</div>
       )}
     </div>
   );

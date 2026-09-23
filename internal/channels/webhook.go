@@ -7,22 +7,25 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/golovanov-dev/alertloop/internal/domain"
 )
 
-// SignatureHeader carries the hex-encoded HMAC-SHA256 of the request body.
+// SignatureHeader carries the bare lowercase hex HMAC-SHA256 of the raw request
+// body, with no prefix. The format is a contract with receivers.
 const SignatureHeader = "X-AlertLoop-Signature"
 
 // SignatureVersionHeader identifies the signing scheme so receivers can adapt
 // to future changes.
 const SignatureVersionHeader = "X-AlertLoop-Signature-Version"
 
-// signatureVersion is the current signing scheme: "v1=<hex sha256 hmac>".
+// signatureVersion is the value of SignatureVersionHeader for the scheme above.
 const signatureVersion = "v1"
 
 // Webhook delivers events to a generic outbound HTTP endpoint. The request body
@@ -31,24 +34,49 @@ const signatureVersion = "v1"
 type Webhook struct {
 	name   string
 	url    string
+	origin string // scheme://host of url: the only part of it errors may show
 	secret string
 	client *http.Client
 }
 
-// NewWebhook builds a named Webhook channel. A zero timeout falls back to 10s.
+// NewWebhook builds a named Webhook channel. A zero timeout falls back to
+// domain.DefaultChannelTimeout.
 func NewWebhook(name, url, secret string, timeout time.Duration) *Webhook {
 	if timeout <= 0 {
-		timeout = 10 * time.Second
+		timeout = domain.DefaultChannelTimeout
 	}
 	return &Webhook{
 		name:   name,
 		url:    url,
+		origin: originOf(url),
 		secret: secret,
 		client: &http.Client{Timeout: timeout},
 	}
 }
 
+// originOf returns scheme://host of a webhook URL. The path and query of a
+// Slack or Discord webhook URL are its secret, and delivery errors reach
+// last_error, the read API, the console and the log.
+func originOf(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return "(unparsable url)"
+	}
+	return u.Scheme + "://" + u.Host
+}
+
+// redactURLError drops the full URL that a *url.Error carries in its text.
+func (w *Webhook) redactURLError(err error) error {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return fmt.Errorf("%s: %w", w.origin, urlErr.Err)
+	}
+	return err
+}
+
 func (w *Webhook) Name() string { return w.name }
+
+func (w *Webhook) Timeout() time.Duration { return w.client.Timeout }
 
 // webhookPayload is the JSON body posted to the receiver.
 //
@@ -64,10 +92,7 @@ type webhookPayload struct {
 func (w *Webhook) Type() domain.ChannelType { return domain.ChannelWebhook }
 
 func (w *Webhook) Send(ctx context.Context, n domain.Notification) error {
-	kind := n.Kind
-	if kind == "" {
-		kind = domain.KindAlert
-	}
+	kind := n.Kind.OrAlert()
 	body, err := json.Marshal(webhookPayload{
 		Event:     n.Event,
 		Kind:      kind,
@@ -79,7 +104,7 @@ func (w *Webhook) Send(ctx context.Context, n domain.Notification) error {
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.url, bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("build webhook request: %w", err)
+		return fmt.Errorf("build webhook request: %w", w.redactURLError(err))
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "AlertLoop/1")
@@ -90,7 +115,7 @@ func (w *Webhook) Send(ctx context.Context, n domain.Notification) error {
 
 	resp, err := w.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("webhook request failed: %w", err)
+		return fmt.Errorf("webhook request failed: %w", w.redactURLError(err))
 	}
 	defer resp.Body.Close()
 	// Drain a small amount so the connection can be reused.
@@ -102,17 +127,9 @@ func (w *Webhook) Send(ctx context.Context, n domain.Notification) error {
 	return nil
 }
 
-// Sign returns the hex-encoded HMAC-SHA256 of body keyed by secret. Exported so
-// receivers (and tests) can verify signatures with the same routine.
+// Sign returns the hex-encoded HMAC-SHA256 of body keyed by secret.
 func Sign(secret string, body []byte) string {
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write(body)
 	return hex.EncodeToString(mac.Sum(nil))
-}
-
-// Verify reports whether signature matches body under secret, using a
-// constant-time comparison.
-func Verify(secret string, body []byte, signature string) bool {
-	expected := Sign(secret, body)
-	return hmac.Equal([]byte(expected), []byte(signature))
 }

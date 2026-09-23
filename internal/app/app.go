@@ -62,7 +62,7 @@ func New(ctx context.Context, cfg config.Config, version string, log *slog.Logge
 
 	// nil when notify_on_resolve is off, which makes "do not notify" a nil
 	// pointer rather than a flag every call site has to remember.
-	recovery := service.NewRecoveryNotifier(store, cfg.ShouldNotifyOnResolve(), cfg.Worker.MaxAttempts, log)
+	recovery := service.NewRecoveryNotifier(cfg.ShouldNotifyOnResolve(), cfg.Worker.MaxAttempts, log)
 
 	router, err := buildRouter(cfg.Routing, registry.Targets())
 	if err != nil {
@@ -124,25 +124,82 @@ func RequireCredential(cfg config.Config, mode string) error {
 		"An exported environment variable counts only where that file references it")
 }
 
-// modeServesHTTP reports whether a CLI mode puts an HTTP listener on the
-// network. The modes are the ones cmd/alertloop accepts: "server" and "all"
-// serve, "worker" only drains the delivery queue, "check-db" is a probe that
-// exits. An unknown mode serves nothing — cmd/alertloop rejects it by name a
-// moment later.
+// minCredentialLen is the length below which a token or key is reported as weak.
+const minCredentialLen = 32
+
+// fixCredential ends every weak-credential warning with what to do about it.
+const fixCredential = "Replace it with the output of: openssl rand -hex 32"
+
+// WeakCredentialWarnings names the weak credentials of a process that serves
+// HTTP: the public demo admin token, any token or key shorter than
+// minCredentialLen, and, when there are several ingest keys, each one not
+// limited by `sources`. It never prints a credential itself.
+func WeakCredentialWarnings(cfg config.Config, mode string) []string {
+	if !modeServesHTTP(mode) {
+		return nil
+	}
+	var out []string
+	switch {
+	case cfg.AdminToken == config.DemoAdminToken:
+		out = append(out, "admin_token is the public demo token change-me-admin: requests through a "+
+			"reverse proxy or from a public address are refused. "+fixCredential)
+	case cfg.AdminToken != "" && len(cfg.AdminToken) < minCredentialLen:
+		out = append(out, fmt.Sprintf("admin_token is shorter than %d characters. %s", minCredentialLen, fixCredential))
+	}
+	ingestKeys := 0
+	for i, k := range cfg.APIKeys {
+		if len(k.Key) < minCredentialLen {
+			out = append(out, fmt.Sprintf("api_keys[%d] (scope %s) is shorter than %d characters. %s",
+				i, k.Scope, minCredentialLen, fixCredential))
+		}
+		if k.Scope == config.ScopeIngest {
+			ingestKeys++
+		}
+	}
+	// One ingest key needs no sources: there is no other source to isolate.
+	if ingestKeys > 1 {
+		for i, k := range cfg.APIKeys {
+			if k.Scope == config.ScopeIngest && k.Sources == nil {
+				out = append(out, fmt.Sprintf("api_keys[%d] (scope ingest) has no sources: it can change and "+
+					"resolve events of every source. List the sources it reports", i))
+			}
+		}
+	}
+	return out
+}
+
+// The modes of cmd/alertloop. "check-db" is a probe that exits.
+const (
+	ModeServer  = "server"
+	ModeWorker  = "worker"
+	ModeAll     = "all"
+	ModeCheckDB = "check-db"
+)
+
+// Modes lists every mode cmd/alertloop accepts; anything else is refused before
+// the config is loaded.
+var Modes = []string{ModeServer, ModeWorker, ModeAll, ModeCheckDB}
+
+// modeServesHTTP reports whether a mode puts an HTTP listener on the network:
+// "server" and "all" do, "worker" only drains the delivery queue.
 func modeServesHTTP(mode string) bool {
 	switch mode {
-	case "server", "all":
+	case ModeServer, ModeAll:
 		return true
 	}
 	return false
 }
 
-// CheckDatabase validates cfg and reaches its database, without migrating it.
-// It is `alertloop check-db`, the health check of a worker container: the
-// worker has no HTTP listener to probe. See storage.Check for what it will not
-// do on the way.
+// CheckDatabase is `alertloop check-db`, the pre-flight check of an upgrade and
+// the health check of a worker container. It refuses what starting `server` or
+// `all` would refuse from the config and the database — an invalid config, no
+// credential, a schema migrated by a newer version — and migrates nothing. See
+// storage.Check for what it will not do on the way.
 func CheckDatabase(ctx context.Context, cfg config.Config) error {
 	if err := cfg.Validate(); err != nil {
+		return err
+	}
+	if err := RequireCredential(cfg, ModeServer); err != nil {
 		return err
 	}
 	return storage.Check(ctx, cfg.Database.Driver, cfg.Database.DSN)
@@ -254,8 +311,12 @@ func buildRegistry(c config.Channels) (*channels.Registry, error) {
 // RunServer starts the HTTP server and blocks until ctx is cancelled.
 func (a *App) RunServer(ctx context.Context) error {
 	keyScopes := make(map[string]string, len(a.cfg.APIKeys))
+	keySources := map[string][]string{}
 	for _, k := range a.cfg.APIKeys {
 		keyScopes[k.Key] = k.Scope
+		if k.Sources != nil {
+			keySources[k.Key] = k.Sources
+		}
 	}
 	trusted, err := api.NewTrustedProxies(a.cfg.RateLimit.TrustedProxies)
 	if err != nil {
@@ -273,6 +334,7 @@ func (a *App) RunServer(ctx context.Context) error {
 		Deliveries:     a.delivery,
 		Routing:        a.router,
 		APIKeys:        keyScopes,
+		APIKeySources:  keySources,
 		AdminToken:     a.cfg.AdminToken,
 		Version:        a.version,
 		RateLimit:      a.cfg.RateLimit,
@@ -389,8 +451,8 @@ func (a *App) runRetention(ctx context.Context) {
 
 func (a *App) cleanupOnce(ctx context.Context) {
 	cutoff := time.Now().UTC().AddDate(0, 0, -a.cfg.RetentionDays)
-	// Deleting events cascades to delivery_attempts via FK; also sweep any
-	// orphaned attempts defensively.
+	// Deleting events cascades to delivery_attempts via FK. The second sweep
+	// finds orphans only on old databases (see DeleteDeliveryAttemptsBefore).
 	n, err := a.store.DeleteEventsBefore(ctx, cutoff)
 	if err != nil {
 		a.log.Error("retention cleanup failed", "error", err)
@@ -403,6 +465,3 @@ func (a *App) cleanupOnce(ctx context.Context) {
 		a.log.Info("retention cleanup", "deleted_events", n, "cutoff", cutoff.Format(time.RFC3339))
 	}
 }
-
-// ChannelTargets reports the configured channel instances wired into the App.
-func (a *App) ChannelTargets() []domain.ChannelTarget { return a.registry.Targets() }

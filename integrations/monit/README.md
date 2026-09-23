@@ -141,14 +141,18 @@ that switched them all on would page you about a PostgreSQL you do not run.
 
 ## Create the API key
 
-Give this server its own key, scoped to ingestion only, in **AlertLoop's** config
-file:
+Give this server its own key, scoped to ingestion and to this host's source,
+in **AlertLoop's** config file:
 
 ```yaml
 api_keys:
   - key: "paste-the-output-of-openssl-rand-hex-32"
-    scope: ingest       # may only create events; cannot read them or resolve them
+    scope: ingest       # may only send events; cannot read them
+    sources: [web-01]   # this host's name: the key touches only its events
 ```
+
+`web-01` stands for the output of `hostname -s` run on this host, the one Monit
+watches, not on the AlertLoop server.
 
 Restart AlertLoop, then put the key on this host:
 
@@ -156,17 +160,29 @@ Restart AlertLoop, then put the key on this host:
 sudo nano /etc/alertloop/monit.env
 ```
 
+`install.sh` has already written every setting into that file, with
+`ALERTLOOP_SOURCE=monit`. Change the values in the existing lines; do not add
+new ones. When a setting appears twice, the last line wins, so an added
+`ALERTLOOP_SOURCE=web-01` above the stock line leaves the source `monit`, and
+every alert from this host gets 403 and is lost; recoveries carry no source
+and can still pass, so the host looks fine. After editing, the three lines read:
+
 ```bash
 ALERTLOOP_URL=http://127.0.0.1:8080
 ALERTLOOP_API_KEY=the-key-you-just-made
+ALERTLOOP_SOURCE=web-01
 ```
 
 The adapter reads everything after `=` as the value, so keep comments on lines
 of their own. AlertLoop on another host:
 `ALERTLOOP_URL=https://alerts.example.com`.
 
-One key per server, so a compromised host can be cut off on its own. `ingest` is
-deliberately the whole scope: Monit needs to report events and nothing else.
+One key per server, limited to that server's source: a compromised host can be
+cut off on its own, and its key cannot change or resolve another host's
+incidents (403). `ALERTLOOP_SOURCE` must be the name in `sources`; routing rules
+that matched `source: monit` should match the host names instead. One key shared
+by several hosts still works, but gives no isolation between them: any of them
+can change or resolve the others' incidents.
 
 Over the network, **HTTPS is required** — the adapter refuses plain HTTP to
 anything that is not localhost, and there is no flag to skip certificate
@@ -465,7 +481,7 @@ sudo MONIT_SERVICE=postgresql MONIT_EVENT="Connection failed" \
 | `config_not_found` | Monit runs as root; the file is at `/etc/alertloop/monit.env`. Check `--config` if a rule overrides it. |
 | `insecure_url` | Plain HTTP to a remote host. Use `https://`, or `127.0.0.1` if AlertLoop is local. |
 | `http_status=401` | The key is wrong, or AlertLoop was not restarted after it was added. |
-| `http_status=403` | The key exists but its scope is not `ingest`. |
+| `http_status=403` | The key's scope is not `ingest`, or (`source_not_allowed`) `ALERTLOOP_SOURCE` is not in the key's `sources`, or the `dedupe_key` belongs to another host's incident. |
 | `http_status=429` | Rate limited. Raise `rate_limit` in AlertLoop, or alert on fewer cycles. |
 | `connection_refused` | AlertLoop is down, or the port is not published where you think. |
 | `error=timeout` | AlertLoop is up and slow — often its database. Check `/health/ready`. |
@@ -540,16 +556,18 @@ including what to alert on from `/v1/stats`.
 
 ## Rotating the API key
 
-Nothing is cached, so this is a file edit and no restart:
+Nothing is cached, so on the Monit hosts this is a file edit with no restart:
 
-1. Add a **second** key with scope `ingest` to AlertLoop's config and restart it.
-   Both keys now work.
-2. On each host: `sudo nano /etc/alertloop/monit.env`, replace the value.
+1. Add a **new** key for each host to AlertLoop's config, next to the old ones:
+   scope `ingest` and that host's own `sources`, as the old key of that host.
+   Restart AlertLoop. Both keys of every host now work.
+2. On each host: `sudo nano /etc/alertloop/monit.env`, replace the value of
+   `ALERTLOOP_API_KEY` with that host's new key.
 3. Verify with a `--dry-run`, then a real test event.
-4. Remove the old key from AlertLoop's config and restart it.
+4. Remove the old keys from AlertLoop's config and restart it.
 
-Do it in that order. Removing the old key first means every host stops reporting
-until you have visited all of them.
+Do it in that order. Removing an old key first means its host stops reporting
+until you have visited it.
 
 ## Uninstall
 

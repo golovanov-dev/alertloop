@@ -40,7 +40,7 @@ Go 1.25 or newer; Node for the admin console. There is no CGO dependency.
 
 ```bash
 make build       # build bin/alertloop with the admin console currently in internal/adminui/dist
-ALERTLOOP_ADMIN_TOKEN=dev-token make run   # all-in-one on :8080, local SQLite, alertloop.example.yaml
+ALERTLOOP_ADMIN_TOKEN=dev-token make run   # all-in-one on 127.0.0.1:8080, local SQLite, alertloop.example.yaml
 make test        # run the Go test suite (PostgreSQL tests skip without a DSN)
 make vet         # static analysis
 make fmt         # format Go code
@@ -55,6 +55,7 @@ The React console lives in `web/admin`; the Go build embeds
 cd web/admin
 npm install
 npm run dev      # http://localhost:5273, proxies /v1 to localhost:8080
+npm run check:openapi   # the console's API types against api/openapi.yaml
 ```
 
 `make admin` builds it into `internal/adminui/dist`. The Docker image build does

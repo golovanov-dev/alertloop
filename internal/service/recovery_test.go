@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -18,7 +19,7 @@ func twoChannelService(t *testing.T, notify bool) (*IngestService, *EventService
 		{Type: domain.ChannelTelegram, Name: "ops-telegram"},
 		{Type: domain.ChannelEmail, Name: "ops-email"},
 	}
-	rec := NewRecoveryNotifier(s, notify, 5, quietLogger())
+	rec := NewRecoveryNotifier(notify, 5, quietLogger())
 	clock := clockAt(time.Date(2026, 8, 22, 10, 0, 0, 0, time.UTC))
 	ingest := NewIngestService(s, routing.NewAllChannels(targets), 5, rec, clock, quietLogger())
 	events := NewEventService(s, rec, clock)
@@ -194,7 +195,7 @@ func TestRecoverySkipsChannelsTheAlertWasNotRoutedTo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("router: %v", err)
 	}
-	rec := NewRecoveryNotifier(s, true, 5, quietLogger())
+	rec := NewRecoveryNotifier(true, 5, quietLogger())
 	clock := clockAt(time.Date(2026, 8, 22, 10, 0, 0, 0, time.UTC))
 	ingest := NewIngestService(s, router, 5, rec, clock, quietLogger())
 	ctx := context.Background()
@@ -239,7 +240,7 @@ func TestRecoveryIncludesChannelsWhoseAlertIsStillQueued(t *testing.T) {
 // correct. It must not be an error, and it must not queue undeliverable work.
 func TestResolveWithNoChannelsQueuesNothing(t *testing.T) {
 	s := newStore(t)
-	rec := NewRecoveryNotifier(s, true, 5, quietLogger())
+	rec := NewRecoveryNotifier(true, 5, quietLogger())
 	ingest := NewIngestService(s, routing.NewAllChannels(nil), 5, rec,
 		clockAt(time.Date(2026, 8, 22, 10, 0, 0, 0, time.UTC)), quietLogger())
 	ctx := context.Background()
@@ -294,10 +295,9 @@ func TestManualResolveActionNotifies(t *testing.T) {
 		t.Fatalf("recovery attempts = %d after a manual resolve, want 2", n)
 	}
 
-	// Resolving an already-resolved event is a no-op transition and must stay
-	// silent rather than notify again.
-	if _, err := events.Apply(ctx, res.Event.ID, domain.ActionResolve); err != nil {
-		t.Fatalf("second manual resolve: %v", err)
+	// Resolving an already-resolved event is refused and stays silent.
+	if _, err := events.Apply(ctx, res.Event.ID, domain.ActionResolve); !errors.Is(err, domain.ErrInvalidTransition) {
+		t.Fatalf("second manual resolve: err = %v, want ErrInvalidTransition", err)
 	}
 	if n := countDeliveries(t, store, domain.KindRecovery); n != 2 {
 		t.Fatalf("recovery attempts = %d after resolving twice, want 2", n)
@@ -419,7 +419,7 @@ func TestResolvingAMutedIncidentDoesNotNotify(t *testing.T) {
 // is already over.
 func TestFiringRetriesWhenTheIncidentClosesUnderneathIt(t *testing.T) {
 	s := newStore(t)
-	rec := NewRecoveryNotifier(s, true, 5, quietLogger())
+	rec := NewRecoveryNotifier(true, 5, quietLogger())
 	targets := []domain.ChannelTarget{{Type: domain.ChannelWebhook, Name: "wh"}}
 	svc := NewIngestService(&resolveRacingStore{Store: s}, routing.NewAllChannels(targets), 5, rec,
 		clockAt(time.Date(2026, 8, 24, 10, 0, 0, 0, time.UTC)), quietLogger())
@@ -461,7 +461,9 @@ func (s *resolveRacingStore) RefreshOpenEvent(ctx context.Context, id string, u 
 		if err != nil {
 			return nil, err
 		}
-		if _, _, err := s.ResolveByDedupe(ctx, e.DedupeKey, u.LastSeenAt); err != nil {
+		if _, err := s.TransitionEvent(ctx, id, storage.StateChange{
+			From: e.State, To: domain.StateResolved, At: u.LastSeenAt,
+		}); err != nil {
 			return nil, err
 		}
 	}

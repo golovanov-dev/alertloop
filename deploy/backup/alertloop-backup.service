@@ -1,0 +1,24 @@
+[Unit]
+Description=AlertLoop database backup
+Documentation=https://github.com/golovanov-dev/alertloop/blob/main/OPERATIONS.md#backup-and-restore
+# A remote PostgreSQL needs the network up.
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# The service user: sqlite3 may create the database's -wal/-shm files, and
+# created by root they would stop AlertLoop from opening its own database.
+User=alertloop
+Group=alertloop
+UMask=0077
+# PostgreSQL: PGHOST, PGUSER, PGPASSWORD, PGDATABASE, each value in single
+# quotes (OPERATIONS.md, "systemd, PostgreSQL").
+EnvironmentFile=-/etc/alertloop/backup.env
+ExecStart=/usr/local/bin/alertloop-backup sqlite /var/lib/alertloop/alertloop.db /var/backups/alertloop
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/alertloop /var/backups/alertloop

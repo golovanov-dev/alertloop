@@ -106,3 +106,39 @@ func checkRecoveryWaitsForAlert(t *testing.T, s Store) {
 	mark("alert-1-tg", domain.DeliverySent)
 	claim(later, "recovery-1-tg")
 }
+
+// The worker passes the channels whose share of its slots is used up; their
+// attempts stay queued and the next channel's are claimed instead.
+func TestClaimSkipsTheGivenChannels(t *testing.T) {
+	checkClaimSkipsChannels(t, newTestStore(t))
+}
+
+func TestPostgresClaimSkipsTheGivenChannels(t *testing.T) {
+	checkClaimSkipsChannels(t, postgresStore(t))
+}
+
+func checkClaimSkipsChannels(t *testing.T, s Store) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Date(2026, 9, 22, 9, 0, 0, 0, time.UTC)
+	if _, _, err := s.CreateEvent(ctx, sampleEvent("ev", "", now)); err != nil {
+		t.Fatalf("create event: %v", err)
+	}
+	for i, channel := range []string{"mail", "hook", "tg"} {
+		d := &domain.DeliveryAttempt{
+			ID: channel, EventID: "ev", Channel: domain.ChannelWebhook, ChannelName: channel,
+			State: domain.DeliveryPending, MaxAttempts: 5,
+			CreatedAt: now.Add(time.Duration(i) * time.Second), UpdatedAt: now,
+		}
+		if err := s.CreateDeliveryAttempt(ctx, d); err != nil {
+			t.Fatalf("create attempt %s: %v", channel, err)
+		}
+	}
+	claimed, err := s.ClaimDue(ctx, now.Add(time.Hour), 10, "mail", "hook")
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if len(claimed) != 1 || claimed[0].ID != "tg" {
+		t.Fatalf("claimed %v, want only tg", claimed)
+	}
+}

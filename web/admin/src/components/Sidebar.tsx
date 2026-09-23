@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import { NavLink } from "react-router-dom";
 import { useApp } from "../context";
 import { c } from "../theme";
+import { Button } from "../ui";
 import { Logo } from "./Logo";
 
 function navStyle({ isActive }: { isActive: boolean }) {
@@ -88,7 +89,10 @@ export function Sidebar({
         boxSizing: "border-box",
         overflowY: "auto",
         transform: open ? "translateX(0)" : "translateX(-100%)",
-        transition: "transform .2s ease",
+        // Hidden, not only moved away: Tab must not reach a closed menu. It
+        // shows at once on open (to take the focus) and hides after sliding out.
+        visibility: open ? "visible" : "hidden",
+        transition: open ? "transform .2s ease" : "transform .2s ease, visibility .2s",
         boxShadow: open ? "2px 0 24px rgba(0,0,0,0.5)" : "none",
       } as const)
     : ({
@@ -104,7 +108,7 @@ export function Sidebar({
       } as const);
 
   return (
-    <div style={rootStyle}>
+    <div id={mobile ? "al-menu" : undefined} style={rootStyle}>
       <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "6px 8px 22px" }}>
         <Logo size={22} />
         <span style={{ fontSize: 15, fontWeight: 600, letterSpacing: "-0.01em" }}>AlertLoop</span>
@@ -155,8 +159,9 @@ export function Sidebar({
 
       <div style={{ flex: 1 }} />
 
-      <div
+      <Button
         onClick={logout}
+        aria-label="Log out"
         style={{
           borderTop: `1px solid ${c.border}`,
           marginTop: 6,
@@ -164,11 +169,12 @@ export function Sidebar({
           display: "flex",
           alignItems: "center",
           gap: 8,
-          cursor: "pointer",
+          width: "100%",
         }}
       >
-        <div
+        <span
           style={{
+            flexShrink: 0,
             width: 22,
             height: 22,
             borderRadius: 6,
@@ -182,10 +188,10 @@ export function Sidebar({
           }}
         >
           ##
-        </div>
-        <div style={{ fontSize: 12.5, color: c.muted, flex: 1 }}>Admin session</div>
-        <div style={{ fontSize: 12, color: c.accent }}>Log out</div>
-      </div>
+        </span>
+        <span style={{ fontSize: 12.5, color: c.muted, flex: 1 }}>Admin session</span>
+        <span style={{ fontSize: 12, color: c.accent }}>Log out</span>
+      </Button>
     </div>
   );
 }

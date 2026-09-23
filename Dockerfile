@@ -2,7 +2,7 @@
 # of what is checked in. The output is static files, the same for every
 # platform, so it is built once on the build machine: under QEMU emulation for
 # arm64, npm crashed with "Illegal instruction" and the image build hung.
-FROM --platform=$BUILDPLATFORM node:22-alpine AS ui
+FROM --platform=$BUILDPLATFORM node:22-alpine@sha256:b6f26b36c8ff49624cfdac716b8ea1138d606df02586a77d364bb5536a634f85 AS ui
 WORKDIR /ui
 COPY web/admin/package.json web/admin/package-lock.json ./
 # `npm ci`, not `npm install`. install is allowed to update the lock file, so
@@ -17,7 +17,7 @@ RUN mkdir -p /internal/adminui && npm run build
 
 # Build stage: compile a static, CGO-free binary (modernc SQLite is pure Go, so
 # the image needs no libc and cross-compiles cleanly).
-FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine@sha256:8a5910f31396cd4d89662f56c68b3ae31d374308270a1c3bd96672ee5ed43414 AS build
 WORKDIR /src
 
 COPY go.mod go.sum ./
@@ -41,11 +41,9 @@ RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath \
 # Docker path instead of a local build. Whatever has been found in busybox,
 # musl, or ca-certificates since then would ship to every user.
 #
-# Track the current stable branch and rebuild on release; that is what actually
-# keeps this current. Pin by digest if your policy requires reproducible bases -
-# it is deliberately not pinned here, because a digest nobody updates is how an
-# image quietly ages past its support window all over again.
-FROM alpine:3.22
+# Base images are pinned by digest (tag kept for reading). Refresh the digests
+# before every release, or the image ages past its support window unnoticed.
+FROM alpine:3.22@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8
 RUN apk add --no-cache ca-certificates tzdata && \
     adduser -D -u 10001 alertloop && \
     mkdir -p /data && chown alertloop:alertloop /data
@@ -66,6 +64,9 @@ RUN mkdir -p /etc/alertloop && { \
 USER alertloop
 EXPOSE 8080
 ENV ALERTLOOP_CONFIG=/etc/alertloop/alertloop.yaml
+# Read by addr: ${ALERTLOOP_ADDR:-...} in alertloop.example.yaml: inside a
+# container loopback is unreachable from the published port.
+ENV ALERTLOOP_ADDR=:8080
 VOLUME ["/data"]
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s \

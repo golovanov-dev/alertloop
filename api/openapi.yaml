@@ -32,18 +32,25 @@ paths:
       tags: [events]
       summary: Ingest an event
       description: >
-        Creates an event and enqueues one delivery attempt per configured
-        channel.
+        Creates an event and queues one delivery attempt for each channel its
+        routing selects: every configured channel when the config has no
+        `routing` section. See `GET /v1/routing`.
 
 
         What a repeated `dedupe_key` does depends on `status`. **Without
-        `status`** the key is an idempotency key and behaves as it always has:
-        the existing open event is returned with HTTP 200, untouched, and no
-        new deliveries are created. **With `status`** the key identifies an
-        incident: `firing` refreshes the open incident with the newest severity,
-        message, and payload (HTTP 200, still no new deliveries — a check that
-        fails every minute must not notify every minute), and `resolved` closes
-        it.
+        `status`** the key is an idempotency key while the event is open: the
+        existing open event is returned with HTTP 200, untouched, and no new
+        deliveries are created. Once that event is resolved, the same key
+        creates a new event. **With `status`** the key identifies an incident:
+        `firing` refreshes the open incident with the newest severity, message,
+        and payload (HTTP 200), and `resolved` closes it.
+
+
+        A repeated `firing` creates no deliveries — a check that fails every
+        minute must not notify every minute — unless it raises the severity:
+        then an alert goes to each channel the new severity routes to that has
+        had no alert for this incident. A muted incident gets none. The same or
+        a lower severity notifies nobody.
 
 
         Closing an incident sends a **recovery notice** to the channels that
@@ -54,6 +61,16 @@ paths:
 
         Resolving an incident frees its `dedupe_key`, so the same failure
         recurring afterwards opens a new incident and notifies again.
+
+
+        **Sources of an `ingest` key.** A key with `sources` in the config may
+        report only those sources, and may refresh or resolve only events of
+        those sources. Anything else gets 403 `source_not_allowed` and changes
+        nothing. A key without `sources` works with every source.
+
+
+        **Response.** A caller with scope `full` (the admin token included)
+        gets the event and `outcome`. An `ingest` key gets only `id`, `state` and `outcome`.
       security:
         - ApiKeyAuth: []
         - BearerAuth: []
@@ -109,7 +126,9 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Event'
+                oneOf:
+                  - $ref: '#/components/schemas/IngestResult'
+                  - $ref: '#/components/schemas/IngestSummary'
         "200":
           description: >
             The incident already existed. Without `status` it is returned
@@ -118,7 +137,9 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Event'
+                oneOf:
+                  - $ref: '#/components/schemas/IngestResult'
+                  - $ref: '#/components/schemas/IngestSummary'
         "204":
           description: >
             Accepted, with no incident to return: `status: resolved` for a
@@ -130,9 +151,37 @@ paths:
           $ref: '#/components/responses/BadRequest'
         "401":
           $ref: '#/components/responses/Unauthorized'
+        "403":
+          description: >
+            `forbidden`: the credential lacks scope `ingest`.
+            `source_not_allowed`: the key's `sources` do not include the
+            request's `source`, or the `dedupe_key` belongs to an event of
+            another source. Nothing is changed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        "413":
+          description: >
+            `request_too_large`: the request body exceeds 524288 bytes. Nothing
+            is stored.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        "409":
+          description: >
+            `invalid_transition`: `status: resolved` found the incident changed
+            by other requests several times in a row and gave up; retry.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        "429":
+          $ref: '#/components/responses/TooManyRequests'
     get:
       tags: [events]
       summary: List events
+      description: >
+        Newest first. Filters combine with AND and work with the cursor. A
+        filter value outside its enum gets 400.
       security:
         - ApiKeyAuth: []
         - BearerAuth: []
@@ -140,7 +189,15 @@ paths:
         - { name: type, in: query, schema: { $ref: '#/components/schemas/EventType' } }
         - { name: severity, in: query, schema: { $ref: '#/components/schemas/Severity' } }
         - { name: state, in: query, schema: { $ref: '#/components/schemas/EventState' } }
-        - { name: source, in: query, schema: { type: string } }
+        - { name: source, in: query, schema: { type: string }, description: Exact source. Not valid UTF-8 gets 400. }
+        - name: q
+          in: query
+          description: >
+            Events whose `message` contains this text, ignoring case (Cyrillic
+            included). `%` and `_` match themselves. Empty means no filter; more
+            than 200 characters or not valid UTF-8 gets 400. On PostgreSQL case folding follows
+            the database `LC_CTYPE`: with `C` only ASCII letters are folded.
+          schema: { type: string, maxLength: 200 }
         - $ref: '#/components/parameters/Limit'
         - $ref: '#/components/parameters/Cursor'
       responses:
@@ -150,8 +207,14 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/EventList'
+        "400":
+          $ref: '#/components/responses/BadRequest'
         "401":
           $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+        "429":
+          $ref: '#/components/responses/TooManyRequests'
   /v1/events/{id}:
     get:
       tags: [events]
@@ -168,8 +231,14 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Event'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
         "404":
           $ref: '#/components/responses/NotFound'
+        "429":
+          $ref: '#/components/responses/TooManyRequests'
   /v1/events/{id}/ack:
     post: { $ref: '#/components/x-actions/ack' }
   /v1/events/{id}/resolve:
@@ -184,6 +253,9 @@ paths:
     get:
       tags: [delivery]
       summary: List delivery attempts
+      description: >
+        Newest first. Filters combine with AND. A `state`, `channel` or `kind`
+        outside its enum gets 400.
       security:
         - ApiKeyAuth: []
         - BearerAuth: []
@@ -202,13 +274,21 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DeliveryAttemptList'
+        "400":
+          $ref: '#/components/responses/BadRequest'
         "401":
           $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+        "429":
+          $ref: '#/components/responses/TooManyRequests'
   /v1/delivery-attempts/{id}/replay:
     post:
       tags: [delivery]
       summary: Replay a dead-lettered delivery attempt
-      description: Re-queues a `dead_letter` attempt as `pending` for another try.
+      description: >
+        Re-queues a `dead_letter` attempt as `pending` and resets `attempts` to
+        0, so it gets a new cycle of up to `max_attempts` tries with backoff.
       security:
         - ApiKeyAuth: []
         - BearerAuth: []
@@ -221,6 +301,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DeliveryAttempt'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
         "404":
           $ref: '#/components/responses/NotFound'
         "409":
@@ -229,6 +313,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        "429":
+          $ref: '#/components/responses/TooManyRequests'
   /v1/routing:
     get:
       tags: [routing]
@@ -267,6 +353,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         "403":
           $ref: '#/components/responses/Forbidden'
+        "429":
+          $ref: '#/components/responses/TooManyRequests'
   /v1/routing/preview:
     post:
       tags: [routing]
@@ -311,14 +399,25 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         "403":
           $ref: '#/components/responses/Forbidden'
+        "413":
+          description: >
+            `request_too_large`: the request body exceeds 65536 bytes.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        "429":
+          $ref: '#/components/responses/TooManyRequests'
   /v1/stats:
     get:
       tags: [system]
-      summary: Aggregate event and delivery counts
+      summary: Aggregate counts and monitoring signals
       description: >
-        Returns event counts grouped by event state and delivery-attempt counts
-        grouped by delivery state. Used by the admin console Overview page.
-        Requires the `read` scope.
+        Returns event counts grouped by event state, delivery-attempt counts
+        grouped by delivery state, and four absolute signals for monitoring
+        AlertLoop itself: open incidents, the age of the oldest due delivery,
+        dead letters in the last 24 hours, and the last worker tick. A monitor
+        can alert on each of them from a single reading. Requires the `read`
+        scope.
       security:
         - ApiKeyAuth: []
         - BearerAuth: []
@@ -334,10 +433,16 @@ paths:
                   value:
                     events: { new: 12, acknowledged: 3, resolved: 41 }
                     deliveries: { pending: 2, sent: 55, dead_letter: 1 }
+                    open_incidents: 9
+                    oldest_due_delivery_age_seconds: 3
+                    dead_letter_last_24h: 1
+                    worker_last_tick_at: "2026-09-22T12:00:07Z"
         "401":
           $ref: '#/components/responses/Unauthorized'
         "403":
           $ref: '#/components/responses/Forbidden'
+        "429":
+          $ref: '#/components/responses/TooManyRequests'
   /v1/info:
     get:
       tags: [system]
@@ -365,6 +470,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         "403":
           $ref: '#/components/responses/Forbidden'
+        "429":
+          $ref: '#/components/responses/TooManyRequests'
   /health:
     get:
       tags: [system]
@@ -410,9 +517,11 @@ components:
       in: header
       name: X-API-Key
       description: >
-        A scoped API key or the admin token. Scopes: `ingest` (create events
-        only), `read` (read events/deliveries/stats), `full` (all operations
-        incl. state actions and replay). The admin token has full access. A
+        A scoped API key or the admin token. Scopes: `ingest` (POST
+        /v1/events only: create, refresh and resolve events by `dedupe_key`,
+        limited to the key's `sources` when it has them), `read` (read
+        events/deliveries/stats), `full` (all operations incl. state actions
+        and replay). The admin token has full access. A
         request whose credential lacks the required scope returns HTTP 403.
     BearerAuth:
       type: http
@@ -429,16 +538,33 @@ components:
     Limit:
       name: limit
       in: query
-      description: Page size (default 50, max 200).
+      description: >
+        Page size, default 50. A value above 200 is lowered to 200. A value
+        that is not a positive integer gets 400.
       schema: { type: integer, minimum: 1, maximum: 200 }
     Cursor:
       name: cursor
       in: query
-      description: Opaque pagination cursor from a previous response.
+      description: Opaque pagination cursor from a previous response. A malformed one gets 400.
       schema: { type: string }
   responses:
     BadRequest:
-      description: Validation failed.
+      description: >
+        `validation_failed`: a field or query parameter is invalid (a filter
+        outside its enum, `limit`, `cursor`, `q`), or `bad_request`: the body
+        is not valid JSON. `error.message` names the parameter.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    TooManyRequests:
+      description: >
+        `rate_limited`: the per-client-IP limit, or for `POST /v1/events` the
+        process-wide ingest limit, is exhausted (`rate_limit` in the config).
+        Health and readiness probes are never limited.
+      headers:
+        Retry-After:
+          description: Seconds to wait before retrying.
+          schema: { type: integer }
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
@@ -453,14 +579,17 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
     Forbidden:
-      description: The credential is valid but lacks the required scope.
+      description: >
+        `forbidden`: the credential lacks the required scope, or it is the demo
+        admin token `change-me-admin` sent through a reverse proxy or from a
+        public address.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
   x-actions:
     ack: &action
       tags: [events]
-      summary: Acknowledge an event
+      summary: Acknowledge an incident
       security:
         - ApiKeyAuth: []
         - BearerAuth: []
@@ -472,24 +601,65 @@ components:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Event' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+        "403": { $ref: '#/components/responses/Forbidden' }
         "404": { $ref: '#/components/responses/NotFound' }
+        "429": { $ref: '#/components/responses/TooManyRequests' }
         "409":
-          description: Transition not allowed from the current state.
+          description: >
+            The action is not allowed: the event is not an `incident` (actions
+            apply to incidents only), the transition is not allowed from the
+            current state, the event is already `resolved`, or it kept changing
+            while the action was applied (retry). `error.code` is
+            `invalid_transition`; `error.message` says which.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+      description: >
+        Actions apply to `incident` events only; for a `business_event` or an
+        `audit` entry the answer is 409. The server alone decides which
+        transitions are allowed. `resolved` is final: no action leaves it.
+        Repeating an action whose result is the current state (acknowledging an
+        acknowledged incident) returns the event unchanged.
     resolve:
       <<: *action
-      summary: Resolve an event
+      summary: Resolve an incident
+      description: >
+        Closes the incident and queues a recovery notice to the channels that
+        received its alert, unless the incident is muted or
+        `notify_on_resolve` is off. Resolving an incident that is already
+        `resolved` returns 409 and sends nothing. Allowed from every other
+        state. Incidents only.
     mute:
       <<: *action
-      summary: Mute an event
+      summary: Mute an incident
+      description: >
+        Stops notifications about the incident. Alert attempts not sent yet
+        (`pending`, `failed`) become `cancelled`. An alert being sent at the
+        moment of mute becomes `cancelled` when that send fails or is
+        interrupted while the incident is still muted (acknowledged or
+        resolved in the meantime, it is retried, and after a resolve no
+        recovery follows it); if it goes out, it is `sent`. A `sent` alert is
+        untouched.
+        A `dead_letter` alert is not cancelled, and replaying it sends it. A
+        muted incident sends no recovery notice, whether it is resolved by hand
+        or by its source. Not allowed from `resolved`. Incidents only.
     unmute:
       <<: *action
-      summary: Unmute an event
+      summary: Unmute an incident
+      description: >
+        Returns a muted incident to `new`, whatever its state before mute was
+        (`acknowledged` or `escalated` is not restored). Cancelled alert
+        attempts stay cancelled, and a severity rise that arrived during mute
+        is not sent afterwards. Allowed only from `muted`. Incidents only.
     escalate:
       <<: *action
-      summary: Manually escalate an event
+      summary: Mark an incident as escalated
+      description: >
+        Marks the incident as escalated; no notifications are sent and no
+        channel changes. Automatic escalation (policies, on-call schedules) is
+        a paid-edition feature. Allowed from every state except `resolved`,
+        `muted` included. Incidents only.
   schemas:
     EventType:
       type: string
@@ -508,19 +678,26 @@ components:
         answers "has anyone dealt with it".
 
 
-        Nothing changes it automatically. It moves through the actions on
-        `/v1/events/{id}` (ack, resolve, mute, unmute, escalate) or, for
-        incidents, through an ingested `status: resolved` carrying the same
-        `dedupe_key`. For a `business_event` or an `audit` entry — a submitted
-        form, a completed order, an admin action — `new` is therefore a normal
-        resting state, not a sign that delivery failed: such events record
-        something that already happened and have nothing to close.
+        Nothing changes it automatically. For an incident it moves through the
+        actions on `/v1/events/{id}` (ack, resolve, mute, unmute, escalate) or
+        through an ingested `status: resolved` carrying the same `dedupe_key`.
+        The actions apply to incidents only. For a `business_event` or an
+        `audit` entry — a submitted form, a completed order, an admin action —
+        `new` is therefore a normal resting state, not a sign that delivery
+        failed: such events record something that already happened and have
+        nothing to close.
     ChannelType:
       type: string
       enum: [email, telegram, webhook]
     DeliveryState:
       type: string
-      enum: [pending, sending, sent, failed, dead_letter]
+      enum: [pending, sending, sent, failed, dead_letter, cancelled]
+      description: >
+        `sent` and `dead_letter` end a delivery that was attempted. `cancelled`
+        is an alert of a muted incident that was not sent: it was waiting when
+        the incident was muted, or it was being sent and that send failed or
+        was interrupted. The worker does not take it, replay does not apply to
+        it, and unmute does not queue it again.
     DeliveryKind:
       type: string
       enum: [alert, recovery]
@@ -612,7 +789,9 @@ components:
         payload:
           type: object
           additionalProperties: true
-          description: Free-form JSON payload (max 256 KB).
+          description: >
+            Free-form JSON payload, at most 262144 bytes (400 above that). The
+            whole request body is limited to 524288 bytes (413 above that).
     Event:
       type: object
       properties:
@@ -643,6 +822,31 @@ components:
           description: >
             When the incident was closed, by an ingested `status: resolved` or by
             the manual resolve action. Absent while the incident is open.
+    IngestOutcome:
+      type: string
+      enum: [created, deduplicated, refreshed, resolved, already_resolved]
+      description: >
+        What the request did: `created` a new event; `deduplicated` returned the
+        open event untouched (no `status`); `refreshed` the open incident
+        (`firing`); `resolved` it; or found it `already_resolved`.
+    IngestResult:
+      description: The response to a caller with scope `full`.
+      allOf:
+        - $ref: '#/components/schemas/Event'
+        - type: object
+          required: [id, type, outcome]
+          properties:
+            outcome: { $ref: '#/components/schemas/IngestOutcome' }
+    IngestSummary:
+      type: object
+      description: >
+        The response to an `ingest` key, which may not read events.
+      required: [id, state, outcome]
+      additionalProperties: false
+      properties:
+        id: { type: string }
+        state: { $ref: '#/components/schemas/EventState' }
+        outcome: { $ref: '#/components/schemas/IngestOutcome' }
     DeliveryAttempt:
       type: object
       properties:
@@ -758,8 +962,17 @@ components:
     Stats:
       type: object
       description: >
-        Counts by state. Each map contains only the states currently present in
-        the database, so a state with zero rows is absent rather than 0.
+        Counts by state, and absolute signals for monitoring AlertLoop itself.
+        Each count map contains only the states currently present in the
+        database, so a state with zero rows is absent rather than 0. The four
+        signals are always present; a signal with no value is `null`.
+      required:
+        - events
+        - deliveries
+        - open_incidents
+        - oldest_due_delivery_age_seconds
+        - dead_letter_last_24h
+        - worker_last_tick_at
       properties:
         events:
           type: object
@@ -769,6 +982,37 @@ components:
           type: object
           description: Delivery-attempt counts keyed by delivery state.
           additionalProperties: { type: integer, format: int64 }
+        open_incidents:
+          type: integer
+          format: int64
+          description: Events of type `incident` that are not `resolved`.
+        oldest_due_delivery_age_seconds:
+          type: integer
+          format: int64
+          nullable: true
+          description: >
+            Whole seconds since the longest-waiting delivery attempt that the
+            worker could take now became due (`pending` or `failed` with its
+            retry time reached; a recovery waiting for its alert is not due).
+            With a worker running it stays near `worker.poll_interval`; it
+            grows while no worker takes attempts, or while one channel keeps
+            every slot it may use busy. `null` when nothing is due.
+        dead_letter_last_24h:
+          type: integer
+          format: int64
+          description: >
+            Delivery attempts that became `dead_letter` in the last 24 hours and
+            are still there. A replayed attempt leaves the count.
+        worker_last_tick_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: >
+            The last time any delivery worker polled the queue, in whole
+            seconds. A running worker records it at most every 15 seconds, so
+            it is at most 15 seconds plus `worker.poll_interval` old. `null`
+            until a worker of version 0.7.0 or later has run against this
+            database.
     Info:
       type: object
       properties:

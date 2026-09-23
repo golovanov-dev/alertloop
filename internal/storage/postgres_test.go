@@ -41,7 +41,7 @@ func postgresStore(t *testing.T) Store {
 	}
 	// Every test starts from an empty database. CASCADE also clears
 	// delivery_attempts, which references events.
-	if _, err := s.(*sqlStore).db.ExecContext(ctx, `TRUNCATE events CASCADE`); err != nil {
+	if _, err := s.(*sqlStore).db.ExecContext(ctx, `TRUNCATE events, worker_heartbeat CASCADE`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 	t.Cleanup(func() { s.Close() })
@@ -139,24 +139,28 @@ func TestPostgresIncidentLifecycle(t *testing.T) {
 	}
 
 	// Close it.
-	closed, didClose, err := s.ResolveByDedupe(ctx, key, now.Add(10*time.Minute))
+	closed, err := s.TransitionEvent(ctx, "pg-open-1", StateChange{
+		From: domain.StateNew, To: domain.StateResolved, At: now.Add(10 * time.Minute),
+	})
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
-	if !didClose || closed.State != domain.StateResolved || closed.ResolvedAt == nil {
-		t.Fatalf("resolve did not close the incident: closed=%v %+v", didClose, closed)
+	if closed.State != domain.StateResolved || closed.ResolvedAt == nil {
+		t.Fatalf("resolve did not close the incident: %+v", closed)
 	}
 
-	// A repeat is idempotent.
-	again, didClose, err := s.ResolveByDedupe(ctx, key, now.Add(11*time.Minute))
+	// A repeat changes nothing, and the key still finds the closed incident.
+	if _, err := s.TransitionEvent(ctx, "pg-open-1", StateChange{
+		From: domain.StateNew, To: domain.StateResolved, At: now.Add(11 * time.Minute),
+	}); !errors.Is(err, ErrStateChanged) {
+		t.Fatalf("second resolve: err = %v, want ErrStateChanged", err)
+	}
+	again, err := s.EventByDedupe(ctx, key)
 	if err != nil {
-		t.Fatalf("second resolve: %v", err)
+		t.Fatalf("event by dedupe after close: %v", err)
 	}
-	if didClose {
-		t.Fatal("the second resolve closed something")
-	}
-	if !again.ResolvedAt.Equal(*closed.ResolvedAt) {
-		t.Fatal("resolved_at moved on a repeat")
+	if again.ID != "pg-open-1" || !again.ResolvedAt.Equal(*closed.ResolvedAt) {
+		t.Fatalf("event by dedupe = %s resolved_at %v; want the closed incident unchanged", again.ID, again.ResolvedAt)
 	}
 
 	// And the key is free for the next outage.
@@ -170,9 +174,9 @@ func TestPostgresIncidentLifecycle(t *testing.T) {
 		t.Fatal("a resolved incident still blocks its own recurrence on PostgreSQL")
 	}
 
-	// An unknown key resolves to nothing, not to an error the caller must
-	// special-case beyond ErrNotFound.
-	if _, _, err := s.ResolveByDedupe(ctx, "pg:never:seen", now); !errors.Is(err, domain.ErrNotFound) {
+	// An unknown key finds nothing, not an error the caller must special-case
+	// beyond ErrNotFound.
+	if _, err := s.EventByDedupe(ctx, "pg:never:seen"); !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("resolve of an unknown key: err = %v, want ErrNotFound", err)
 	}
 }
@@ -333,7 +337,14 @@ func TestPostgresKeywordValueDSNAuthenticatesASpecialPassword(t *testing.T) {
 	if _, err := db.ExecContext(ctx, "CREATE ROLE "+role+" LOGIN PASSWORD "+literal); err != nil {
 		t.Fatalf("create role (the test DSN needs CREATEROLE): %v", err)
 	}
-	t.Cleanup(func() { _, _ = db.ExecContext(context.Background(), "DROP ROLE IF EXISTS "+role) })
+	t.Cleanup(func() {
+		_, _ = db.ExecContext(context.Background(), "DROP OWNED BY "+role)
+		_, _ = db.ExecContext(context.Background(), "DROP ROLE IF EXISTS "+role)
+	})
+	// Check reads the migration ledger; the service's own role owns it.
+	if _, err := db.ExecContext(ctx, "GRANT SELECT ON schema_migrations TO "+role); err != nil {
+		t.Fatalf("grant the ledger to the role: %v", err)
+	}
 
 	dsn := fmt.Sprintf("host=%s port=%d user=%s dbname=%s sslmode=disable password=%s",
 		admin.Host, admin.Port, role, admin.Database, password)

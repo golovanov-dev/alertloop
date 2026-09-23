@@ -10,7 +10,9 @@
 
 name: alertloop
 
-x-image: &image ${ALERTLOOP_IMAGE:-ghcr.io/golovanov-dev/alertloop:latest}
+# The release this file belongs to; ALERTLOOP_IMAGE in .env overrides it.
+# Not :latest: `docker compose pull` would upgrade, and migrations are one-way.
+x-image: &image ${ALERTLOOP_IMAGE:-ghcr.io/golovanov-dev/alertloop:0.6.1}
 
 # Container log rotation: 10 MB x 3 per container.
 x-logging: &logging
@@ -120,7 +122,7 @@ services:
       # Started, not healthy: plain `up -d` would hang on an api in a restart loop.
       api:
         condition: service_started
-    # No HTTP here: check-db loads the config and pings the database.
+    # No HTTP here: check-db checks the config and the database as a start would.
     healthcheck:
       test: ["CMD", "alertloop", "--config", "/etc/alertloop/alertloop.yaml", "check-db"]
       interval: 10s

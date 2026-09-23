@@ -20,17 +20,6 @@ import (
 	"github.com/golovanov-dev/alertloop/internal/domain"
 )
 
-// severityRank orders severities by how alarming they are, for min_severity.
-// success deliberately shares info's rank: this is an order of alarm, not of
-// importance, and a successful outcome is not more alarming than a notice.
-var severityRank = map[string]int{
-	"info":     10,
-	"success":  10,
-	"warning":  20,
-	"error":    30,
-	"critical": 40,
-}
-
 // Decision is the outcome of routing one event.
 type Decision struct {
 	// Rule is the name of the rule that matched; empty when none did.
@@ -254,8 +243,8 @@ func compile(m config.RoutingMatch) (matcher, error) {
 		severities: normalizeAll(m.Severity),
 	}
 	if s := normalize(m.MinSeverity); s != "" {
-		rank, ok := severityRank[s]
-		if !ok {
+		rank := domain.SeverityRank(domain.Severity(s))
+		if rank == 0 {
 			return matcher{}, fmt.Errorf("unknown min_severity %q", m.MinSeverity)
 		}
 		out.minSeverity = rank
@@ -293,7 +282,7 @@ func (m matcher) matches(e eventValues) bool {
 	if len(m.severities) > 0 && !contains(m.severities, e.severity) {
 		return false
 	}
-	if m.minSeverity > 0 && severityRank[e.severity] < m.minSeverity {
+	if m.minSeverity > 0 && domain.SeverityRank(domain.Severity(e.severity)) < m.minSeverity {
 		return false
 	}
 	if len(m.sources) > 0 && !matchesAny(m.sources, e.source) {

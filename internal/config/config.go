@@ -9,8 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"net"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -97,15 +100,24 @@ type RateLimit struct {
 // Scope constants for API keys. Higher-privilege operations require a broader
 // scope; ScopeFull satisfies everything.
 const (
-	ScopeIngest = "ingest" // may only create events (POST /v1/events)
-	ScopeRead   = "read"   // may only read (GET events, deliveries, stats, info)
-	ScopeFull   = "full"   // full API access (ingest + read + actions + replay)
+	// ScopeIngest may only use POST /v1/events: it creates, refreshes and
+	// resolves events by dedupe_key, of every source or of its Sources only.
+	ScopeIngest = "ingest"
+	ScopeRead   = "read" // may only read (GET events, deliveries, stats, info)
+	ScopeFull   = "full" // full API access (ingest + read + actions + replay)
 )
+
+// DemoAdminToken is the fallback admin token of the Compose demo profile. It is
+// published in this repository.
+const DemoAdminToken = "change-me-admin"
 
 // APIKey is a service credential with a scope limiting what it can do.
 type APIKey struct {
 	Key   string `yaml:"key"`
 	Scope string `yaml:"scope"` // ingest | read | full (default full)
+	// Sources limits an ingest key to events with these exact `source` values,
+	// new or existing. Omitted: every source. Only for scope ingest.
+	Sources []string `yaml:"sources"`
 }
 
 // Logging configures application log output.
@@ -275,7 +287,6 @@ func (c Config) ShouldNotifyOnResolve() bool {
 // channel field defaults applied per configured channel by normalizeChannels.
 const (
 	defaultSMTPPort     = 587
-	defaultChanTimeout  = 10 * time.Second
 	defaultTelegramBase = "https://api.telegram.org"
 )
 
@@ -362,7 +373,7 @@ func Load(configPath string) (Config, error) {
 			// restart: an operator who mistyped a key AND forgot a variable
 			// would otherwise fix the first, restart, and only then learn about
 			// the second.
-			if err := errors.Join(subErr, checkUnknownKeys(&doc, s)); err != nil {
+			if err := errors.Join(subErr, checkUnknownKeys(&doc, s), checkNullSources(&doc, s)); err != nil {
 				return cfg, err
 			}
 			// The type error comes last, and only when nothing above fired.
@@ -383,12 +394,30 @@ func Load(configPath string) (Config, error) {
 		if cfg.APIKeys[i].Scope == "" {
 			cfg.APIKeys[i].Scope = ScopeFull
 		}
+		for j, s := range cfg.APIKeys[i].Sources {
+			cfg.APIKeys[i].Sources[j] = strings.TrimSpace(s)
+		}
 	}
 
 	if cfg.Database.Driver == "" {
 		cfg.Database.Driver = inferDriver(cfg.Database.DSN)
 	}
 	return cfg, nil
+}
+
+// checkNullSources refuses an api_keys entry whose sources key is there with
+// no value ("sources:" or an empty ${VAR:-}). It decodes as nil, which means
+// "every source", while the operator wrote a restriction; "sources: []" is
+// refused by Validate for the same reason.
+func checkNullSources(doc *yaml.Node, s schema) error {
+	var errs []error
+	walkKeys(doc, func(path string, key, value *yaml.Node, plain bool) bool {
+		if plain && path == "api_keys.sources" && value.Kind == yaml.ScalarNode && value.ShortTag() == "!!null" {
+			errs = append(errs, fmt.Errorf("line %d: api_keys sources has no value; remove it to allow every source", key.Line))
+		}
+		return s.descend(path, plain)
+	})
+	return errors.Join(errs...)
 }
 
 // normalizeChannels fills per-channel field defaults (SMTP port, timeouts,
@@ -399,7 +428,7 @@ func normalizeChannels(c *Channels) {
 			c.Email[i].Port = defaultSMTPPort
 		}
 		if c.Email[i].Timeout == 0 {
-			c.Email[i].Timeout = defaultChanTimeout
+			c.Email[i].Timeout = domain.DefaultChannelTimeout
 		}
 	}
 	for i := range c.Telegram {
@@ -407,12 +436,12 @@ func normalizeChannels(c *Channels) {
 			c.Telegram[i].APIBase = defaultTelegramBase
 		}
 		if c.Telegram[i].Timeout == 0 {
-			c.Telegram[i].Timeout = defaultChanTimeout
+			c.Telegram[i].Timeout = domain.DefaultChannelTimeout
 		}
 	}
 	for i := range c.Webhook {
 		if c.Webhook[i].Timeout == 0 {
-			c.Webhook[i].Timeout = defaultChanTimeout
+			c.Webhook[i].Timeout = domain.DefaultChannelTimeout
 		}
 	}
 }
@@ -430,7 +459,7 @@ func (c Config) Validate() error {
 		return fmt.Errorf("database dsn is required")
 	}
 
-	for _, k := range c.APIKeys {
+	for i, k := range c.APIKeys {
 		if k.Key == "" {
 			return fmt.Errorf("an api_keys entry is missing its key")
 		}
@@ -438,6 +467,18 @@ func (c Config) Validate() error {
 		case ScopeIngest, ScopeRead, ScopeFull:
 		default:
 			return fmt.Errorf("api key has invalid scope %q (want ingest, read, or full)", k.Scope)
+		}
+		if k.Sources == nil {
+			continue
+		}
+		if k.Scope != ScopeIngest {
+			return fmt.Errorf("api_keys[%d]: sources applies to scope ingest only, this key has scope %s", i, k.Scope)
+		}
+		if len(k.Sources) == 0 {
+			return fmt.Errorf("api_keys[%d]: sources is empty; remove it to allow every source", i)
+		}
+		if slices.Contains(k.Sources, "") {
+			return fmt.Errorf("api_keys[%d]: sources has an empty entry", i)
 		}
 	}
 
@@ -486,7 +527,68 @@ func (c Config) Validate() error {
 			return err
 		}
 	}
+	if _, err := ParseTrustedProxies(c.RateLimit.TrustedProxies); err != nil {
+		return fmt.Errorf("rate_limit.trusted_proxies: %w", err)
+	}
+	if _, err := c.Log.SlogLevel(); err != nil {
+		return err
+	}
+	if _, err := c.Log.JSON(); err != nil {
+		return err
+	}
 	return nil
+}
+
+// ParseTrustedProxies parses rate_limit.trusted_proxies: CIDR blocks and bare
+// IPs, blank entries skipped.
+func ParseTrustedProxies(entries []string) ([]*net.IPNet, error) {
+	var nets []*net.IPNet
+	for _, raw := range entries {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		if _, block, err := net.ParseCIDR(raw); err == nil {
+			nets = append(nets, block)
+			continue
+		}
+		ip := net.ParseIP(raw)
+		if ip == nil {
+			return nil, &net.ParseError{Type: "trusted proxy address", Text: raw}
+		}
+		bits := 32
+		if ip.To4() == nil {
+			bits = 128
+		}
+		nets = append(nets, &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)})
+	}
+	return nets, nil
+}
+
+// SlogLevel is log.level as a slog level; empty means info.
+func (l Logging) SlogLevel() (slog.Level, error) {
+	switch strings.ToLower(l.Level) {
+	case "debug":
+		return slog.LevelDebug, nil
+	case "", "info":
+		return slog.LevelInfo, nil
+	case "warn", "warning":
+		return slog.LevelWarn, nil
+	case "error":
+		return slog.LevelError, nil
+	}
+	return slog.LevelInfo, fmt.Errorf("log.level %q is not one of debug, info, warn, error", l.Level)
+}
+
+// JSON reports whether log.format is json; empty means text.
+func (l Logging) JSON() (bool, error) {
+	switch strings.ToLower(l.Format) {
+	case "", "text":
+		return false, nil
+	case "json":
+		return true, nil
+	}
+	return false, fmt.Errorf("log.format %q is not one of text, json", l.Format)
 }
 
 // validate checks the routing section against the set of configured channel

@@ -211,3 +211,46 @@ func TestOnlyTheModesThatServeHTTPNeedACredential(t *testing.T) {
 		}
 	}
 }
+
+func TestWeakCredentialsAreWarnedAbout(t *testing.T) {
+	long := strings.Repeat("a", minCredentialLen)
+	cfg := config.Default()
+	cfg.AdminToken = config.DemoAdminToken
+	cfg.APIKeys = []config.APIKey{{Key: "short-ingest-key", Scope: "ingest"}, {Key: long, Scope: "read"}}
+
+	got := strings.Join(WeakCredentialWarnings(cfg, "all"), "\n")
+	for _, want := range []string{"change-me-admin", "api_keys[0]", "openssl rand -hex 32"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("no warning naming %s:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "api_keys[1]") || strings.Contains(got, "short-ingest-key") {
+		t.Errorf("warned about a long key, or printed a key:\n%s", got)
+	}
+
+	cfg.AdminToken = long[1:]
+	if got := WeakCredentialWarnings(cfg, "server"); len(got) != 2 || !strings.Contains(got[0], "admin_token is shorter") {
+		t.Errorf("a %d-character admin token is not reported as short: %v", len(cfg.AdminToken), got)
+	}
+	if got := WeakCredentialWarnings(cfg, "worker"); got != nil {
+		t.Errorf("a worker serves nothing and must not warn: %v", got)
+	}
+}
+
+// With several ingest keys, one without sources can change every source's
+// incidents; with a single ingest key there is nothing to isolate.
+func TestIngestKeysWithoutSourcesAreWarnedAbout(t *testing.T) {
+	long := strings.Repeat("a", minCredentialLen)
+	cfg := config.Default()
+	cfg.AdminToken = long
+	cfg.APIKeys = []config.APIKey{{Key: long + "1", Scope: config.ScopeIngest}}
+	if got := WeakCredentialWarnings(cfg, "all"); got != nil {
+		t.Fatalf("a single ingest key was warned about: %v", got)
+	}
+
+	cfg.APIKeys = append(cfg.APIKeys, config.APIKey{Key: long + "2", Scope: config.ScopeIngest, Sources: []string{"web-01"}})
+	got := WeakCredentialWarnings(cfg, "all")
+	if len(got) != 1 || !strings.Contains(got[0], "api_keys[0]") || !strings.Contains(got[0], "no sources") {
+		t.Fatalf("warnings = %v, want one naming api_keys[0] as having no sources", got)
+	}
+}

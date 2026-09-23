@@ -1,0 +1,94 @@
+#!/bin/sh
+# Back up the AlertLoop database into DIR and delete copies older than
+# KEEP_DAYS days (default 14). A copy is written under a temporary name, checked,
+# and only then given its final name, so every alertloop-* file in DIR is a
+# complete backup of an AlertLoop database.
+#
+# Usage: alertloop-backup sqlite   DB_FILE DIR
+#        alertloop-backup postgres DIR          (PGHOST, PGUSER, PGPASSWORD, PGDATABASE)
+#        alertloop-backup compose  CLONE DIR    (the postgres service of that clone)
+set -eu
+umask 077
+
+KEEP_DAYS="${KEEP_DAYS:-14}"
+stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+
+usage() {
+  echo "usage: alertloop-backup sqlite DB_FILE DIR | postgres DIR | compose CLONE DIR" >&2
+  exit 64
+}
+
+# first_migration counts AlertLoop's first migration, 0001_init, in the
+# schema_migrations data of a plain SQL script that pg_restore printed.
+first_migration() {
+  awk -F'\t' '/^COPY [^ ]*schema_migrations /{c=1; next} c && /^\\.$/{c=0} c && $1 == "0001_init"{n++} END{print n+0}'
+}
+
+# tables counts the tables events and delivery_attempts in the table of
+# contents that pg_restore --list printed.
+tables() {
+  awk '$4 == "TABLE" && $6 == "events"{e=1} $4 == "TABLE" && $6 == "delivery_attempts"{d=1} END{print e+d}'
+}
+
+mode="${1:-}"
+case "$mode" in
+  sqlite)   [ $# -eq 3 ] || usage; dir="$3"; ext=db ;;
+  postgres) [ $# -eq 2 ] || usage; dir="$2"; ext=dump ;;
+  compose)  [ $# -eq 3 ] || usage; dir="$3"; ext=dump ;;
+  *) usage ;;
+esac
+
+case "$KEEP_DAYS" in
+  '' | *[!0-9]*) echo "alertloop-backup: KEEP_DAYS must be a number of days, not '$KEEP_DAYS'" >&2; exit 64 ;;
+esac
+case "$dir" in
+  *\'*) echo "alertloop-backup: the directory name must not contain a single quote: $dir" >&2; exit 64 ;;
+esac
+[ -d "$dir" ] || { echo "alertloop-backup: no directory $dir" >&2; exit 1; }
+out="$dir/alertloop-$stamp.$ext"
+tmp="$(mktemp "$dir/.alertloop-$stamp.XXXXXX")"
+trap 'rm -f "$tmp"' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+case "$mode" in
+  sqlite)
+    db="$2"
+    [ -f "$db" ] || { echo "alertloop-backup: no database file $db" >&2; exit 1; }
+    sqlite3 "$db" ".backup '$tmp'"
+    check="$(sqlite3 "$tmp" 'PRAGMA integrity_check;')"
+    [ "$check" = ok ] || { echo "alertloop-backup: integrity_check: $check" >&2; exit 1; }
+    ledger="$(sqlite3 "$tmp" "SELECT count(*) FROM schema_migrations WHERE version = '0001_init';" 2>/dev/null)" || ledger=0
+    found="$(sqlite3 "$tmp" "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN ('events', 'delivery_attempts');")"
+    ;;
+  postgres)
+    pg_dump -Fc -f "$tmp"
+    toc="$(pg_restore --list "$tmp")"
+    found="$(printf '%s\n' "$toc" | tables)"
+    ledger="$(pg_restore --data-only --table=schema_migrations -f - "$tmp" | first_migration)"
+    ;;
+  compose)
+    clone="$2"
+    (cd "$clone" && docker compose exec -T postgres pg_dump -U alertloop -Fc alertloop) >"$tmp"
+    toc="$( (cd "$clone" && docker compose exec -T postgres pg_restore --list) <"$tmp")"
+    found="$(printf '%s\n' "$toc" | tables)"
+    ledger="$( (cd "$clone" && docker compose exec -T postgres pg_restore --data-only --table=schema_migrations -f -) <"$tmp" | first_migration)"
+    ;;
+esac
+
+# An empty database, or someone else's, backs up without an error. A copy
+# without AlertLoop's first migration and its two tables is not a backup of
+# AlertLoop.
+[ "$ledger" -eq 1 ] && [ "$found" -eq 2 ] || {
+  echo "alertloop-backup: the copy has no AlertLoop migration 0001_init or no events and delivery_attempts tables: not an AlertLoop database, nothing kept" >&2
+  exit 1
+}
+
+# ln refuses an existing name, so a second run in the same second fails instead
+# of replacing the copy the first one made. It also needs a file system with
+# hard links.
+ln "$tmp" "$out" || { echo "alertloop-backup: cannot name the copy $out (ln says why above), nothing kept" >&2; exit 1; }
+rm -f "$tmp"
+find "$dir" -maxdepth 1 -name "alertloop-*.$ext" -mtime +"$KEEP_DAYS" -exec rm -f {} +
+echo "$out"

@@ -63,6 +63,8 @@ func writeDomainError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, "invalid_transition", err.Error())
 	case errors.Is(err, domain.ErrInvalidAction):
 		writeError(w, http.StatusBadRequest, "invalid_action", err.Error())
+	case errors.Is(err, domain.ErrSourceNotAllowed):
+		writeError(w, http.StatusForbidden, "source_not_allowed", err.Error())
 	case errors.Is(err, domain.ErrNotReplayable):
 		writeError(w, http.StatusConflict, "not_replayable", err.Error())
 	default:

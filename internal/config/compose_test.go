@@ -66,6 +66,27 @@ func TestComposePublishesAConfigurableLoopbackPort(t *testing.T) {
 	}
 }
 
+// The example config listens on loopback. Inside a container that is the
+// container's own loopback, which the published port never reaches, while the
+// health check (run inside) still passes. The image itself sets the
+// all-interfaces address, so every way of running it is covered — Compose,
+// docker run, the Monit reference compose — and Compose does not repeat it.
+func TestTheImageListensOnAllInterfaces(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "Dockerfile"))
+	if err != nil {
+		t.Fatalf("read Dockerfile: %v", err)
+	}
+	stages := strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\nFROM ")
+	if !strings.Contains(stages[len(stages)-1], "\nENV ALERTLOOP_ADDR=:8080\n") {
+		t.Error("the final stage of the Dockerfile does not set ENV ALERTLOOP_ADDR=:8080")
+	}
+	for name, svc := range loadCompose(t) {
+		if v, ok := svc.Environment["ALERTLOOP_ADDR"]; ok {
+			t.Errorf("service %s sets ALERTLOOP_ADDR = %q; the image sets it, keep one place", name, v)
+		}
+	}
+}
+
 // ALERTLOOP_PORT is for Compose alone. Handed to the container it would look
 // like configuration, and the environment configures nothing the config file
 // does not ask for — so it must not be passed in.
@@ -186,9 +207,9 @@ func TestEnvExamplePinsTheCurrentImage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := regexp.MustCompile(`ALERTLOOP_IMAGE=ghcr\.io/golovanov-dev/alertloop:(v?)(\d+\.\d+\.\d+)`).FindStringSubmatch(string(data))
+	m := regexp.MustCompile(`(?m)^ALERTLOOP_IMAGE=ghcr\.io/golovanov-dev/alertloop:(v?)(\d+\.\d+\.\d+)\r?$`).FindStringSubmatch(string(data))
 	if m == nil {
-		t.Fatal(".env.example no longer shows how to pin ALERTLOOP_IMAGE to a version")
+		t.Fatal(".env.example no longer pins ALERTLOOP_IMAGE to a version on an uncommented line")
 	}
 	if m[1] != "" {
 		t.Fatalf(".env.example pins :v%s, but release.yml publishes :%s (it strips the v); :v%s does not exist", m[2], m[2], m[2])
@@ -196,6 +217,28 @@ func TestEnvExamplePinsTheCurrentImage(t *testing.T) {
 	top, released := changelogTopVersions(t)
 	if m[2] != top && m[2] != released {
 		t.Fatalf(".env.example pins %s; the CHANGELOG is at %s (last release %s). Update the example.", m[2], top, released)
+	}
+
+	// Without .env the compose file runs its own default, which must be the
+	// same release: `docker compose pull` on :latest upgraded silently.
+	for _, f := range []string{"docker-compose.yml", "integrations/monit/examples/docker-compose.yml"} {
+		compose, err := os.ReadFile(filepath.Join("..", "..", f))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := "${ALERTLOOP_IMAGE:-ghcr.io/golovanov-dev/alertloop:" + m[2] + "}"; !strings.Contains(string(compose), want) {
+			t.Errorf("%s does not default to the image .env.example pins; want %s", f, want)
+		}
+	}
+
+	// README names the pinned release in its Compose notes; a release that
+	// forgot it told readers to write the previous version into .env.
+	readme, err := os.ReadFile(filepath.Join("..", "..", "README.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "(`" + m[2] + "`, without the `v`)"; !strings.Contains(string(readme), want) {
+		t.Errorf("README.md does not name the image .env.example pins; want %s", want)
 	}
 }
 

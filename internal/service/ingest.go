@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"time"
 
@@ -110,19 +111,38 @@ type EventInput struct {
 	Payload    json.RawMessage     `json:"payload"`
 }
 
-// Ingest validates and stores an event. When the event is newly created it also
-// enqueues delivery attempts. What happens when the dedupe_key is already known
-// depends on in.Status — see EventInput.Status and IngestOutcome.
+// Ingest is IngestFor with no source restriction: the caller may report and
+// change events of every source.
 func (s *IngestService) Ingest(ctx context.Context, in EventInput) (IngestResult, error) {
+	return s.IngestFor(ctx, in, nil)
+}
+
+// IngestFor validates and stores an event. When the event is newly created it
+// also enqueues delivery attempts. What happens when the dedupe_key is already
+// known depends on in.Status — see EventInput.Status and IngestOutcome.
+//
+// allowed lists the sources the caller may report; nil allows every source. A
+// request from another source, or one whose dedupe_key finds an event of
+// another source, fails with domain.ErrSourceNotAllowed and changes nothing.
+func (s *IngestService) IngestFor(ctx context.Context, in EventInput, allowed []string) (IngestResult, error) {
 	if err := validateInput(&in); err != nil {
 		return IngestResult{}, err
+	}
+	src := strings.TrimSpace(in.Source)
+	if allowed != nil && src != "" && !slices.Contains(allowed, src) {
+		// Most often a misconfigured sender (a source left at its default), so
+		// it is a warning like a refusal by the stored event, not only a 403 in
+		// the access log.
+		s.log.Warn("ingest refused: request source is not in this API key's sources",
+			"request_source", src, "dedupe_key", strings.TrimSpace(in.DedupeKey))
+		return IngestResult{}, fmt.Errorf("%w: this API key may not report events from source %q", domain.ErrSourceNotAllowed, src)
 	}
 	s.warnLifecycleOnNonIncident(in)
 
 	now := s.now().UTC()
 
 	if in.Status == domain.StatusResolved {
-		return s.resolve(ctx, strings.TrimSpace(in.DedupeKey), now)
+		return s.resolve(ctx, strings.TrimSpace(in.DedupeKey), allowed, src, now)
 	}
 
 	e := &domain.Event{
@@ -143,8 +163,8 @@ func (s *IngestService) Ingest(ctx context.Context, in EventInput) (IngestResult
 		LastSeenAt: now,
 	}
 
-	// Routing runs once, here at ingestion: a repeated dedupe_key returns the
-	// stored event and creates no deliveries, so it is never routed twice.
+	// Routing runs here for a new event. A repeated dedupe_key is routed again
+	// only for a `firing` that raises the severity (see refresh).
 	decision := s.router.Route(e)
 
 	// Build the event and its delivery jobs, then persist them atomically so an
@@ -158,6 +178,9 @@ func (s *IngestService) Ingest(ctx context.Context, in EventInput) (IngestResult
 		s.logRouting(e, decision)
 		return IngestResult{Event: stored, Outcome: OutcomeCreated}, nil
 	}
+	if err := s.checkOwner(stored, allowed, src); err != nil {
+		return IngestResult{}, err
+	}
 
 	// The key matched an incident that is still open. Without an explicit
 	// status the caller is using dedupe_key as an idempotency key, and a repeat
@@ -166,15 +189,7 @@ func (s *IngestService) Ingest(ctx context.Context, in EventInput) (IngestResult
 		return IngestResult{Event: stored, Outcome: OutcomeDeduplicated}, nil
 	}
 
-	// A repeated `firing`: the problem is still happening. Refresh the incident
-	// in place. No new deliveries — a check that fails every minute must not
-	// notify anyone every minute.
-	refreshed, err := s.store.RefreshOpenEvent(ctx, stored.ID, storage.EventUpdate{
-		Severity:   e.Severity,
-		Message:    e.Message,
-		Payload:    e.Payload,
-		LastSeenAt: now,
-	})
+	refreshed, err := s.refresh(ctx, stored, e, now)
 	if err == nil {
 		s.log.Debug("open incident refreshed", "event_id", refreshed.ID, "dedupe_key", refreshed.DedupeKey)
 		return IngestResult{Event: refreshed, Outcome: OutcomeRefreshed}, nil
@@ -203,15 +218,54 @@ func (s *IngestService) Ingest(ctx context.Context, in EventInput) (IngestResult
 		s.logRouting(&retry, decision)
 		return IngestResult{Event: stored, Outcome: OutcomeCreated}, nil
 	}
+	if err := s.checkOwner(stored, allowed, src); err != nil {
+		return IngestResult{}, err
+	}
 	return IngestResult{Event: stored, Outcome: OutcomeDeduplicated}, nil
+}
+
+// refresh applies a repeated `firing` to the open incident stored. A repeat
+// creates no deliveries — a check that fails every minute must not notify
+// anyone every minute — unless it raises the severity: then the channels the
+// new severity routes to and that were not alerted yet get the alert. The
+// store decides the rise against the severity it holds, in the same
+// transaction as the update.
+func (s *IngestService) refresh(ctx context.Context, stored, report *domain.Event, now time.Time) (*domain.Event, error) {
+	u := storage.EventUpdate{
+		Severity:   report.Severity,
+		Message:    report.Message,
+		Payload:    report.Payload,
+		LastSeenAt: now,
+	}
+	if stored.Type == domain.EventIncident && domain.SeverityRank(report.Severity) > domain.SeverityRank(stored.Severity) {
+		probe := *stored
+		probe.Severity = report.Severity
+		u.AlertsOnRise = s.buildDeliveries(stored.ID, s.router.Route(&probe).Channels, now)
+		s.log.Info("incident severity rose; alerting channels not alerted yet",
+			"event_id", stored.ID, "dedupe_key", stored.DedupeKey, "from", stored.Severity, "to", report.Severity)
+	}
+	return s.store.RefreshOpenEvent(ctx, stored.ID, u)
+}
+
+// checkOwner refuses a caller limited to allowed sources access to an event of
+// another source. The error does not name that source; the log does, because a
+// refusal here is either a misconfigured key or a key used against events it
+// was not issued for.
+func (s *IngestService) checkOwner(e *domain.Event, allowed []string, requestSource string) error {
+	if allowed == nil || slices.Contains(allowed, e.Source) {
+		return nil
+	}
+	s.log.Warn("ingest refused: dedupe_key belongs to an event of a source this API key may not report",
+		"event_id", e.ID, "dedupe_key", e.DedupeKey, "event_source", e.Source, "request_source", requestSource)
+	return fmt.Errorf("%w: dedupe_key belongs to an event of a source this API key may not report", domain.ErrSourceNotAllowed)
 }
 
 // resolve closes the open incident carrying key. It is deliberately forgiving:
 // a monitoring source that reports a recovery twice, or reports one for an
 // incident that retention already removed, has done nothing wrong and must not
 // receive an error it would log as a delivery failure.
-func (s *IngestService) resolve(ctx context.Context, key string, now time.Time) (IngestResult, error) {
-	event, closed, err := s.store.ResolveByDedupe(ctx, key, now)
+func (s *IngestService) resolve(ctx context.Context, key string, allowed []string, requestSource string, now time.Time) (IngestResult, error) {
+	e, err := s.store.EventByDedupe(ctx, key)
 	if err != nil {
 		if errors.Is(err, domain.ErrNotFound) {
 			s.log.Debug("resolve for an unknown dedupe_key; nothing to close", "dedupe_key", key)
@@ -219,14 +273,25 @@ func (s *IngestService) resolve(ctx context.Context, key string, now time.Time) 
 		}
 		return IngestResult{}, err
 	}
+	if err := s.checkOwner(e, allowed, requestSource); err != nil {
+		return IngestResult{}, err
+	}
+	// Already closed, before this request or by a request that won the race:
+	// notifying again would tell the same people the same good news twice,
+	// which is how a monitoring source that repeats itself becomes noise.
+	event, closed, err := transition(ctx, s.store, s.recovery, e, now,
+		func(domain.EventState) (domain.EventState, error) { return domain.StateResolved, nil })
+	if errors.Is(err, domain.ErrNotFound) {
+		// Retention removed the incident between the lookup and the close.
+		return IngestResult{Outcome: OutcomeNothingToResolve}, nil
+	}
+	if err != nil {
+		return IngestResult{}, err
+	}
 	if !closed {
-		// Already closed. Notifying again would tell the same people the same
-		// good news twice, which is how a monitoring source that repeats itself
-		// becomes noise.
 		return IngestResult{Event: event, Outcome: OutcomeAlreadyResolved}, nil
 	}
 	s.log.Info("incident resolved by the reporting source", "event_id", event.ID, "dedupe_key", key)
-	s.recovery.Notify(ctx, event, now)
 	return IngestResult{Event: event, Outcome: OutcomeResolved}, nil
 }
 

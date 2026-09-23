@@ -15,4 +15,7 @@ var (
 	// ErrNotReplayable is returned when a delivery attempt cannot be replayed
 	// because it is not in the dead_letter state.
 	ErrNotReplayable = errors.New("delivery attempt is not in dead_letter state")
+	// ErrSourceNotAllowed is returned when an API key limited to a list of
+	// sources reports another source, or touches an event of another source.
+	ErrSourceNotAllowed = errors.New("source not allowed")
 )

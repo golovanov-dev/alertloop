@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"sort"
 	"strings"
@@ -416,5 +417,51 @@ func TestIngestWarnsOnFiringAuditEvent(t *testing.T) {
 	out := logged.String()
 	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "status=firing on a non-incident") || !strings.Contains(out, "type=audit") {
 		t.Fatalf("no warning for status=firing on an audit event:\n%s", out)
+	}
+}
+
+// Both refusals of a key limited by sources are warnings (SECURITY.md,
+// CHANGELOG): a source outside the list is usually a misconfigured sender, and
+// the access log alone records it as an info-level 403.
+func TestIngestSourceRefusalsAreWarnings(t *testing.T) {
+	s := newStore(t)
+	var logged bytes.Buffer
+	svc := NewIngestService(s, routing.NewAllChannels([]domain.ChannelTarget{
+		{Type: domain.ChannelWebhook, Name: "siem"},
+	}), 5, nil, time.Now, slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	ctx := context.Background()
+
+	if _, err := svc.IngestFor(ctx, EventInput{
+		Status: domain.StatusFiring, Type: domain.EventIncident, Severity: domain.SeverityWarning,
+		Source: "web-01", Message: "down", DedupeKey: "web-01:nginx",
+	}, []string{"web-01"}); err != nil {
+		t.Fatalf("ingest own event: %v", err)
+	}
+	if strings.Contains(logged.String(), "level=WARN") {
+		t.Fatalf("an allowed request produced a warning:\n%s", logged.String())
+	}
+
+	// The request's own source is not in the key's list.
+	_, err := svc.IngestFor(ctx, EventInput{
+		Status: domain.StatusFiring, Type: domain.EventIncident, Severity: domain.SeverityWarning,
+		Source: "monit", Message: "down", DedupeKey: "web-02:nginx",
+	}, []string{"web-02"})
+	if !errors.Is(err, domain.ErrSourceNotAllowed) {
+		t.Fatalf("err = %v, want ErrSourceNotAllowed", err)
+	}
+	out := logged.String()
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "request_source=monit") {
+		t.Fatalf("no warning for a request source outside the key's sources:\n%s", out)
+	}
+
+	// The dedupe_key belongs to an event of another source.
+	logged.Reset()
+	_, err = svc.IngestFor(ctx, EventInput{Status: domain.StatusResolved, DedupeKey: "web-01:nginx"}, []string{"web-02"})
+	if !errors.Is(err, domain.ErrSourceNotAllowed) {
+		t.Fatalf("err = %v, want ErrSourceNotAllowed", err)
+	}
+	out = logged.String()
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "event_source=web-01") {
+		t.Fatalf("no warning for a dedupe_key of another source's event:\n%s", out)
 	}
 }

@@ -3,16 +3,17 @@ import { api, ApiError } from "../api";
 import { Logo } from "../components/Logo";
 import { useApp } from "../context";
 import { c, font } from "../theme";
+import { Button } from "../ui";
 
 export function Login() {
-  const { login } = useApp();
+  const { login, notice } = useApp();
   const [token, setTokenInput] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
   const submit = async () => {
     if (!token.trim()) {
-      setError("Enter the admin token");
+      setError("Enter the admin token or an API key with scope full");
       return;
     }
     setBusy(true);
@@ -22,9 +23,14 @@ export function Login() {
       login(token.trim());
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) {
-        setError("Invalid admin token");
+        setError("Unknown token or API key");
+      } else if (e instanceof ApiError && e.status === 403 && e.message.includes("lacks the required scope")) {
+        // A read key fails the /v1/routing probe and an ingest key fails
+        // /v1/info with this text, written by requireScope in
+        // internal/api/middleware.go. Any other 403 keeps the server's message.
+        setError("This key has scope read or ingest. The console needs the admin token or a key with scope full.");
       } else if (e instanceof ApiError && e.status === 0) {
-        setError("Cannot reach the API. Check the server and API base URL.");
+        setError("Cannot reach the AlertLoop server.");
       } else {
         setError(e instanceof Error ? e.message : "Sign in failed");
       }
@@ -74,8 +80,11 @@ export function Login() {
           </div>
 
           <div style={{ marginTop: 24 }}>
-            <div style={{ fontSize: 12.5, color: c.muted, marginBottom: 6 }}>Admin token</div>
+            <label htmlFor="token" style={{ display: "block", fontSize: 12.5, color: c.muted, marginBottom: 6 }}>
+              Admin token or API key
+            </label>
             <input
+              id="token"
               type="password"
               value={token}
               autoFocus
@@ -89,13 +98,19 @@ export function Login() {
             />
           </div>
 
+          {notice && !error && (
+            <div style={{ marginTop: 14, fontSize: 12.5, color: c.warn }}>{notice}</div>
+          )}
           {error && (
             <div style={{ marginTop: 14, fontSize: 12.5, color: c.danger }}>{error}</div>
           )}
 
-          <div
-            onClick={busy ? undefined : submit}
+          <Button
+            disabled={busy}
+            onClick={submit}
             style={{
+              display: "block",
+              width: "100%",
               marginTop: 20,
               textAlign: "center",
               padding: 11,
@@ -109,9 +124,9 @@ export function Login() {
             }}
           >
             {busy ? "Signing in…" : "Sign in"}
-          </div>
+          </Button>
           <div style={{ marginTop: 16, textAlign: "center", fontSize: 12, color: c.muted2 }}>
-            Use the admin token from your AlertLoop config.
+            Use the admin token from your AlertLoop config or an API key with scope full.
           </div>
         </div>
       </div>

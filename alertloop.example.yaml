@@ -10,8 +10,9 @@
 # any other value into this file directly.
 # Every key AlertLoop reads is shown below; an unknown key stops startup.
 
-# HTTP listen address for the API, the admin console and Swagger.
-addr: ":8080"
+# HTTP listen address for the API, the admin console and Swagger. Loopback:
+# reach it through a reverse proxy. The Docker image sets ALERTLOOP_ADDR=:8080.
+addr: ${ALERTLOOP_ADDR:-127.0.0.1:8080}
 
 # Signs in to /admin and grants full API access. No fallback: an unset token
 # stops startup. Generate one with: openssl rand -hex 32
@@ -22,6 +23,7 @@ admin_token: ${ALERTLOOP_ADMIN_TOKEN}
 # api_keys:
 #   - key: ${ALERTLOOP_INGEST_KEY}
 #     scope: ingest
+#     sources: [web-01]   # only events with this source; omitted: every source
 #   - key: ${ALERTLOOP_READ_KEY}
 #     scope: read
 
@@ -44,7 +46,7 @@ log:
 # In-process rate limiting.
 rate_limit:
   enabled: true
-  per_ip_per_second: 20    # requests per second per client IP
+  per_ip_per_second: 20    # requests per second per client IP (IPv6: per /64)
   per_ip_burst: 40
   ingest_per_second: 100   # overall event ingestion cap for the process
   ingest_burst: 200

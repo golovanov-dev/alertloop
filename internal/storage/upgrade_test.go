@@ -45,6 +45,7 @@ func TestUpgradeFromV010Schema(t *testing.T) {
 		for _, stmt := range []string{
 			`DROP TABLE IF EXISTS delivery_attempts`,
 			`DROP TABLE IF EXISTS events`,
+			`DROP TABLE IF EXISTS worker_heartbeat`,
 			`DROP TABLE IF EXISTS schema_migrations`,
 		} {
 			if _, err := db.Exec(stmt); err != nil {
@@ -173,6 +174,11 @@ func assertUpgradeKeepsData(t *testing.T, db *sql.DB, d dialect) {
 			t.Fatalf("attempt %s: channel_name = %q, want it backfilled to %q",
 				a.ID, a.ChannelName, domain.ChannelTelegram)
 		}
+	}
+
+	// The heartbeat table exists and starts empty: no worker has ticked yet.
+	if m, err := s.Monitoring(ctx, time.Now(), created); err != nil || m.LastWorkerTick != nil {
+		t.Fatalf("monitoring after upgrade: tick=%v err=%v", m.LastWorkerTick, err)
 	}
 
 	// The upgraded database supports the new lifecycle: the resolved legacy

@@ -41,14 +41,27 @@ const (
 	SeverityCritical Severity = "critical"
 )
 
+// severityRanks is the one list of severities, with how alarming each is.
+// success shares info's rank: this is an order of alarm, not of importance,
+// and a successful outcome is not more alarming than a notice.
+var severityRanks = map[Severity]int{
+	SeverityInfo:     10,
+	SeveritySuccess:  10,
+	SeverityWarning:  20,
+	SeverityError:    30,
+	SeverityCritical: 40,
+}
+
 // ValidSeverity reports whether s is a known severity.
 func ValidSeverity(s Severity) bool {
-	switch s {
-	case SeverityInfo, SeveritySuccess, SeverityWarning, SeverityError, SeverityCritical:
-		return true
-	default:
-		return false
-	}
+	_, ok := severityRanks[s]
+	return ok
+}
+
+// SeverityRank orders severities by how alarming they are; 0 for an unknown
+// one.
+func SeverityRank(s Severity) int {
+	return severityRanks[s]
 }
 
 // IngestStatus is the lifecycle signal a monitoring source attaches to an
@@ -92,6 +105,16 @@ const (
 	StateEscalated    EventState = "escalated"
 )
 
+// ValidEventState reports whether s is a known event state.
+func ValidEventState(s EventState) bool {
+	switch s {
+	case StateNew, StateAcknowledged, StateResolved, StateMuted, StateEscalated:
+		return true
+	default:
+		return false
+	}
+}
+
 // Event is a stored record that something important happened.
 type Event struct {
 	ID         string          `json:"id"`
@@ -132,9 +155,14 @@ const (
 )
 
 // ApplyAction returns the resulting state after applying action to the current
-// state, or an error if the transition is not allowed. The state machine is
-// deliberately permissive but rejects transitions out of terminal/blank states
-// that would be meaningless.
+// state, or an error if the transition is not allowed. The server is the only
+// place these rules live; the console offers what this function allows.
+//
+// `resolved` is terminal: nothing leaves it, and resolving it again is an error
+// rather than a no-op, so a second resolve can never send a second recovery.
+// Acknowledge and escalate are allowed from `muted`. Unmute always returns to
+// `new`, whatever the state before mute was. Escalate is a label: it changes
+// the state and sends nothing.
 func ApplyAction(current EventState, action EventAction) (EventState, error) {
 	switch action {
 	case ActionAck:
@@ -143,6 +171,9 @@ func ApplyAction(current EventState, action EventAction) (EventState, error) {
 		}
 		return StateAcknowledged, nil
 	case ActionResolve:
+		if current == StateResolved {
+			return "", fmt.Errorf("%w: event is already resolved", ErrInvalidTransition)
+		}
 		return StateResolved, nil
 	case ActionMute:
 		if current == StateResolved {
@@ -162,6 +193,16 @@ func ApplyAction(current EventState, action EventAction) (EventState, error) {
 	default:
 		return "", fmt.Errorf("%w: unknown action %q", ErrInvalidAction, action)
 	}
+}
+
+// CheckActionAllowed reports whether manual actions apply to events of type t.
+// Only incidents have a lifecycle; a business event or an audit entry records
+// something that already happened and has nothing to acknowledge or close.
+func CheckActionAllowed(t EventType) error {
+	if t != EventIncident {
+		return fmt.Errorf("%w: actions apply to incidents only, this event is %s", ErrInvalidTransition, t)
+	}
+	return nil
 }
 
 // ParseAction converts a URL action segment to an EventAction.

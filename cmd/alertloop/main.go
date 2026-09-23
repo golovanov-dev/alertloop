@@ -1,12 +1,5 @@
-// Command alertloop is the single AlertLoop binary. It supports three runtime
-// modes selected by subcommand: `server` (HTTP API and web UI), `worker`
-// (delivery workers only), and `all` (both in one process, the default) — plus
-// `check-db`, a one-shot check that the configured database answers, which is
-// the health check of a container running `worker`.
-//
-// Usage:
-//
-//	alertloop [flags] [server|worker|all|check-db]
+// Command alertloop is the single AlertLoop binary. The subcommand selects the
+// mode (all by default); app.Modes is the list of them.
 //
 // Configuration comes from one YAML file (--config, or ALERTLOOP_CONFIG) on top
 // of built-in defaults. The environment only fills ${VAR} references inside that
@@ -15,13 +8,16 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -47,8 +43,10 @@ func run() error {
 		showVersion = fs.Bool("version", false, "print version and exit")
 	)
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "AlertLoop %s\n\nUsage: alertloop [flags] [server|worker|all|check-db]\n\n"+
-			"  check-db  load the config, ping the database, exit 0 if it answered (a health check)\n\nFlags:\n", version)
+		fmt.Fprintf(os.Stderr, "AlertLoop %s\n\nUsage: alertloop [flags] [%s]\n\n"+
+			"  check-db  check the config, the log file and the database as a start would, change nothing,\n"+
+			"            exit 0 if all pass (a health check and the pre-flight check of an upgrade)\n\nFlags:\n",
+			version, strings.Join(app.Modes, "|"))
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(os.Args[1:]); err != nil {
@@ -59,9 +57,14 @@ func run() error {
 		return nil
 	}
 
-	mode := "all"
+	mode := app.ModeAll
 	if fs.NArg() > 0 {
 		mode = fs.Arg(0)
+	}
+	// Before the config is loaded: every mode but check-db migrates the
+	// database, and a mistyped check-db must not.
+	if !slices.Contains(app.Modes, mode) {
+		return fmt.Errorf("unknown mode %q (want %s)", mode, strings.Join(app.Modes, ", "))
 	}
 
 	cfg, err := config.Load(*configPath)
@@ -79,7 +82,7 @@ func run() error {
 	// Before the logger: a health check runs every few seconds next to the
 	// real process, and must neither append to that process's log file nor run
 	// migrations under it.
-	if mode == "check-db" {
+	if mode == app.ModeCheckDB {
 		return checkDB(cfg)
 	}
 
@@ -91,6 +94,9 @@ func run() error {
 		defer logCloser.Close()
 	}
 	slog.SetDefault(log)
+	for _, w := range app.WeakCredentialWarnings(cfg, mode) {
+		log.Warn(w)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -104,14 +110,14 @@ func run() error {
 	log.Info("starting alertloop", "mode", mode, "version", version)
 
 	switch mode {
-	case "server":
+	case app.ModeServer:
 		return a.RunServer(ctx)
-	case "worker":
+	case app.ModeWorker:
 		return a.RunWorker(ctx)
-	case "all":
+	case app.ModeAll:
 		return a.RunAll(ctx)
-	default:
-		return fmt.Errorf("unknown mode %q (want server, worker, all, or check-db)", mode)
+	default: // a mode added to app.Modes without a runner here
+		return fmt.Errorf("mode %q has no runner", mode)
 	}
 }
 
@@ -120,14 +126,18 @@ func run() error {
 // by Docker killing the process.
 const checkDBTimeout = 4 * time.Second
 
-// checkDB is `alertloop check-db`: load the config as the worker would, reach
-// the database, report. It exists because the worker has no HTTP listener for a
-// health check to probe, and adding one only for that would be a second port to
-// secure. It migrates nothing and changes nothing in the database.
+// checkDB is `alertloop check-db`: refuse what a start of `server` or `all`
+// would refuse, reach the database, report. It is the worker's health check,
+// since the worker has no HTTP listener to probe, and the pre-flight check of
+// an upgrade. It migrates nothing, changes nothing in the database, and writes
+// nothing to the log file.
 func checkDB(cfg config.Config) error {
 	ctx, cancel := context.WithTimeout(context.Background(), checkDBTimeout)
 	defer cancel()
 	if err := app.CheckDatabase(ctx, cfg); err != nil {
+		return err
+	}
+	if err := checkLogFile(cfg.Log.File); err != nil {
 		return err
 	}
 	// The version, because this is also the pre-flight check of an upgrade: run
@@ -151,16 +161,13 @@ func checkDB(cfg config.Config) error {
 // The returned io.Closer, when non-nil, must be closed on shutdown to release
 // the log file.
 func setupLogger(c config.Logging) (*slog.Logger, io.Closer, error) {
-	var level slog.Level
-	switch strings.ToLower(c.Level) {
-	case "debug":
-		level = slog.LevelDebug
-	case "warn", "warning":
-		level = slog.LevelWarn
-	case "error":
-		level = slog.LevelError
-	default:
-		level = slog.LevelInfo
+	level, err := c.SlogLevel()
+	if err != nil {
+		return nil, nil, err
+	}
+	asJSON, err := c.JSON()
+	if err != nil {
+		return nil, nil, err
 	}
 
 	var out io.Writer = os.Stdout
@@ -189,7 +196,7 @@ func setupLogger(c config.Logging) (*slog.Logger, io.Closer, error) {
 		},
 	}
 	var handler slog.Handler
-	if strings.ToLower(c.Format) == "json" {
+	if asJSON {
 		handler = slog.NewJSONHandler(out, opts)
 	} else {
 		handler = slog.NewTextHandler(out, opts)
@@ -212,4 +219,37 @@ func openLogFile(path string) (*os.File, error) {
 		return nil, fmt.Errorf("open log file %q: %w", path, err)
 	}
 	return f, nil
+}
+
+// checkLogFile reports whether the process could open log.file for appending,
+// without creating it or writing to it: an existing file is opened and closed,
+// for a missing one the nearest existing directory must accept a new file.
+func checkLogFile(path string) error {
+	if path == "" {
+		return nil
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+	if err == nil {
+		return f.Close()
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("open log file %q: %w", path, err)
+	}
+	dir := filepath.Dir(path)
+	for {
+		if _, err := os.Stat(dir); err == nil {
+			break
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	probe, err := os.CreateTemp(dir, ".alertloop-check-*")
+	if err != nil {
+		return fmt.Errorf("log file %q cannot be created: %w", path, err)
+	}
+	_ = probe.Close()
+	return os.Remove(probe.Name())
 }

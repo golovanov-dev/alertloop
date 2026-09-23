@@ -284,12 +284,11 @@ func keyName(n *yaml.Node) (name string, plain bool) {
 type schema struct {
 	known      map[string]bool // every path yaml.v3 can decode
 	containers map[string]bool // the ones with keys below them
-	freeform   map[string]bool // prefixes under which any key is allowed
 }
 
 func configSchema() schema {
-	known, containers, freeform := knownYAMLPaths(reflect.TypeOf(Config{}))
-	return schema{known: known, containers: containers, freeform: freeform}
+	known, containers := knownYAMLPaths(reflect.TypeOf(Config{}))
+	return schema{known: known, containers: containers}
 }
 
 // descend reports whether the key walk should look below this key.
@@ -298,7 +297,7 @@ func (s schema) descend(path string, plain bool) bool {
 	// Compose uses for the same purpose. It is the only way to declare a
 	// reusable value, and there is no AlertLoop setting it could be a
 	// misspelling of.
-	if strings.HasPrefix(path, "x-") || isFreeform(path, s.freeform) {
+	if strings.HasPrefix(path, "x-") {
 		return false
 	}
 	// Below a scalar field there is nothing to find: "addr: {port: 1}" is a
@@ -337,7 +336,7 @@ func checkUnknownKeys(doc *yaml.Node, s schema) error {
 		if s.descend(path, plain) {
 			return true
 		}
-		if strings.HasPrefix(path, "x-") || isFreeform(path, s.freeform) {
+		if strings.HasPrefix(path, "x-") {
 			return false
 		}
 		if plain && s.known[path] {
@@ -383,9 +382,9 @@ func checkUnknownKeys(doc *yaml.Node, s schema) error {
 }
 
 // knownYAMLPaths derives, from the Config types themselves, the dotted paths
-// yaml.v3 can decode: known is every path, containers are the ones with keys
-// below them, and freeform are the prefixes under which any key is allowed (a
-// map or an interface field — the config has none today).
+// yaml.v3 can decode: known is every path, and containers are the ones with
+// keys below them. The keys below a map or interface field are not walked, so
+// any are accepted; the config has no such field today.
 //
 // Derived by reflection rather than written out as a list on purpose: a
 // hand-kept list goes stale the first time a field is added, the config file
@@ -395,38 +394,18 @@ func checkUnknownKeys(doc *yaml.Node, s schema) error {
 // or the lower-cased field name; ",inline" flattens; a `yaml:"-"` field is not
 // a key at all, which is what makes "warnings:" in a file unknown rather than
 // accepted).
-func knownYAMLPaths(t reflect.Type) (known, containers, freeform map[string]bool) {
-	known, containers, freeform = map[string]bool{}, map[string]bool{}, map[string]bool{}
+func knownYAMLPaths(t reflect.Type) (known, containers map[string]bool) {
+	known, containers = map[string]bool{}, map[string]bool{}
 
-	yamlUnmarshaler := reflect.TypeOf((*yaml.Unmarshaler)(nil)).Elem()
-
-	// Two cases this mirroring does NOT cover, because Config has no such field
-	// today and inventing the handling blind would be worse than the note: a
-	// `yaml:",inline"` MAP at the top level (yaml.v3 accepts one; here the
-	// freeform prefix would be empty and every key in the file would come out
-	// unknown), and `,inline` on a slice (yaml.v3 errors, this walks the element
-	// type). Whoever adds a free-form section adds a test for it here.
+	// Free-form sections (a map field, a type with its own UnmarshalYAML, an
+	// inline map) need handling here; Config has none today.
 	var expand func(t reflect.Type, prefix string, open map[reflect.Type]bool)
 	expand = func(t reflect.Type, prefix string, open map[reflect.Type]bool) {
 		for t.Kind() == reflect.Pointer || t.Kind() == reflect.Slice || t.Kind() == reflect.Array {
 			t = t.Elem()
 		}
 		switch {
-		case t.Kind() == reflect.Map, t.Kind() == reflect.Interface:
-			// The keys below are the operator's to choose, so none of them can
-			// be called unknown.
-			if prefix != "" {
-				freeform[prefix] = true
-			}
-			return
 		case t.Kind() != reflect.Struct:
-			return
-		case reflect.PointerTo(t).Implements(yamlUnmarshaler):
-			// The type parses itself; its Go fields say nothing about the keys
-			// it accepts.
-			if prefix != "" {
-				freeform[prefix] = true
-			}
 			return
 		case open[t]: // a self-referential type would recurse forever
 			return
@@ -457,7 +436,7 @@ func knownYAMLPaths(t reflect.Type) (known, containers, freeform map[string]bool
 		}
 	}
 	expand(t, "", map[reflect.Type]bool{})
-	return known, containers, freeform
+	return known, containers
 }
 
 // yamlFieldName reports the key a struct field decodes from, whether it is
@@ -482,17 +461,6 @@ func yamlFieldName(f reflect.StructField) (name string, inline, ok bool) {
 		name = strings.ToLower(f.Name)
 	}
 	return name, inline, true
-}
-
-// isFreeform reports whether path lies inside a section whose keys are not
-// AlertLoop's to know.
-func isFreeform(path string, freeform map[string]bool) bool {
-	for p := range freeform {
-		if path == p || strings.HasPrefix(path, p+".") {
-			return true
-		}
-	}
-	return false
 }
 
 // suggestKey finds the known key an unknown one was probably meant to be. It

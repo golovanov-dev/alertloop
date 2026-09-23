@@ -32,6 +32,7 @@ func TestExampleConfigRefusesWithoutAnAdminToken(t *testing.T) {
 
 func TestExampleConfigLoadsWithAnAdminToken(t *testing.T) {
 	t.Setenv("ALERTLOOP_ADMIN_TOKEN", "a-real-token")
+	t.Setenv("ALERTLOOP_ADDR", "")
 
 	cfg, err := Load(examplePath())
 	if err != nil {
@@ -45,6 +46,17 @@ func TestExampleConfigLoadsWithAnAdminToken(t *testing.T) {
 	}
 	if cfg.RetentionDays != 30 {
 		t.Fatalf("retention_days = %d, want 30", cfg.RetentionDays)
+	}
+	// A binary install copies this file: it must not listen on every interface.
+	if cfg.Addr != "127.0.0.1:8080" {
+		t.Fatalf("addr = %q, want loopback 127.0.0.1:8080", cfg.Addr)
+	}
+
+	// The Docker image sets ALERTLOOP_ADDR=:8080; a literal addr here would
+	// leave the container unreachable behind a green health check.
+	t.Setenv("ALERTLOOP_ADDR", ":8080")
+	if cfg, err = Load(examplePath()); err != nil || cfg.Addr != ":8080" {
+		t.Fatalf("with ALERTLOOP_ADDR=:8080: addr = %q, err = %v; want :8080", cfg.Addr, err)
 	}
 }
 
@@ -60,7 +72,7 @@ func TestTheShippedExampleShowsEveryKey(t *testing.T) {
 		t.Fatalf("read the example: %v", err)
 	}
 	shown := pathsShownIn(string(data))
-	known, _, _ := knownYAMLPaths(reflect.TypeOf(Config{}))
+	known, _ := knownYAMLPaths(reflect.TypeOf(Config{}))
 
 	var missing []string
 	for _, path := range sortedKeys(known) {
@@ -196,6 +208,7 @@ func envExamplePath() string { return filepath.Join("..", "..", ".env.example") 
 // leak this way will not be called change-me either.
 var nonSecretEnvExampleVars = map[string]bool{
 	"COMPOSE_PROFILES": true, // which deployment `docker compose up` starts
+	"ALERTLOOP_IMAGE":  true, // the release that runs
 }
 
 // The 2026-08-24 defect, as a test: `cp .env.example .env` supplied a non-empty

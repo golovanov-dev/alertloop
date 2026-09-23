@@ -24,19 +24,42 @@ input, select {
   border-radius:7px; padding:8px 10px; font-size:13px; outline:none;
 }
 input:focus, select:focus { border-color:#a78bfa; }
-input::placeholder { color:#565c68; }
+input::placeholder { color:#80889a; }
 
 table { border-collapse: collapse; }
 
+/* Every action is a <button class="al-btn">: the class drops the native look,
+   inline styles give the button its own. */
+.al-btn {
+  font: inherit; color: inherit; line-height: inherit; text-align: inherit;
+  background: none; border: 0; padding: 0; margin: 0; cursor: pointer;
+}
+.al-btn[aria-disabled="true"] { cursor: not-allowed; }
+a:focus-visible, .al-btn:focus-visible { outline: 2px solid #c4b5fd; outline-offset: 2px; }
+
 /* Responsive helpers for the admin console (paired with inline styles). */
 .al-cards { display: flex; gap: 16px; }
-.al-table-scroll { overflow-x: auto; }
+/* A shadow at the edge that has more columns behind it: the gradients in the
+   card colour scroll with the content and cover the shadow at the far end. */
+.al-table-scroll {
+  overflow-x: auto;
+  background:
+    linear-gradient(to right, #161a22 30%, rgba(22,26,34,0)) left / 40px 100% no-repeat local,
+    linear-gradient(to left, #161a22 30%, rgba(22,26,34,0)) right / 40px 100% no-repeat local,
+    radial-gradient(farthest-side at 0 50%, rgba(230,230,230,.16), transparent) left / 14px 100% no-repeat scroll,
+    radial-gradient(farthest-side at 100% 50%, rgba(230,230,230,.16), transparent) right / 14px 100% no-repeat scroll;
+}
 @media (max-width: 820px) {
   .al-cards { flex-direction: column; }
 }
 @media (max-width: 600px) {
-  /* Override the inline grid on small screens. */
-  .al-meta { grid-template-columns: 104px 1fr !important; }
+  /* Override the inline styles on small screens. */
+  .al-meta { grid-template-columns: 104px minmax(0, 1fr) !important; }
+  /* Recent critical events: time, severity and source on the first line,
+     the message on its own line below. */
+  .al-crit-row { flex-wrap: wrap; row-gap: 6px !important; }
+  .al-crit-time { width: auto !important; }
+  .al-crit-msg { order: 1; flex-basis: 100% !important; white-space: normal !important; overflow-wrap: anywhere; }
 }
 ::-webkit-scrollbar { width:10px; height:10px; }
 ::-webkit-scrollbar-thumb { background:#242832; border-radius:6px; }

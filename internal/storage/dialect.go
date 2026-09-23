@@ -2,6 +2,7 @@ package storage
 
 import (
 	"database/sql"
+	"database/sql/driver"
 	"fmt"
 	"net/url"
 	"strconv"
@@ -9,8 +10,26 @@ import (
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib" // postgres driver ("pgx")
-	_ "modernc.org/sqlite"             // pure-Go sqlite driver ("sqlite")
+	"modernc.org/sqlite"               // pure-Go sqlite driver ("sqlite")
 )
+
+// sqliteLower is the SQLite function lower() is on PostgreSQL. SQLite's own
+// lower() folds ASCII only, so a search for "диск" would miss "Диск".
+const sqliteLower = "alertloop_lower"
+
+func init() {
+	sqlite.MustRegisterDeterministicScalarFunction(sqliteLower, 1,
+		func(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+			switch v := args[0].(type) {
+			case string:
+				return strings.ToLower(v), nil
+			case []byte:
+				return strings.ToLower(string(v)), nil
+			default:
+				return v, nil
+			}
+		})
+}
 
 // dialect captures the small differences between SQLite and PostgreSQL that the
 // SQL store needs to account for.
@@ -42,6 +61,36 @@ func (d dialect) rebind(query string) string {
 // delivery queue. SQLite serializes writers and does not need (or support) it.
 func (d dialect) supportsSkipLocked() bool {
 	return d.name == "postgres"
+}
+
+// rowLock is the clause that locks a row read before it is updated, so the
+// read value holds until commit. SQLite serialises transactions on its single
+// connection and has no such clause.
+func (d dialect) rowLock() string {
+	if d.name == "postgres" {
+		return " FOR UPDATE"
+	}
+	return ""
+}
+
+// shareLock is the row-lock clause for a sub-SELECT whose answer must hold
+// until the statement commits. PostgreSQL needs it: under READ COMMITTED a
+// plain sub-SELECT reads the snapshot taken when the statement started, so a
+// concurrent change committed a moment later would be missed. SQLite runs one
+// statement at a time on its single connection and has no such clause.
+func (d dialect) shareLock() string {
+	if d.name == "postgres" {
+		return " FOR SHARE"
+	}
+	return ""
+}
+
+// lower is the function that lower-cases text, Unicode included.
+func (d dialect) lower() string {
+	if d.name == "postgres" {
+		return "lower"
+	}
+	return sqliteLower
 }
 
 // open resolves the driver and DSN for a driver name and opens a *sql.DB.

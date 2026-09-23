@@ -3,6 +3,7 @@ package channels
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"mime"
 	"net"
@@ -21,10 +22,11 @@ type mailSender interface {
 
 // Email delivers events as plain-text messages over SMTP.
 type Email struct {
-	name   string
-	from   string
-	to     []string
-	sender mailSender
+	name    string
+	from    string
+	to      []string
+	sender  mailSender
+	timeout time.Duration
 }
 
 // EmailConfig configures the SMTP transport.
@@ -48,12 +50,13 @@ type EmailConfig struct {
 // NewEmail builds a named Email channel backed by a real SMTP transport.
 func NewEmail(c EmailConfig) *Email {
 	if c.Timeout <= 0 {
-		c.Timeout = 10 * time.Second
+		c.Timeout = domain.DefaultChannelTimeout
 	}
 	return &Email{
-		name: c.Name,
-		from: c.From,
-		to:   c.To,
+		name:    c.Name,
+		from:    c.From,
+		to:      c.To,
+		timeout: c.Timeout,
 		sender: &smtpMailer{
 			addr:     net.JoinHostPort(c.Host, fmt.Sprint(c.Port)),
 			host:     c.Host,
@@ -73,6 +76,7 @@ func newEmailWithSender(name, from string, to []string, s mailSender) *Email {
 
 func (e *Email) Type() domain.ChannelType { return domain.ChannelEmail }
 func (e *Email) Name() string             { return e.name }
+func (e *Email) Timeout() time.Duration   { return e.timeout }
 
 func (e *Email) Send(ctx context.Context, n domain.Notification) error {
 	msg := buildMessage(e.from, e.to, subjectLine(n), plainBody(n), messageID(n, e.from), time.Now())
@@ -125,10 +129,7 @@ func messageID(n domain.Notification, from string) string {
 	if at := strings.LastIndex(from, "@"); at >= 0 && at+1 < len(from) {
 		domainPart = from[at+1:]
 	}
-	kind := n.Kind
-	if kind == "" {
-		kind = domain.KindAlert
-	}
+	kind := n.Kind.OrAlert()
 	id := "unknown"
 	if n.Event != nil && n.Event.ID != "" {
 		id = n.Event.ID
@@ -166,18 +167,13 @@ type smtpMailer struct {
 	timeout  time.Duration
 }
 
-func (m *smtpMailer) send(ctx context.Context, from string, to []string, msg []byte) error {
+func (m *smtpMailer) send(ctx context.Context, from string, to []string, msg []byte) (err error) {
 	dialer := &net.Dialer{Timeout: m.timeout}
 	var conn net.Conn
-	var err error
 	if m.implicit {
 		// SMTPS: TLS handshake before any SMTP command (typically port 465).
-		//nolint:noctx // The dial is bounded by dialer.Timeout, which is what
-		// stops a worker wedging on an unresponsive SMTP server. Switching to
-		// (*tls.Dialer).DialContext would additionally make it cancellable, but
-		// net/smtp gives the rest of the session no context either, so the
-		// change buys nothing until the whole SMTP path is rewritten.
-		conn, err = tls.DialWithDialer(dialer, "tcp", m.addr, &tls.Config{ServerName: m.host})
+		td := &tls.Dialer{NetDialer: dialer, Config: &tls.Config{ServerName: m.host}}
+		conn, err = td.DialContext(ctx, "tcp", m.addr)
 	} else {
 		conn, err = dialer.DialContext(ctx, "tcp", m.addr)
 	}
@@ -187,6 +183,18 @@ func (m *smtpMailer) send(ctx context.Context, from string, to []string, msg []b
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(deadline)
 	}
+	// net/smtp takes no context, so cancellation is delivered through the
+	// connection: a deadline in the past fails every pending and later read or
+	// write at once. Without this a shutdown that cancels ctx would still wait
+	// for a silent server until the channel timeout. The STARTTLS client wraps
+	// this same conn, so the deadline reaches it too.
+	stop := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Unix(1, 0)) })
+	defer func() {
+		stop()
+		if err != nil && ctx.Err() != nil && !errors.Is(err, context.Cause(ctx)) {
+			err = fmt.Errorf("%w (%w)", err, context.Cause(ctx))
+		}
+	}()
 
 	client, err := smtp.NewClient(conn, m.host)
 	if err != nil {
@@ -231,5 +239,9 @@ func (m *smtpMailer) send(ctx context.Context, from string, to []string, msg []b
 	if err := w.Close(); err != nil {
 		return fmt.Errorf("smtp close data: %w", err)
 	}
-	return client.Quit()
+	// The server accepted the message at the end of DATA. A failed QUIT (a
+	// shutdown cutting the connection now) must not turn a delivered mail into
+	// a retry that sends it twice.
+	_ = client.Quit()
+	return nil
 }

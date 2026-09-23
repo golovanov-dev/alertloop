@@ -13,7 +13,8 @@ import (
 // `alertloop check-db` runs, and that is the health check of the worker
 // container, which has no HTTP listener to probe.
 //
-// It opens a connection and pings — nothing else. No migration runs, nothing
+// It opens a connection, pings, and refuses a schema migrated by a newer
+// AlertLoop, as startup would — nothing else. No migration runs, nothing
 // in the database changes, and a SQLite file that does not exist is an error
 // rather than something to create: a check that quietly created an empty
 // database at a mistyped path would report a healthy install that is looking
@@ -45,7 +46,7 @@ func Check(ctx context.Context, driver, dsn string) error {
 		err = explainAuthFailure(err, driver == "postgres" && passwordLooksPercentEncoded(dsn))
 		return fmt.Errorf("database is unreachable: %w", err)
 	}
-	return nil
+	return checkSchemaVersion(ctx, db, dialect{name: driver})
 }
 
 // sqliteFileExists fails for a SQLite DSN whose file is not there, and for an

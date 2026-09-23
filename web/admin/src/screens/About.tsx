@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
 import { c } from "../theme";
-import { Card } from "../ui";
+import { timeZone } from "../format";
+import { Button, Card } from "../ui";
 import type { Info } from "../types";
 
 export function About() {
@@ -19,6 +20,7 @@ export function About() {
   }, []);
 
   const statusColor = apiStatus === "checking" ? c.warn : apiStatus === "ready" ? c.ok : c.danger;
+  const zone = timeZone();
   const statusLabel = apiStatus === "checking" ? "Checking…" : apiStatus === "ready" ? "Ready" : "Unreachable";
 
   return (
@@ -61,12 +63,12 @@ export function About() {
               <span style={{ fontSize: 14 }}>{statusLabel}</span>
             </div>
           </div>
-          <div
+          <Button
             onClick={check}
-            style={{ fontSize: 12.5, color: c.accent, cursor: "pointer", padding: "6px 12px", border: `1px solid ${c.border}`, borderRadius: 7 }}
+            style={{ fontSize: 12.5, color: c.accent, padding: "6px 12px", border: `1px solid ${c.border}`, borderRadius: 7 }}
           >
             Check again
-          </div>
+          </Button>
         </Row>
 
         <Divider />
@@ -81,6 +83,16 @@ export function About() {
         <Divider />
 
         <Row>
+          <div style={{ fontSize: 13, color: c.muted }}>Times are shown in</div>
+          <div style={{ fontSize: 13.5, color: c.text2, textAlign: "right" }}>
+            {zone.name ? `${zone.name} ` : null}
+            <span style={{ whiteSpace: "nowrap" }}>{zone.name ? `(now ${zone.offset})` : zone.offset}</span>
+          </div>
+        </Row>
+
+        <Divider />
+
+        <Row>
           <div style={{ fontSize: 13, color: c.muted }}>License</div>
           <div style={{ fontSize: 13.5, color: c.text2 }}>{info?.license ?? "AGPL-3.0-only"}</div>
         </Row>
@@ -90,7 +102,7 @@ export function About() {
 }
 
 function Row({ children }: { children: React.ReactNode }) {
-  return <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>{children}</div>;
+  return <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 16 }}>{children}</div>;
 }
 function Divider() {
   return <div style={{ height: 1, background: c.border }} />;

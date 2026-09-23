@@ -10,6 +10,10 @@ import (
 	"time"
 
 	"github.com/golovanov-dev/alertloop/internal/domain"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 // sqlStore is a Store backed by database/sql. It supports SQLite and PostgreSQL
@@ -104,14 +108,8 @@ const insertDeliverySQL = `INSERT INTO delivery_attempts
 	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 func (s *sqlStore) insertDelivery(ctx context.Context, ex execer, d *domain.DeliveryAttempt) error {
-	kind := d.Kind
-	if kind == "" {
-		// A caller that does not say is announcing an event, which is what every
-		// delivery was before recovery notices existed.
-		kind = domain.KindAlert
-	}
 	_, err := ex.ExecContext(ctx, s.d.rebind(insertDeliverySQL),
-		d.ID, d.EventID, d.Channel, d.ChannelName, kind, d.State, d.Attempts, d.MaxAttempts,
+		d.ID, d.EventID, d.Channel, d.ChannelName, d.Kind.OrAlert(), d.State, d.Attempts, d.MaxAttempts,
 		nullableTime(d.NextRetryAt), d.LastError, formatTime(d.CreatedAt), formatTime(d.UpdatedAt),
 	)
 	return err
@@ -250,6 +248,12 @@ func (s *sqlStore) ListEvents(ctx context.Context, f EventFilter, limit int, cur
 		where = append(where, "source = ?")
 		args = append(args, f.Source)
 	}
+	if f.Search != "" {
+		// Both sides go through the same function, so case folding is the
+		// same on either side of LIKE.
+		where = append(where, s.d.lower()+"(message) LIKE "+s.d.lower()+`(?) ESCAPE '\'`)
+		args = append(args, "%"+likeEscaper.Replace(f.Search)+"%")
+	}
 	if cursor != "" {
 		ct, cid, err := decodeCursor(cursor)
 		if err != nil {
@@ -294,94 +298,174 @@ func (s *sqlStore) ListEvents(ctx context.Context, f EventFilter, limit int, cur
 	return page, nil
 }
 
-func (s *sqlStore) UpdateEventState(ctx context.Context, id string, state domain.EventState, at time.Time) (*domain.Event, error) {
-	// Closing an incident by hand stamps resolved_at exactly as an ingested
-	// `status: resolved` does; otherwise the two paths would disagree about
-	// when the same incident ended. Leaving the resolved state clears it again.
-	var (
-		q    string
-		args []any
-	)
-	if state == domain.StateResolved {
-		q = s.d.rebind(`UPDATE events SET state = ?, updated_at = ?, resolved_at = ? WHERE id = ?`)
-		args = []any{state, formatTime(at), formatTime(at), id}
-	} else {
-		q = s.d.rebind(`UPDATE events SET state = ?, updated_at = ?, resolved_at = NULL WHERE id = ?`)
-		args = []any{state, formatTime(at), id}
+// TransitionEvent is the one write path for an event's state. The UPDATE is
+// conditional on the state the caller read, so of two concurrent requests
+// exactly one changes the event, and the recovery attempts it queues commit or
+// roll back together with the close: a request cut off after the close has
+// either closed the incident and queued its recovery, or done neither.
+func (s *sqlStore) TransitionEvent(ctx context.Context, id string, c StateChange) (*domain.Event, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
 	}
-	res, err := s.db.ExecContext(ctx, q, args...)
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful commit
+
+	var resolvedAt *time.Time
+	if c.To == domain.StateResolved {
+		resolvedAt = &c.At
+	}
+	q := s.d.rebind(`UPDATE events SET state = ?, updated_at = ?, resolved_at = ?
+		WHERE id = ? AND state = ?
+		RETURNING ` + eventColumns)
+	e, err := scanEvent(tx.QueryRowContext(ctx, q, c.To, formatTime(c.At), nullableTime(resolvedAt), id, c.From))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrStateChanged
+	}
 	if err != nil {
 		return nil, fmt.Errorf("update event state: %w", err)
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return nil, domain.ErrNotFound
+
+	if c.CancelAlerts {
+		q := s.d.rebind(`UPDATE delivery_attempts SET state = ?, next_retry_at = NULL, updated_at = ?
+			WHERE event_id = ? AND kind = ? AND state IN (?, ?)`)
+		if _, err := tx.ExecContext(ctx, q, domain.DeliveryCancelled, formatTime(c.At),
+			id, domain.KindAlert, domain.DeliveryPending, domain.DeliveryFailed); err != nil {
+			return nil, fmt.Errorf("cancel alert attempts: %w", err)
+		}
 	}
-	return s.GetEvent(ctx, id)
+
+	if c.RecoveryMaxAttempts > 0 {
+		targets, err := alertedChannels(ctx, tx, s.d, id)
+		if err != nil {
+			return nil, err
+		}
+		for _, t := range targets {
+			d := &domain.DeliveryAttempt{
+				ID: uuid.NewString(), EventID: id, Channel: t.Type, ChannelName: t.Name,
+				Kind: domain.KindRecovery, State: domain.DeliveryPending,
+				MaxAttempts: c.RecoveryMaxAttempts, CreatedAt: c.At, UpdatedAt: c.At,
+			}
+			if err := s.insertDelivery(ctx, tx, d); err != nil {
+				return nil, fmt.Errorf("insert recovery attempt: %w", err)
+			}
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit event state: %w", err)
+	}
+	return e, nil
 }
 
 // RefreshOpenEvent applies a repeated `firing` to an already-open incident: it
 // moves last_seen_at forward and adopts the newest severity, message, and
 // payload. It deliberately does NOT touch state — an incident an operator has
-// acknowledged stays acknowledged while the problem keeps firing — and it
-// creates no delivery attempts, so a check that fails every minute does not
-// notify anyone every minute.
+// acknowledged stays acknowledged while the problem keeps firing. A repeat at
+// the same or a lower severity creates no delivery attempts, so a check that
+// fails every minute does not notify anyone every minute; a rise alerts the
+// channels the new severity routes to that were not alerted yet.
+//
+// The stored severity and state are read under a row lock in the same
+// transaction as the update, so of two concurrent rises only the first queues
+// alerts, and a mute or close waits for the alerts it must cancel or follow.
 func (s *sqlStore) RefreshOpenEvent(ctx context.Context, id string, u EventUpdate) (*domain.Event, error) {
 	payload := u.Payload
 	if len(payload) == 0 {
 		payload = []byte("{}")
 	}
-	q := s.d.rebind(`UPDATE events SET severity = ?, message = ?, payload = ?, last_seen_at = ?, updated_at = ?
-		WHERE id = ? AND state <> ?`)
-	res, err := s.db.ExecContext(ctx, q,
-		u.Severity, u.Message, string(payload), formatTime(u.LastSeenAt), formatTime(u.LastSeenAt),
-		id, domain.StateResolved,
-	)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, fmt.Errorf("refresh event: %w", err)
+		return nil, err
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful commit
+
+	var (
+		oldSeverity domain.Severity
+		oldState    domain.EventState
+	)
+	q := s.d.rebind(`SELECT severity, state FROM events WHERE id = ? AND state <> ?` + s.d.rowLock())
+	err = tx.QueryRowContext(ctx, q, id, domain.StateResolved).Scan(&oldSeverity, &oldState)
+	if errors.Is(err, sql.ErrNoRows) {
 		// The incident was resolved between the lookup and this update.
 		return nil, domain.ErrNotFound
 	}
-	return s.GetEvent(ctx, id)
+	if err != nil {
+		return nil, fmt.Errorf("read event for refresh: %w", err)
+	}
+
+	q = s.d.rebind(`UPDATE events SET severity = ?, message = ?, payload = ?, last_seen_at = ?, updated_at = ?
+		WHERE id = ?
+		RETURNING ` + eventColumns)
+	e, err := scanEvent(tx.QueryRowContext(ctx, q,
+		u.Severity, u.Message, string(payload), formatTime(u.LastSeenAt), formatTime(u.LastSeenAt), id))
+	if err != nil {
+		return nil, fmt.Errorf("refresh event: %w", err)
+	}
+
+	if len(u.AlertsOnRise) > 0 && oldState != domain.StateMuted &&
+		domain.SeverityRank(u.Severity) > domain.SeverityRank(oldSeverity) {
+		if err := s.insertMissingAlerts(ctx, tx, id, u.AlertsOnRise); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit event refresh: %w", err)
+	}
+	return e, nil
 }
 
-// ResolveByDedupe closes the open incident carrying key. closed reports whether
-// this call is what closed it: a repeated `resolved` returns the already-closed
-// event with closed=false, and a key that has never been seen returns
-// domain.ErrNotFound.
-func (s *sqlStore) ResolveByDedupe(ctx context.Context, key string, at time.Time) (event *domain.Event, closed bool, err error) {
-	if key == "" {
-		return nil, false, domain.ErrNotFound
-	}
-	// RETURNING, not UPDATE-then-SELECT. Closing an incident FREES its key -
-	// that is the whole point of the partial unique index - so a `firing` for
-	// the same key arriving between the two statements would be read back as
-	// "the event we just resolved". The recovery notice would then go to that
-	// new incident's channels, announcing that a problem which started a second
-	// ago is over, with a duration computed from the wrong start time.
-	//
-	// Both engines support RETURNING (SQLite since 3.35, and the pure-Go driver
-	// is newer than that), so the read cannot be separated from the write.
-	q := s.d.rebind(`UPDATE events SET state = ?, resolved_at = ?, updated_at = ?
-		WHERE dedupe_key = ? AND state <> ?
-		RETURNING ` + eventColumns)
-	closedEvent, err := scanEvent(s.db.QueryRowContext(ctx, q,
-		domain.StateResolved, formatTime(at), formatTime(at), key, domain.StateResolved))
-	if err == nil {
-		return closedEvent, true, nil
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return nil, false, fmt.Errorf("resolve event by dedupe_key: %w", err)
-	}
-
-	// Nothing was open. Either it is already closed - a source repeating a
-	// recovery - or the key has never been seen.
-	e, err := s.latestEventByDedupe(ctx, key)
+// insertMissingAlerts queues the alerts whose channel has no alert attempt of
+// eventID yet. A cancelled attempt counts: the channel was alerted, then
+// muted.
+func (s *sqlStore) insertMissingAlerts(ctx context.Context, tx *sql.Tx, eventID string, alerts []*domain.DeliveryAttempt) error {
+	alerted, err := s.alertChannelNames(ctx, tx, eventID)
 	if err != nil {
-		return nil, false, err
+		return err
 	}
-	return e, false, nil
+	for _, d := range alerts {
+		if alerted[d.ChannelName] {
+			continue
+		}
+		if err := s.insertDelivery(ctx, tx, d); err != nil {
+			return fmt.Errorf("insert alert attempt: %w", err)
+		}
+	}
+	return nil
+}
+
+// alertChannelNames lists the channels with an alert attempt of eventID, in
+// any state.
+func (s *sqlStore) alertChannelNames(ctx context.Context, tx *sql.Tx, eventID string) (map[string]bool, error) {
+	q := s.d.rebind(`SELECT DISTINCT channel_name FROM delivery_attempts WHERE event_id = ? AND kind = ?`)
+	rows, err := tx.QueryContext(ctx, q, eventID, domain.KindAlert)
+	if err != nil {
+		return nil, fmt.Errorf("list alerted channels: %w", err)
+	}
+	defer rows.Close()
+
+	out := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		out[name] = true
+	}
+	return out, rows.Err()
+}
+
+// EventByDedupe returns the open incident carrying key, or the latest closed
+// one when none is open, or domain.ErrNotFound for a key never seen.
+func (s *sqlStore) EventByDedupe(ctx context.Context, key string) (*domain.Event, error) {
+	if key == "" {
+		return nil, domain.ErrNotFound
+	}
+	e, err := s.eventByDedupe(ctx, key)
+	if !errors.Is(err, domain.ErrNotFound) {
+		return e, err
+	}
+	return s.latestEventByDedupe(ctx, key)
 }
 
 // DeleteEventsBefore removes events that stopped mattering before cutoff.
@@ -405,12 +489,10 @@ func (s *sqlStore) DeleteEventsBefore(ctx context.Context, cutoff time.Time) (in
 		"COALESCE(resolved_at, last_seen_at) < ?", formatTime(cutoff))
 }
 
-// deleteBefore removes rows created before cutoff in bounded batches so a large
+// deleteBatched removes rows matching where in bounded batches, so a large
 // retention sweep never holds a single long lock (which on SQLite would stall
-// the whole API, and on Postgres would bloat WAL/locks). table is an internal
-// constant, never user input.
-// deleteBatched removes rows matching where in bounded batches. table and where
-// are internal constants, never user input.
+// the whole API, and on Postgres would bloat WAL/locks). table and where are
+// internal constants, never user input.
 //
 // It yields between batches. On SQLite there is exactly ONE connection by
 // design, so a sweep that loops without pausing holds it for the whole run and
@@ -471,9 +553,7 @@ func scanDelivery(sc interface{ Scan(...any) error }) (*domain.DeliveryAttempt, 
 	); err != nil {
 		return nil, err
 	}
-	if d.Kind == "" {
-		d.Kind = domain.KindAlert
-	}
+	d.Kind = d.Kind.OrAlert()
 	if nextRetry.Valid && nextRetry.String != "" {
 		t := parseTime(nextRetry.String)
 		d.NextRetryAt = &t
@@ -483,19 +563,14 @@ func scanDelivery(sc interface{ Scan(...any) error }) (*domain.DeliveryAttempt, 
 	return &d, nil
 }
 
-// AlertedChannels lists the channels an alert for eventID was queued to, in any
-// state. It is who a recovery notice goes to: exactly the recipients of the
-// alert, and nobody else.
-//
-// A dead-lettered alert IS included. Its recovery is created anyway and waits:
-// ClaimDue does not release a recovery until its alert is sent, so after the
-// alert is replayed both go out, in order. Leaving that channel out would make
-// a replay deliver "down" with no "back up" ever following it.
-func (s *sqlStore) AlertedChannels(ctx context.Context, eventID string) ([]domain.ChannelTarget, error) {
-	q := s.d.rebind(`SELECT DISTINCT channel, channel_name FROM delivery_attempts
-		WHERE event_id = ? AND kind = ?
+// alertedChannels lists the channels an alert for eventID was queued to: the
+// audience of its recovery notice, and nobody else. A cancelled alert was never
+// sent, so its channel is not told the incident is over.
+func alertedChannels(ctx context.Context, tx *sql.Tx, d dialect, eventID string) ([]domain.ChannelTarget, error) {
+	q := d.rebind(`SELECT DISTINCT channel, channel_name FROM delivery_attempts
+		WHERE event_id = ? AND kind = ? AND state <> ?
 		ORDER BY channel_name`)
-	rows, err := s.db.QueryContext(ctx, q, eventID, domain.KindAlert)
+	rows, err := tx.QueryContext(ctx, q, eventID, domain.KindAlert, domain.DeliveryCancelled)
 	if err != nil {
 		return nil, fmt.Errorf("list alerted channels: %w", err)
 	}
@@ -604,6 +679,14 @@ func (s *sqlStore) ListDeliveryAttempts(ctx context.Context, f DeliveryFilter, l
 // it is still `sending`; anything else means someone took it back, and
 // ErrNotFound says so.
 //
+// An alert that did not go out (failed, dead-lettered, or handed back at
+// shutdown) while its incident is muted becomes `cancelled` instead: mute
+// cancels alerts not sent yet, and one that was mid-send at the moment of mute
+// is exactly that. The check sits in the UPDATE itself, see mutedAlertCond, so
+// a mute cannot slip in between reading the event and writing the result. A
+// sent alert stays `sent`: it was delivered. d.State and d.NextRetryAt are set
+// to what was actually stored.
+//
 // last_error is truncated by runes, not bytes: a cut through a multi-byte
 // character produces text PostgreSQL refuses to store, which is what made the
 // requeue loop above more than theoretical.
@@ -612,21 +695,53 @@ func (s *sqlStore) MarkResult(ctx context.Context, d *domain.DeliveryAttempt) er
 	if at.IsZero() {
 		at = time.Now()
 	}
+	stateExpr, retryExpr := "?", "?"
+	args := []any{d.State}
+	if d.State != domain.DeliverySent {
+		cond := s.mutedAlertCond()
+		stateExpr = "CASE WHEN " + cond + " THEN ? ELSE ? END"
+		retryExpr = "CASE WHEN " + cond + " THEN NULL ELSE ? END"
+		args = []any{domain.DeliveryCancelled, d.State}
+	}
 	q := s.d.rebind(`UPDATE delivery_attempts
-		SET state = ?, attempts = ?, next_retry_at = ?, last_error = ?, updated_at = ?
-		WHERE id = ? AND state = ?`)
-	res, err := s.db.ExecContext(ctx, q,
-		d.State, d.Attempts, nullableTime(d.NextRetryAt),
+		SET state = ` + stateExpr + `, next_retry_at = ` + retryExpr + `,
+			attempts = ?, last_error = ?, updated_at = ?
+		WHERE id = ? AND state = ?
+		RETURNING state`)
+	args = append(args, nullableTime(d.NextRetryAt), d.Attempts,
 		domain.TruncateRunes(d.LastError, domain.MaxLastErrorRunes),
-		formatTime(at), d.ID, domain.DeliverySending,
-	)
+		formatTime(at), d.ID, domain.DeliverySending)
+	var state string
+	err := s.db.QueryRowContext(ctx, q, args...).Scan(&state)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.ErrNotFound
+	}
 	if err != nil {
 		return fmt.Errorf("mark delivery result: %w", err)
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return domain.ErrNotFound
+	d.State = domain.DeliveryState(state)
+	if d.State == domain.DeliveryCancelled {
+		d.NextRetryAt = nil
 	}
 	return nil
+}
+
+// mutedAlertCond is true for a delivery_attempts row that is an alert of an
+// event currently in `muted`. It is written into the UPDATE statements that
+// hand a `sending` attempt back (MarkResult, RequeueStuckSending), so the
+// decision to cancel and the write happen in one statement.
+//
+// On PostgreSQL the sub-SELECT share-locks the event row. Without the lock a
+// mute committed after this statement took its snapshot, but before it
+// commits, would be missed here, while the mute's own cancel would skip the
+// row because it is still `sending`: the alert would stay queued. With the
+// lock either the mute waits for this statement (and its cancel then sees the
+// `failed` or `pending` row) or this statement waits for the mute (and then
+// reads `muted`).
+func (s *sqlStore) mutedAlertCond() string {
+	return fmt.Sprintf(`(kind = '%s' AND (SELECT e.state FROM events e
+			WHERE e.id = delivery_attempts.event_id%s) = '%s')`,
+		domain.KindAlert, s.d.shareLock(), domain.StateMuted)
 }
 
 func (s *sqlStore) Replay(ctx context.Context, id string, at time.Time) (*domain.DeliveryAttempt, error) {
@@ -638,7 +753,7 @@ func (s *sqlStore) Replay(ctx context.Context, id string, at time.Time) (*domain
 		return nil, domain.ErrNotReplayable
 	}
 	q := s.d.rebind(`UPDATE delivery_attempts
-		SET state = ?, next_retry_at = ?, last_error = '', updated_at = ?
+		SET state = ?, attempts = 0, next_retry_at = ?, last_error = '', updated_at = ?
 		WHERE id = ? AND state = ?`)
 	res, err := s.db.ExecContext(ctx, q,
 		domain.DeliveryPending, formatTime(at), formatTime(at), id, domain.DeliveryDeadLetter,
@@ -653,12 +768,18 @@ func (s *sqlStore) Replay(ctx context.Context, id string, at time.Time) (*domain
 	return s.GetDeliveryAttempt(ctx, id)
 }
 
+// RequeueStuckSending returns abandoned `sending` attempts to `pending`, except
+// alerts of a muted incident, which become `cancelled` (see MarkResult).
 func (s *sqlStore) RequeueStuckSending(ctx context.Context, staleBefore time.Time) (int64, error) {
+	cond := s.mutedAlertCond()
 	q := s.d.rebind(`UPDATE delivery_attempts
-		SET state = ?, updated_at = ?
+		SET state = CASE WHEN ` + cond + ` THEN ? ELSE ? END,
+			next_retry_at = CASE WHEN ` + cond + ` THEN NULL ELSE next_retry_at END,
+			updated_at = ?
 		WHERE state = ? AND updated_at < ?`)
 	res, err := s.db.ExecContext(ctx, q,
-		domain.DeliveryPending, formatTime(time.Now()), domain.DeliverySending, formatTime(staleBefore),
+		domain.DeliveryCancelled, domain.DeliveryPending, formatTime(time.Now()),
+		domain.DeliverySending, formatTime(staleBefore),
 	)
 	if err != nil {
 		return 0, fmt.Errorf("requeue stuck sending: %w", err)
@@ -670,7 +791,11 @@ func (s *sqlStore) RequeueStuckSending(ctx context.Context, staleBefore time.Tim
 // cutoff - ones whose event is already gone.
 //
 // Deleting an event cascades to its attempts, so this sweep exists only for
-// rows the cascade missed. It deliberately does not touch attempts whose event
+// rows the cascade missed: databases written while a DSN with its own `?`
+// dropped foreign_keys (fixed by requiredPragmas, dialect.go), and manual
+// deletes with foreign keys off. On a database created since then it finds
+// nothing. Kept on purpose (decision R14, 2026-09-21 audit): it costs one
+// indexed query per retention run. It deliberately does not touch attempts whose event
 // is still retained: the delivery history of a live incident is exactly what an
 // operator opens when asking why a notification never arrived.
 func (s *sqlStore) DeleteDeliveryAttemptsBefore(ctx context.Context, cutoff time.Time) (int64, error) {
@@ -708,7 +833,51 @@ func (s *sqlStore) countByColumn(ctx context.Context, table, column string) (map
 	return out, rows.Err()
 }
 
+// Monitoring reads every signal in one statement, so they describe one moment.
+func (s *sqlStore) Monitoring(ctx context.Context, now, deadLetterSince time.Time) (Monitoring, error) {
+	q := fmt.Sprintf(`SELECT
+		(SELECT COUNT(*) FROM events WHERE type = '%[1]s' AND state <> '%[2]s'),
+		(SELECT MIN(COALESCE(c.next_retry_at, c.created_at)) FROM delivery_attempts c WHERE %[3]s),
+		(SELECT COUNT(*) FROM delivery_attempts WHERE state = '%[4]s' AND updated_at >= ?),
+		(SELECT last_tick_at FROM worker_heartbeat WHERE id = 1)`,
+		domain.EventIncident, domain.StateResolved, deliverableCond, domain.DeliveryDeadLetter)
+	var (
+		m              Monitoring
+		dueSince, tick sql.NullString
+	)
+	err := s.db.QueryRowContext(ctx, s.d.rebind(q), formatTime(now), formatTime(deadLetterSince)).
+		Scan(&m.OpenIncidents, &dueSince, &m.DeadLetters, &tick)
+	if err != nil {
+		return Monitoring{}, fmt.Errorf("read monitoring signals: %w", err)
+	}
+	if dueSince.Valid {
+		t := parseTime(dueSince.String)
+		m.OldestDueSince = &t
+	}
+	if tick.Valid {
+		t := parseTime(tick.String)
+		m.LastWorkerTick = &t
+	}
+	return m, nil
+}
+
+// RecordWorkerTick keeps the latest tick of any worker: with several workers,
+// one that writes a moment late does not move it back.
+func (s *sqlStore) RecordWorkerTick(ctx context.Context, at time.Time) error {
+	q := s.d.rebind(`INSERT INTO worker_heartbeat (id, last_tick_at) VALUES (1, ?)
+		ON CONFLICT (id) DO UPDATE SET last_tick_at = excluded.last_tick_at
+		WHERE worker_heartbeat.last_tick_at < excluded.last_tick_at`)
+	if _, err := s.db.ExecContext(ctx, q, formatTime(at)); err != nil {
+		return fmt.Errorf("record worker tick: %w", err)
+	}
+	return nil
+}
+
 // --- Helpers --------------------------------------------------------------
+
+// likeEscaper makes a search string match itself literally in a LIKE pattern
+// with ESCAPE '\'.
+var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
 
 func nullableTime(t *time.Time) any {
 	if t == nil {
@@ -744,14 +913,20 @@ func decodeCursor(cursor string) (createdAt, id string, err error) {
 	return parts[0], parts[1], nil
 }
 
+// isUniqueViolation reports whether err is a unique-constraint violation, by
+// the driver's error code: SQLSTATE 23505 on PostgreSQL, the extended result
+// code SQLITE_CONSTRAINT_UNIQUE on SQLite.
 func isUniqueViolation(err error) bool {
-	if err == nil {
-		return false
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == pgUniqueViolation
 	}
-	msg := strings.ToLower(err.Error())
-	// SQLite: "UNIQUE constraint failed"; PostgreSQL: "duplicate key value" /
-	// SQLSTATE 23505.
-	return strings.Contains(msg, "unique constraint") ||
-		strings.Contains(msg, "duplicate key") ||
-		strings.Contains(msg, "23505")
+	var liteErr *sqlite.Error
+	if errors.As(err, &liteErr) {
+		return liteErr.Code() == sqlite3.SQLITE_CONSTRAINT_UNIQUE
+	}
+	return false
 }
+
+// pgUniqueViolation is the PostgreSQL SQLSTATE of unique_violation.
+const pgUniqueViolation = "23505"

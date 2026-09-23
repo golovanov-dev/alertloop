@@ -28,7 +28,7 @@ while the failure lasts.
 |---|---|---|
 | `GET /health`, `GET /health/live` | none | The process is up and serving HTTP. No dependencies are checked. |
 | `GET /ready`, `GET /health/ready` | none | The database answered. Returns `503` when it did not. |
-| `GET /v1/stats` | `read` | Event counts by state and delivery-attempt counts by state. |
+| `GET /v1/stats` | `read` | Counts by state, and four absolute signals for alerting (below). |
 
 `/health` and `/health/live` are the same check under two names, as are `/ready`
 and `/health/ready`. Point your monitoring at whichever your tooling prefers.
@@ -37,9 +37,15 @@ and `/health/ready`. Point your monitoring at whichever your tooling prefers.
 
 Under Compose every AlertLoop container has a Docker health check, run every
 10 seconds. The api (and the demo container) probe `/health/ready`. The worker
-serves no HTTP, so it runs `alertloop check-db`: load the config file, connect
-to the database, exit 0 if it answered. It migrates nothing and changes nothing
-in the database. It prints the version that answered.
+serves no HTTP, so it runs `alertloop check-db`. It exits 0 only if `server`
+and `all` would start with this config: the config is valid (`log.level`,
+`log.format`, `trusted_proxies` included), `admin_token` or `api_keys` is set,
+the database answers and has no migrations newer than the binary, and
+`log.file`, if set, can be opened for writing. It migrates nothing, changes
+nothing in the database and writes nothing to the log file; when `log.file`
+does not exist yet, it creates and deletes a temporary file in that directory.
+It prints the version that answered. Because it is the worker's health check, a
+config used only by the worker needs a credential too.
 
 ```bash
 docker compose ps                                  # (healthy) / (unhealthy) per service
@@ -69,9 +75,12 @@ start.
 
 What the worker's check does **not** prove is that deliveries are moving: a
 worker whose database answers can still have a queue that never drains. That is
-what `deliveries.pending` below is for.
+what `worker_last_tick_at` and `oldest_due_delivery_age_seconds` below are for.
 
 ### What to alert on
+
+Every signal below is an absolute value: one reading is enough, and the
+monitor needs no memory of the previous one.
 
 ```bash
 curl -s -H "X-API-Key: $KEY" http://127.0.0.1:8080/v1/stats
@@ -79,33 +88,172 @@ curl -s -H "X-API-Key: $KEY" http://127.0.0.1:8080/v1/stats
 
 ```json
 {
-  "events":     {"new": 12, "acknowledged": 3, "resolved": 400, "muted": 0, "escalated": 1},
-  "deliveries": {"pending": 2, "sending": 1, "sent": 900, "failed": 4, "dead_letter": 7}
+  "events":     {"new": 12, "acknowledged": 3, "resolved": 400, "escalated": 1},
+  "deliveries": {"pending": 2, "sending": 1, "sent": 900, "failed": 4, "dead_letter": 7, "cancelled": 3},
+  "open_incidents": 9,
+  "oldest_due_delivery_age_seconds": 3,
+  "dead_letter_last_24h": 1,
+  "worker_last_tick_at": "2026-09-22T12:00:07Z"
 }
 ```
 
-- **`deliveries.dead_letter` rising** — deliveries have exhausted their retries
-  and stopped. Every one of them is a notification that was never seen by a
-  human. Alert on any increase; investigate at the first one.
-- **`deliveries.pending` growing steadily** — events are arriving faster than
-  they are sent, or no worker is running. A queue that never drains is a
-  worker that is not there. Not every `pending` row is waiting for the worker:
-  a recovery waits for its alert, and one whose alert dead-lettered (or whose
-  channel was removed from the config) stays `pending` until that alert is
-  replayed and sent, or until retention removes the incident. List them with
-  `/v1/delivery-attempts?kind=recovery&state=pending` and check the alert of
-  the same `event_id` and `channel_name`
-  (`?kind=alert&event_id=<id>`): if it is `dead_letter`, the recovery is
-  waiting on it, not on the worker.
-- **`deliveries.failed` staying non-zero** — retries are in flight. Occasional
-  values are normal; a floor that never returns to zero is a channel that is
-  down.
-- **`events.new` growing without bound** — nobody is acknowledging or resolving
-  anything. That is an operational signal about your team, not about AlertLoop.
-  Read it against what you ingest: for business events and audit entries `new`
-  is the normal resting state (see "Event state is not delivery state" in the
-  README), so a steady climb there is expected and only incidents sitting in
-  `new` mean nobody looked.
+| Alert when | Means |
+|---|---|
+| `worker_last_tick_at` is `null` or more than 120 s old | No worker is polling the queue. A running worker writes it at most every 15 s, so it is at most 15 s plus `worker.poll_interval` old. `null` until a 0.7.0 worker has run against the database. |
+| `oldest_due_delivery_age_seconds` above 300 | Deliveries are due and nobody takes them: no worker, or one channel that hangs keeps all the slots it may use busy. `null` means nothing is due. |
+| `dead_letter_last_24h` above 0 | Deliveries exhausted their retries in the last 24 hours. Each one is a notification nobody saw. List them with `/v1/delivery-attempts?state=dead_letter`. |
+
+If you raised `worker.poll_interval` (default 2 s), keep both thresholds well
+above it: a healthy tick is up to 15 s plus one `poll_interval` old, and a due
+delivery waits up to one `poll_interval` before a worker looks. The
+thresholds are the numbers 120 and 300 in the script below; change them there.
+
+#### A check script
+
+The script below turns these three rules into one exit code: **0** when all is
+well, **2** when a rule fails *or* `/v1/stats` did not answer (AlertLoop down,
+wrong key, a proxy error, a timeout, an answer that is not JSON). There is no
+other code, so "not 0" is the whole test. Those are the Nagios plugin codes for
+OK and CRITICAL. It prints `OK`, or one `CRITICAL:` line that names every rule
+that failed and the values behind it, so the alert says what broke.
+
+**Where to run it.** Either host works; they catch different things.
+
+| Run on | URL argument | Catches | Misses |
+|---|---|---|---|
+| The AlertLoop host | none (default `http://127.0.0.1:8080`; if you changed the port — `addr`, or `ALERTLOOP_PORT` under Compose — pass `http://127.0.0.1:<port>`) | worker, queue, dead letters | the host itself going down — nothing on it runs then |
+| Another host (the monitoring host) | `https://alerts.example.com` — your domain, through the reverse proxy | all of the above, and AlertLoop, its proxy or its host being down | only its own host going down; use HTTPS, the key travels in a header |
+
+Running it on another host is the better choice: it also covers [the failure
+that AlertLoop cannot report](#the-failure-that-alertloop-cannot-report). Comparing `worker_last_tick_at` with `now` uses the clock of
+the host that runs the script: keep both hosts on NTP.
+
+Whichever host runs it, send its alert through **something other than
+AlertLoop** (Monit's own mail, cron mail, your monitoring system). A stopped
+worker would hold a notification sent through AlertLoop in the same queue this
+check is watching.
+
+On that host, as a user with `sudo`. It needs `curl` (7.55 or newer) and `jq`
+(`sudo apt-get install -y curl jq`, or `dnf`). First the key: any credential
+with scope `read`. It goes into a root-only file, not into the script, the
+Monit config or the command line, so it does not show in `ps`:
+
+```bash
+sudo install -D -m 0600 -o root -g root /dev/null /etc/alertloop/stats-check.header
+sudoedit /etc/alertloop/stats-check.header
+```
+
+A monitor that runs checks as its own user (NRPE and Icinga run them as
+`nagios`) needs its group to read the file:
+
+```bash
+sudo chgrp nagios /etc/alertloop/stats-check.header && sudo chmod 0640 /etc/alertloop/stats-check.header
+```
+
+One line, the key written literally after the colon and a space:
+
+```text
+X-API-Key: <your read key>
+```
+
+Then the script:
+
+```bash
+sudo tee /usr/local/bin/alertloop-stats-check >/dev/null <<'EOF'
+#!/bin/sh
+# Exit 0 when AlertLoop's delivery queue is healthy, 2 otherwise.
+# Usage: alertloop-stats-check [BASE_URL]    (default http://127.0.0.1:8080)
+url="${1:-http://127.0.0.1:8080}"
+url="${url%/}/v1/stats"
+stats=$(curl -fsS --max-time 10 -H @/etc/alertloop/stats-check.header "$url" 2>&1) || {
+  echo "CRITICAL: $url did not answer: $stats"; exit 2; }
+[ -n "$stats" ] || { echo "CRITICAL: $url answered with an empty body"; exit 2; }
+problems=$(printf '%s\n' "$stats" | jq -r '[
+  if .worker_last_tick_at == null then "no worker has polled the queue"
+  elif now - (.worker_last_tick_at | fromdateiso8601) >= 120
+    then "the worker last polled at \(.worker_last_tick_at)" else empty end,
+  if (.oldest_due_delivery_age_seconds // 0) >= 300
+    then "a delivery has been due for \(.oldest_due_delivery_age_seconds) s" else empty end,
+  if .dead_letter_last_24h > 0
+    then "\(.dead_letter_last_24h) dead letter(s) in the last 24 h" else empty end
+  ] | join("; ")' 2>&1) || { echo "CRITICAL: unexpected answer from $url: $problems"; exit 2; }
+if [ -n "$problems" ]; then echo "CRITICAL: $problems"; exit 2; fi
+echo "OK"
+EOF
+sudo chmod 755 /usr/local/bin/alertloop-stats-check
+sudo /usr/local/bin/alertloop-stats-check https://alerts.example.com; echo "exit $?"
+```
+
+Run it with `sudo`: the key file is readable by root only. A new install with
+no worker running yet prints `CRITICAL: no worker has polled the queue`; a wrong
+key prints `... did not answer: curl: (22) ... 401`.
+
+**Monit** runs programs as root, without a shell and without your environment;
+the script needs neither. Put this into `/etc/monit/conf.d/alertloop-stats`
+(`/etc/monit.d/` on the RHEL family), then `sudo monit reload`:
+
+```text
+check program alertloop-stats
+    with path "/usr/local/bin/alertloop-stats-check https://alerts.example.com"
+    with timeout 20 seconds
+  if status != 0 for 2 cycles then alert
+```
+
+`alert` goes to Monit's own mail (`set mailserver` and `set alert` in
+`monitrc`). Do not add `exec alertloop-monit` here, for the reason above. On the
+AlertLoop host itself, drop the URL from `path`.
+
+**cron** mails whatever a job prints and ignores its exit code, so keep the
+output only on failure. The command writes `/etc/cron.d/alertloop-stats`
+owned by root, mode 0644 and ending in a newline, as cron requires; the
+sixth field is the user:
+
+```bash
+printf '%s\n' 'MAILTO=ops@example.com' \
+  '*/5 * * * * root out=$(/usr/local/bin/alertloop-stats-check https://alerts.example.com) || echo "$out"' |
+  sudo tee /etc/cron.d/alertloop-stats >/dev/null
+```
+
+cron mails nothing while the check passes, and one line every five minutes
+while it fails. cron hands the output to the host's mail transfer agent, and
+many minimal servers have none: make it fail once on purpose (a URL with a
+closed port, such as `http://127.0.0.1:9`) and confirm the mail arrives.
+
+#### When `dead_letter_last_24h` stays above 0
+
+The count covers attempts that dead-lettered in the last 24 hours and are still
+`dead_letter`. It drops only when the attempt is replayed and leaves
+`dead_letter`, when 24 hours pass, or when retention deletes its event. There is no way to acknowledge a dead letter.
+So:
+
+- **You decided not to replay** (the channel is gone, the loss is accepted):
+  the check stays red for up to 24 hours after the last one. Silence it in your
+  monitor for that time (`sudo monit unmonitor alertloop-stats`, and
+  `sudo monit monitor alertloop-stats` the next day; both need `set httpd` in
+  `monitrc` — see the Monit README), and write down why.
+- **The reverse:** a dead letter nobody replays drops out of the count after 24
+  hours and the check turns green, although the notification is still lost.
+  `deliveries.dead_letter` and `/v1/delivery-attempts?state=dead_letter` show
+  every one of them until retention deletes it.
+- **Right after upgrading from 0.6.x** the check can be red at once: attempts
+  that the old version dead-lettered in the last 24 hours count too.
+
+Not every `pending` row waits for the worker: a recovery waits for its alert,
+and one whose alert dead-lettered (or whose channel was removed from the
+config) stays `pending` until that alert is replayed and sent, or until
+retention removes the incident. Such a recovery is not due, so it does not
+raise `oldest_due_delivery_age_seconds`. List them with
+`/v1/delivery-attempts?kind=recovery&state=pending` and check the alert of the
+same `event_id` and `channel_name` (`?kind=alert&event_id=<id>`).
+
+`open_incidents` counts incidents that are not resolved. It is a signal about
+your team, not about AlertLoop: it grows when nobody resolves anything.
+
+Event sources getting 429: the per-IP limit (`rate_limit.per_ip_*`) counts
+IPv6 clients by /64, so sources that share one /64 share one bucket. Behind
+the shipped `nginx.conf` the proxy answers 429 itself, with a zone equal to
+`rate_limit.per_ip_*`: those requests are in nginx's access log, not in
+AlertLoop's.
 
 ### The failure that AlertLoop cannot report
 
@@ -209,8 +357,23 @@ docker inspect --format '{{.LogPath}}' alertloop-worker-1
 It is readable, but it is not what you want to work with: the path changes
 whenever the container is recreated, reading it needs root, and every line is
 wrapped in JSON. The Compose file caps it at 10 MB × 3 per container
-(`x-logging`), so it cannot fill the disk. Point the driver elsewhere — journald,
-or a collector — by editing that anchor; `max-size`/`max-file` apply to the
+(`x-logging`), so it cannot fill the disk.
+
+How far back that goes depends on traffic. The api container writes one line of
+about 220 bytes per API request, `/health/*` excluded; the health checks add
+nothing. 20–30 MB is therefore about 100,000 requests: 1,000 events and a
+once-a-minute `/v1/stats` check a day keep about five weeks, 10,000 events a day
+about a week, 100,000 a day one day. For more, raise `max-size` or `max-file` in
+the `x-logging` anchor and recreate the containers
+(`docker compose up -d --force-recreate --wait --wait-timeout 120`), or write
+plain log files (below). The worker writes one line of about 350 bytes (more
+with a long error) per
+delivery attempt, sent or failed, so its 20–30 MB hold roughly 70,000
+attempts — per event, one per channel it is routed to: after a long
+outage with a backlog the oldest worker lines are the first to go. Save them
+while you investigate (`docker compose logs --no-color worker > worker.log`).
+Point the driver elsewhere — journald, or a
+collector — by editing that anchor; `max-size`/`max-file` apply to the
 `json-file` and `local` drivers only.
 
 ### Docker: plain log files on the host
@@ -293,13 +456,46 @@ Things that bite here, all of them real:
 
 ### What to grep for
 
-| Looking for | Grep |
-|---|---|
-| A delivery that never arrived | `grep "delivery " logs/worker.log` |
-| Exhausted retries | `grep "dead-lettered" logs/worker.log` |
-| Events stored but delivered nowhere | `grep "matched no routing rule"` |
-| Misuse of the incident lifecycle | `grep "status=firing on a non-incident"` |
-| Startup configuration decisions | first ~20 lines after a restart |
+The patterns depend on `log.format`: `text` writes `key=value`, `json` writes
+`"key":"value"`. A `text` pattern finds nothing in a `json` log, and grep says
+nothing about it, so check which format your config has first.
+
+| Looking for | `format: text` | `format: json` |
+|---|---|---|
+| A delivery that never arrived | `grep "delivery " logs/worker.log` | the same |
+| Exhausted retries | `grep "dead-lettered" logs/worker.log` | the same |
+| Deliveries to one channel | `grep "channel_name=ops-hook" logs/worker.log` | `grep '"channel_name":"ops-hook"' logs/worker.log` |
+| Recovery notices queued at a resolve (`channels=0`: no channel had the alert) | `grep "recovery notices queued" logs/api.log` | the same |
+| Events stored but delivered nowhere | `grep "matched no routing rule" logs/api.log` | the same |
+| Misuse of the incident lifecycle | `grep "status=firing on a non-incident" logs/api.log` | the same |
+| Startup configuration decisions | first ~20 lines after a restart | the same |
+| Requests from one client | `grep -w "client_ip=203.0.113.7" logs/api.log` | `grep '"client_ip":"203.0.113.7"' logs/api.log` |
+| Requests made with one API key | `grep "credential=<key id>" logs/api.log` | `grep '"credential":"<key id>"' logs/api.log` |
+| Requests made with the admin token | `grep "credential=admin" logs/api.log` | `grep '"credential":"admin"' logs/api.log` |
+
+`logs/api.log` and `logs/worker.log` are the Compose files from the section
+above. In other layouts, feed the same pattern from where the lines are:
+
+```bash
+sudo journalctl -u alertloop --no-pager | grep "credential=admin"   # systemd, stdout
+sudo grep "credential=admin" /var/log/alertloop/alertloop.log         # systemd with log.file: one file, api and worker together
+docker compose logs --no-color api | grep "credential=admin"        # Compose without log files (demo profile: service alertloop)
+```
+
+Every request line (`msg=http`) carries `client_ip`: the address the per-IP
+rate limiter counts, which behind a reverse proxy is the real client only
+when `rate_limit.trusted_proxies` lists that proxy. An authenticated request
+also carries `credential` and `scope`; a request refused with 403 (wrong scope)
+carries them too. A request refused with 401 carries only `client_ip`: which
+key was tried is not logged. For an API key, `credential` is its key id, the
+first 8 hex digits of its SHA-256; the key itself is never logged. The key id
+of a key, on Linux:
+
+```bash
+printf %s "$KEY" | sha256sum | cut -c1-8          # macOS: shasum -a 256 instead of sha256sum
+```
+
+Use `printf %s`, not `echo`: `echo` adds a newline, and the id comes out wrong.
 
 Set `format: json` when a collector reads the file, and keep `level: info`
 unless you are chasing something specific — `debug` logs every routed event.
@@ -308,104 +504,254 @@ unless you are chasing something specific — `debug` logs every routed event.
 
 ## Backup and restore
 
-**What is in the database:** events, delivery attempts, and the migration
-ledger. **What is not:** your configuration. `alertloop.yaml` and the secrets it
+**What is in the database:** events, delivery attempts, the worker's last
+tick, and the migration ledger. **What is not:** your configuration. `alertloop.yaml` and the secrets it
 references are not in the database and must be backed up separately — losing
 them costs you your channels, API keys, and admin token.
 
 Restoring a backup does **not** re-send anything. Delivery attempts come back in
 the state they were saved in; anything that was `sent` stays sent.
 
-### SQLite
+`deploy/backup/alertloop-backup` backs up every production install. It writes
+the copy readable by its owner only (umask 077), checks it before giving it its
+final name (`PRAGMA integrity_check` for SQLite, `pg_restore --list` for a
+dump, and for both that the copy holds AlertLoop's first migration `0001_init`
+and its `events` and `delivery_attempts` tables: an empty database, or
+someone else's, is refused), prints its path and deletes copies older than
+`KEEP_DAYS` days (default 14). A second run in the same second fails rather
+than replace the first one's copy; the directory must be on a file system
+with hard links (not vfat or SMB). A
+failed run exits non-zero and leaves no `alertloop-*` file behind. The
+copies sit on the same disk as the database: copy the directory off the host
+with the tool you use for everything else.
 
-The database runs in WAL mode, so it is **not** one file: copying `alertloop.db`
-while the service is running gives you a torn backup that is missing everything
-in `alertloop.db-wal`. Use one of these instead.
+The Compose `demo` profile has no recipe: it is for trying AlertLoop, not for
+keeping data.
 
-**Online, service running** (preferred — atomic, no downtime):
+**Monit self-check installed** (`integrations/monit`, systemd only): it starts a
+stopped AlertLoop two cycles later, in the middle of a restore. The systemd
+restore and downgrade commands below therefore stop Monit itself first and start
+it again at the end; on a host without Monit those two lines do nothing. Monit
+is stopped rather than told `monit unmonitor`: that command needs `set httpd` in
+`monitrc`, which Debian and Ubuntu ship commented out, and without it the error
+scrolls past while the restore goes on. Monit's other checks on the host pause
+for the same few minutes.
 
-```bash
-sqlite3 /var/lib/alertloop/alertloop.db \
-  ".backup '/var/backups/alertloop-$(date -u +%Y%m%dT%H%M%SZ).db'"
-```
+### systemd, SQLite
 
-`VACUUM INTO '/var/backups/…'` works too and additionally compacts the file.
-
-**Offline:**
-
-```bash
-systemctl stop alertloop
-cp /var/lib/alertloop/alertloop.db* /var/backups/   # .db, .db-wal, .db-shm
-systemctl start alertloop
-```
-
-**Restore:**
-
-```bash
-systemctl stop alertloop
-cp /var/backups/alertloop-20260822T090000Z.db /var/lib/alertloop/alertloop.db
-rm -f /var/lib/alertloop/alertloop.db-wal /var/lib/alertloop/alertloop.db-shm
-chown alertloop:alertloop /var/lib/alertloop/alertloop.db
-systemctl start alertloop
-```
-
-Deleting the stale `-wal` and `-shm` files matters: left behind, they belong to
-the database you just replaced.
-
-### PostgreSQL
+On the server, in the clone checked out at the release you run, as a user with
+`sudo`:
 
 ```bash
-# Backup (custom format, compressed, restorable selectively)
-docker compose exec -T postgres \
-  pg_dump -U alertloop -Fc alertloop > alertloop-$(date -u +%Y%m%dT%H%M%SZ).dump
-
-# Restore into an empty database
-docker compose exec -T postgres \
-  pg_restore -U alertloop -d alertloop --clean --if-exists < alertloop-20260822T090000Z.dump
+sudo apt-get install -y sqlite3
+sudo install -m 0755 deploy/backup/alertloop-backup /usr/local/bin/
+sudo install -m 0644 deploy/backup/alertloop-backup.service deploy/backup/alertloop-backup.timer /etc/systemd/system/
+sudo install -d -m 0700 -o alertloop -g alertloop /var/backups/alertloop
+sudo systemctl daemon-reload
+sudo systemctl enable --now alertloop-backup.timer
+sudo systemctl start alertloop-backup.service && ls -l /var/backups/alertloop
 ```
 
-Without Docker, the same commands run against your own PostgreSQL host with
-`-h`/`-p`. For a real production estate, prefer your provider's snapshot or
-point-in-time recovery over a dump on a timer.
+The timer runs daily at 03:15 (up to 15 minutes later) and catches up at boot
+after a missed run. It is a timer rather than cron because the backup must run
+as `alertloop`: `sqlite3` run as root can leave root-owned `-wal`/`-shm` files
+that AlertLoop can no longer open. Failures are in
+`journalctl -u alertloop-backup`. To keep 30 days instead of 14:
+`echo "KEEP_DAYS='30'" | sudo tee -a /etc/alertloop/backup.env`.
 
-**Restore checklist, either engine:**
+`sqlite3 .backup` copies a consistent snapshot while AlertLoop runs. Copying
+`alertloop.db` itself does not: the database runs in WAL mode, and recent writes
+are still in `alertloop.db-wal`.
 
-1. Stop the AlertLoop processes first. Restoring under a running worker means
-   restoring under something that is writing.
-2. Restore.
-3. Start AlertLoop. Migrations run at startup, so a backup from an older version
-   is migrated forward — expected and safe.
-4. `curl /health/ready`, then `/v1/stats` — compare the counts to what you
+Restore:
+
+```bash
+command -v monit >/dev/null && sudo systemctl stop monit
+sudo systemctl stop alertloop
+sudo install -m 0600 -o alertloop -g alertloop /var/backups/alertloop/alertloop-<stamp>.db /var/lib/alertloop/alertloop.db
+sudo rm -f /var/lib/alertloop/alertloop.db-wal /var/lib/alertloop/alertloop.db-shm
+sudo systemctl start alertloop
+command -v monit >/dev/null && sudo systemctl start monit
+```
+
+The `-wal` and `-shm` files left behind belong to the database you replaced.
+
+### systemd, PostgreSQL
+
+Same place, same user. `pg_dump` must be the server's major version or newer:
+Ubuntu 24.04's `postgresql-client` is 16, so a PostgreSQL 17 server needs
+`postgresql-client-17` from the PostgreSQL apt repository
+(<https://www.postgresql.org/download/linux/ubuntu/>) — otherwise every run
+fails, and only the journal says so. `pg_dump --version` shows what runs.
+
+`backup.env` holds the connection from `database.dsn`, one `NAME='value'` per
+line, **every value in single quotes**, the password decoded (`%40` in a URL
+DSN is `@` here). systemd reads this file for the backup and `sh` reads it for
+the restore; in single quotes both take `$`, `#`, `\` and spaces as written,
+without quotes they do not agree. A password that contains `'` cannot be
+written this way: change it in PostgreSQL
+(`ALTER ROLE <PGUSER> PASSWORD '<output of openssl rand -hex 32>'`), then in
+`database.dsn` and in `backup.env`, and restart AlertLoop. Every password
+change touches those three places; a stale `backup.env` shows only in
+`journalctl -u alertloop-backup`.
+
+```bash
+sudo apt-get install -y postgresql-client
+sudo install -m 0755 deploy/backup/alertloop-backup /usr/local/bin/
+sudo install -m 0644 deploy/backup/alertloop-backup.service deploy/backup/alertloop-backup.timer /etc/systemd/system/
+sudo install -d -m 0700 -o alertloop -g alertloop /var/backups/alertloop
+sudo install -m 0600 /dev/null /etc/alertloop/backup.env
+sudoedit /etc/alertloop/backup.env    # PGHOST='...'  PGPORT='5432'  PGUSER='...'  PGPASSWORD='...'  PGDATABASE='alertloop', one per line
+sudo mkdir -p /etc/systemd/system/alertloop-backup.service.d
+printf '[Service]\nExecStart=\nExecStart=/usr/local/bin/alertloop-backup postgres /var/backups/alertloop\n' |
+  sudo tee /etc/systemd/system/alertloop-backup.service.d/postgres.conf
+sudo systemctl daemon-reload
+sudo systemctl enable --now alertloop-backup.timer
+sudo systemctl start alertloop-backup.service && ls -l /var/backups/alertloop
+```
+
+Schedule, failures and `KEEP_DAYS` are as for SQLite. With a managed
+PostgreSQL, the provider's snapshots or point-in-time recovery are better than
+a dump on a timer.
+
+Restore:
+
+```bash
+command -v monit >/dev/null && sudo systemctl stop monit
+sudo systemctl stop alertloop
+sudo sh -c 'set -a; . /etc/alertloop/backup.env;
+  pg_restore --clean --if-exists -d "$PGDATABASE" /var/backups/alertloop/alertloop-<stamp>.dump'
+sudo systemctl start alertloop
+command -v monit >/dev/null && sudo systemctl start monit
+```
+
+### Docker Compose, PostgreSQL
+
+On the server, as a user in the `docker` group; the clone is `~/alertloop`
+(substitute yours). The first run checks the recipe, the second line schedules it.
+The script is run through `sh`, so it works whatever file mode the clone gave it:
+
+```bash
+mkdir -m 700 ~/alertloop-backups
+sh ~/alertloop/deploy/backup/alertloop-backup compose ~/alertloop ~/alertloop-backups
+(crontab -l 2>/dev/null; echo '15 3 * * * sh $HOME/alertloop/deploy/backup/alertloop-backup compose $HOME/alertloop $HOME/alertloop-backups >/dev/null') | crontab -
+```
+
+Cron rather than a timer: the recipe then needs no root and no unit files, only
+the `docker` group. Cron mails a failure to the user if the host has mail;
+otherwise look at `ls -lt ~/alertloop-backups`. `KEEP_DAYS=30` in front of the
+command in the crontab line keeps 30 days.
+
+Restore, in the clone:
+
+```bash
+docker compose stop api worker
+docker compose exec -T postgres pg_restore -U alertloop -d alertloop --clean --if-exists < ~/alertloop-backups/alertloop-<stamp>.dump
+docker compose up -d --wait --wait-timeout 120
+```
+
+### Noticing that backups stopped
+
+A timer or a crontab line that stops running says nothing. One command answers
+"is there a copy from the last 25 hours", with exit code 1 and a line when
+there is not:
+
+```bash
+sudo find /var/backups/alertloop -name 'alertloop-*' -mmin -1500 | grep -q . || { echo 'no AlertLoop backup in 25 hours'; false; }   # systemd
+find ~/alertloop-backups -name 'alertloop-*' -mmin -1500 | grep -q . || { echo 'no AlertLoop backup in 25 hours'; false; }             # Compose
+```
+
+Run it on the AlertLoop host, where the copies are, with the same alerting on
+a non-zero exit as the [check script](#a-check-script).
+
+### After a restore
+
+1. Stop AlertLoop before restoring, as the commands above do: restoring under a
+   running worker is restoring under something that writes.
+2. Migrations run at startup, so a backup from an older version is migrated
+   forward. A backup from a newer version is refused
+   ([Upgrades and downgrades](#upgrades-and-downgrades)).
+3. `curl /health/ready`, then `/v1/stats` — compare the counts to what you
    expect — and send one test event.
 
 ### Verify the backup, not the backup job
 
 A backup nobody has restored is a hypothesis. At least once, restore it next to
-production, not over it, and start AlertLoop against the copy. For a binary
-install: a separate config pointing at the restored copy, on a port of its own,
-so the production process cannot answer the check in its place:
+production, not over it, and start AlertLoop against the copy on a port of its
+own, so the production process cannot answer the check in its place. The counts
+in `/v1/stats` are the check: `/health/ready` only pings the database, so an
+empty one (a DSN typo, a restore that never ran) answers `ready` too.
+
+**systemd, SQLite** — on the server, as a user with `sudo`, from any directory:
 
 ```bash
-alertloop --config /tmp/restore-check.yaml server   # database.dsn -> the restored copy, addr: "127.0.0.1:18080"
-curl -s localhost:18080/health/ready
-curl -s -H "X-API-Key: $TOKEN" localhost:18080/v1/stats    # compare with production
+TOKEN="$(sudo grep '^ALERTLOOP_ADMIN_TOKEN=' /etc/alertloop/alertloop.env | cut -d= -f2-)"
+D="$(mktemp -d)"
+sudo install -m 0600 -o "$USER" /var/backups/alertloop/alertloop-<stamp>.db "$D/alertloop.db"
+cat > "$D/check.yaml" <<EOF
+addr: "127.0.0.1:18080"
+admin_token: \${ALERTLOOP_ADMIN_TOKEN}
+database: {driver: sqlite, dsn: "$D/alertloop.db"}
+EOF
+ALERTLOOP_ADMIN_TOKEN="$TOKEN" /usr/local/bin/alertloop --config "$D/check.yaml" server &
+sleep 2
+curl -s -H "X-API-Key: $TOKEN" http://127.0.0.1:18080/v1/stats    # the copy
+curl -s -H "X-API-Key: $TOKEN" http://127.0.0.1:8080/v1/stats     # production
+kill %1; rm -rf "$D"
 ```
 
-The counts in `/v1/stats` are the check. `/health/ready` only pings the
-database, so an empty one (a DSN typo, a restore that never ran) answers
-`ready` too.
+**systemd, PostgreSQL** — the same, with the dump restored into a scratch
+database `alertloop_check` next to production. The connection comes from
+`backup.env`, read into this shell; the check config names only the database,
+and the driver takes host, user and password from those variables. `PGUSER`
+must be allowed to create databases; if it is not, on the database server:
+`sudo -u postgres psql -c 'ALTER ROLE <PGUSER> CREATEDB'` before the check and
+`... NOCREATEDB'` after it. `createdb` and `dropdb` connect to `$PGDATABASE`,
+not to the `postgres` database.
 
-Under Docker a second clone is not separate by itself: `docker-compose.yml`
-sets the project name `alertloop`, so `docker compose up` in any directory
-recreates the production containers, and `pg_restore` there lands in the
-production database. In the second clone's `.env` set `COMPOSE_PROJECT_NAME` to
-another name and `ALERTLOOP_PORT` to a free port, comment out any
-`ALERTLOOP_LOG_FILE_*` lines, and continue only if
-`docker compose config | grep '^name:'` prints the new name. Then start
-`postgres`, restore into it with the command above, and start `api` alone, not
-the worker: it would deliver the restored queue to your real channels.
-Compare `/v1/stats` on the new port with production; `docker compose down -v`
-in that clone removes the check.
+```bash
+TOKEN="$(sudo grep '^ALERTLOOP_ADMIN_TOKEN=' /etc/alertloop/alertloop.env | cut -d= -f2-)"
+D="$(mktemp -d)"
+set -a; eval "$(sudo cat /etc/alertloop/backup.env)"; set +a
+dropdb --if-exists --maintenance-db="$PGDATABASE" alertloop_check   # left by an interrupted check
+createdb --maintenance-db="$PGDATABASE" alertloop_check
+sudo cat /var/backups/alertloop/alertloop-<stamp>.dump | pg_restore --no-owner -d alertloop_check
+cat > "$D/check.yaml" <<'EOF'
+addr: "127.0.0.1:18080"
+admin_token: ${ALERTLOOP_ADMIN_TOKEN}
+database: {driver: postgres, dsn: "dbname=alertloop_check"}
+EOF
+ALERTLOOP_ADMIN_TOKEN="$TOKEN" /usr/local/bin/alertloop --config "$D/check.yaml" server &
+sleep 2
+curl -s -H "X-API-Key: $TOKEN" http://127.0.0.1:18080/v1/stats    # the copy
+curl -s -H "X-API-Key: $TOKEN" http://127.0.0.1:8080/v1/stats     # production
+kill %1; wait; dropdb --maintenance-db="$PGDATABASE" alertloop_check; rm -rf "$D"
+unset PGHOST PGPORT PGUSER PGPASSWORD PGDATABASE
+```
+
+**Docker Compose** — a second clone under a project name of its own. A clone
+by itself is not separate: `docker-compose.yml` sets the project name
+`alertloop`, and an exported `COMPOSE_PROJECT_NAME` overrides both that and
+`.env`, so a plain `docker compose up` in any directory can recreate the
+production containers. Every command below therefore passes
+`-p alertloop-check`, which overrides all of them: nothing in the block can
+reach the production containers or their volumes. In your home directory, as
+the same user:
+
+```bash
+git clone https://github.com/golovanov-dev/alertloop.git ~/alertloop-check && cd ~/alertloop-check
+git checkout "$(git -C ~/alertloop describe --tags)"
+cp ~/alertloop/.env ~/alertloop/alertloop.yaml .
+sed -i '/^ALERTLOOP_PORT=/d; /^ALERTLOOP_LOG_FILE_/d' .env
+echo 'ALERTLOOP_PORT=18080' >> .env
+docker compose -p alertloop-check up -d --wait postgres
+docker compose -p alertloop-check exec -T postgres pg_restore -U alertloop -d alertloop --clean --if-exists < ~/alertloop-backups/alertloop-<stamp>.dump
+docker compose -p alertloop-check up -d --wait --no-deps api    # not the worker: it would deliver the restored queue to your channels
+TOKEN="$(grep '^ALERTLOOP_ADMIN_TOKEN=' .env | cut -d= -f2-)"
+curl -s -H "X-API-Key: $TOKEN" http://127.0.0.1:18080/v1/stats    # the copy
+curl -s -H "X-API-Key: $TOKEN" http://127.0.0.1:8080/v1/stats     # production (its ALERTLOOP_PORT)
+docker compose -p alertloop-check down -v && cd && rm -rf ~/alertloop-check
+```
 
 ---
 
@@ -419,7 +765,9 @@ first: they name each change that needs an action. Skipping versions is fine.
 2. Put the new version in place without restarting.
    **Compose:** check out the release tag, set `ALERTLOOP_IMAGE` in `.env` to
    it, run `docker compose pull`.
-   **systemd:** `sudo bash deploy/systemd/install.sh <new binary>`.
+   **systemd:** `sudo bash deploy/systemd/install.sh <new binary>`. It keeps the
+   binary and the unit it replaces as `/usr/local/bin/alertloop.prev` and
+   `/etc/systemd/system/alertloop.service.prev` (one copy, the one before).
 3. Run `check-db` ([Container health checks](#container-health-checks)): it
    loads your config with the new version and names that version. Fix what it
    reports.
@@ -428,8 +776,73 @@ first: they name each change that needs an action. Skipping versions is fine.
 5. Confirm the version with `GET /v1/info` and the counts with `GET /v1/stats`.
 
 `server` and `worker` run as separate processes must run the same version.
-**Downgrading is not supported**: the way back is to stop, restore the backup
-taken before the upgrade, and start the old version.
+
+**Downgrading is not supported.** Every role and `check-db` refuse to start on
+a database that has migrations the binary does not know, and name them. The way
+back is to stop, restore the backup taken before the upgrade, and start the old
+version. A version that added no migration (its CHANGELOG entry says when it
+does) goes back without the restore. The old version under systemd:
+
+```bash
+command -v monit >/dev/null && sudo systemctl stop monit
+sudo systemctl stop alertloop
+sudo mv /usr/local/bin/alertloop.prev /usr/local/bin/alertloop
+sudo mv /etc/systemd/system/alertloop.service.prev /etc/systemd/system/alertloop.service   # if it exists
+sudo systemctl daemon-reload && sudo systemctl start alertloop
+command -v monit >/dev/null && sudo systemctl start monit
+```
+
+Under Compose: check out the old tag, set `ALERTLOOP_IMAGE` back, and
+`docker compose up -d --wait --wait-timeout 120`. Going back below 0.7.0 with
+an `alertloop.yaml` taken from the 0.7.0 example: images before 0.7.0 do not
+set `ALERTLOOP_ADDR`, so `addr: ${ALERTLOOP_ADDR:-127.0.0.1:8080}` makes the api
+listen on the container's own loopback. Every container reports healthy, and
+the published port does not answer. Put `addr: ":8080"` in `alertloop.yaml`
+before the `up`, and check with
+`curl http://127.0.0.1:<ALERTLOOP_PORT>/health/ready` from the host, not with
+`docker compose ps`.
+
+---
+
+## The delivery worker
+
+- **`worker.concurrency`** (default 2) is how many sends run at once. With
+  two or more channels configured, one channel takes at most
+  `concurrency - 1` of them (at least 1), so one hung channel still leaves a
+  slot for the others. A hung channel does hold its whole share: every slot it
+  may take waits out its `timeout`. Two or more channels hanging at the same
+  time, each with a backlog, can take every slot at any `concurrency`; the
+  channels that work then wait up to a hung channel's `timeout` per attempt
+  for as long as the hung channels have attempts due. With a single channel
+  configured, it may use every slot. With `concurrency: 1` there is no spare
+  slot: each attempt to a hung channel delays every other channel by up to
+  that channel's `timeout`. With more than one channel, keep it at 2 or more;
+  the worker logs a warning at startup otherwise.
+- **Each attempt gets the channel's `timeout`** (default 10s), and nothing
+  shorter.
+- **An attempt stuck in `sending`** because its worker was killed goes back to
+  the queue once it has been there for twice the longest channel `timeout`
+  (at least 5 minutes); the reaper looks every half of that time, so it can
+  take up to half as long again.
+- **An alert of a muted incident** that does not go out becomes `cancelled`
+  instead of `failed`, `dead_letter` or `pending`: one that fails, one cut
+  short at stop, one taken back from a dead worker. It is not retried. The
+  check is the incident's state when that outcome is written: an incident
+  acknowledged or resolved while the send was in flight no longer counts as
+  muted, the alert is retried, and after a resolve no recovery follows it. An alert
+  that went out stays `sent`, also one whose send finished after the mute. A `dead_letter` alert
+  is not cancelled by mute; replaying it sends it. Recovery notices are never
+  cancelled.
+- **On stop** (SIGTERM, `docker stop`) the worker claims nothing new and gives
+  sends in flight 5 seconds to finish. Sends still running then, on any
+  channel type, are cancelled and return to `pending` with their attempt count
+  unchanged. Delivery is at-least-once: a receiver that had already got a
+  cancelled send gets it again.
+- **The time allowed to stop** is set outside AlertLoop: `stop_grace_period`
+  in Compose, `docker stop -t`, `TimeoutStopSec` in systemd. The worker needs
+  about 9 seconds at worst: 5 for sends, up to 3 to save their results and up
+  to 1 to finish taking attempts. The defaults (10 s for Docker, 90 s for
+  systemd) fit it.
 
 ---
 
@@ -437,7 +850,7 @@ taken before the upgrade, and start the old version.
 
 ### A channel has been down for a day
 
-**Symptom:** `deliveries.dead_letter` is climbing; the admin console's Deliveries
+**Symptom:** `dead_letter_last_24h` in `/v1/stats` is above 0; the admin console's Deliveries
 screen shows failures on one channel.
 
 **What you have lost:** every notification routed only to that channel since it
@@ -467,6 +880,9 @@ delivery separately for exactly this reason.
      "http://127.0.0.1:8080/v1/delivery-attempts/$ID/replay"
    ```
 
+   A replayed attempt starts over with `attempts` at 0 and gets the full
+   `max_attempts` retries again.
+
    The Deliveries screen in `/admin` has a Replay button. Replay one first and confirm it
    arrives before replaying a hundred.
 
@@ -474,7 +890,7 @@ delivery separately for exactly this reason.
    deleted along with their delivery attempts. A channel that has been broken
    for longer than that has lost the oldest ones permanently.
 
-**Prevent the repeat:** alert on `deliveries.dead_letter` (see above). A day is
+**Prevent the repeat:** alert on `dead_letter_last_24h` (see above). A day is
 far too long to find out by looking.
 
 ### The disk filled up
@@ -546,7 +962,7 @@ ingestion as something to retry.
 5. Once the database is back, AlertLoop reconnects on its own — no restart is
    needed, though a restart is harmless. Pending deliveries resume; anything
    left stuck in `sending` by a worker that died is requeued automatically
-   within five minutes by the reaper.
+   (see [The delivery worker](#the-delivery-worker)).
 
 ### Changing the database password
 
