@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.7.0 - Unreleased
+## 0.7.0 - 2026-09-23
 
 ### Added
 
@@ -47,10 +47,11 @@
 - A `firing` that raises an open incident's severity alerts the channels the
   new severity routes to that have not had an alert yet.
 - Replaying a dead-lettered delivery starts a new cycle of retries.
-- `POST /v1/events` returns `outcome`. A body over 512 KiB gets 413.
+- `POST /v1/events` returns `outcome`. A body over 512 KiB gets 413, over
+  64 KiB for `POST /v1/routing/preview`.
 - `GET /v1/events` and `GET /v1/delivery-attempts` return 400 for a filter
-  value outside its enum, a `limit` that is not a positive integer, and text
-  that is not valid UTF-8.
+  value outside its enum and a `limit` that is not a positive integer;
+  `GET /v1/events` also for `source` or `q` that is not valid UTF-8.
 - The worker's delivery log lines: `channel` is the channel type, the name is
   in `channel_name`.
 - Config: an unknown `log.level` or `log.format` is an error, and the worker
@@ -74,7 +75,9 @@
 ### Fixed
 
 - One channel that hangs or is down no longer delays notifications to the other
-  channels. The 0.4.0 entry called this fixed; it was not.
+  channels. The 0.4.0 entry called this fixed; it was not. With
+  `worker.concurrency: 1` there is no spare slot: keep it at 2 (the default)
+  when you have several channels; the worker warns at startup.
 - Two earlier entries claimed more than the code did: a muted incident closed
   by its source sent a recovery notice (0.4.0), and `check-db` missed several
   startup refusals (0.6.0). Both now hold.

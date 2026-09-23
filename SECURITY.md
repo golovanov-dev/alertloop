@@ -8,8 +8,8 @@ please report it privately first.
 
 | Version | Supported |
 |---|---|
-| 0.6.x | ✅ current |
-| ≤ 0.5.x | ❌ upgrade |
+| 0.7.x | ✅ current |
+| ≤ 0.6.x | ❌ upgrade |
 
 Before 1.0.0 only the latest minor line is supported. A fix ships as a patch
 release of that line and is not backported: upgrading within 0.x is the fix.

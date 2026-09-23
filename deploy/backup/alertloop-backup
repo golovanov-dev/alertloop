@@ -80,10 +80,10 @@ esac
 # An empty database, or someone else's, backs up without an error. A copy
 # without AlertLoop's first migration and its two tables is not a backup of
 # AlertLoop.
-[ "$ledger" -eq 1 ] && [ "$found" -eq 2 ] || {
+if [ "$ledger" -ne 1 ] || [ "$found" -ne 2 ]; then
   echo "alertloop-backup: the copy has no AlertLoop migration 0001_init or no events and delivery_attempts tables: not an AlertLoop database, nothing kept" >&2
   exit 1
-}
+fi
 
 # ln refuses an existing name, so a second run in the same second fails instead
 # of replacing the copy the first one made. It also needs a file system with

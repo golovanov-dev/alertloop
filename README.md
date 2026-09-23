@@ -95,7 +95,7 @@ The message arrives in Telegram within a few seconds. If it does not, see
   the flag replaces the value for that one command.
 - Port 8080 taken on the host: set `ALERTLOOP_PORT` in `.env`.
 - The image is pinned: `ALERTLOOP_IMAGE` in `.env` names the release you run
-  (`0.6.1`, without the `v`); without it Compose runs the release of the
+  (`0.7.0`, without the `v`); without it Compose runs the release of the
   checked-out tag, never `:latest`.
 - After editing `alertloop.yaml`, apply it with
   `docker compose up -d --force-recreate --wait --wait-timeout 120 api worker`.

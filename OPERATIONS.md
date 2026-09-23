@@ -792,8 +792,12 @@ sudo systemctl daemon-reload && sudo systemctl start alertloop
 command -v monit >/dev/null && sudo systemctl start monit
 ```
 
-Under Compose: check out the old tag, set `ALERTLOOP_IMAGE` back, and
-`docker compose up -d --wait --wait-timeout 120`. Going back below 0.7.0 with
+Under Compose: check out the old tag, write the old version into `.env`
+explicitly (`ALERTLOOP_IMAGE=ghcr.io/golovanov-dev/alertloop:0.6.1`), run
+`docker compose up -d --wait --wait-timeout 120`, and confirm the version with
+`GET /v1/info`. Before 0.7.0 the `.env.example` line was commented out and the
+Compose file fell back to `:latest`, so "setting it back" to what the old
+example had starts whatever `:latest` is. Going back below 0.7.0 with
 an `alertloop.yaml` taken from the 0.7.0 example: images before 0.7.0 do not
 set `ALERTLOOP_ADDR`, so `addr: ${ALERTLOOP_ADDR:-127.0.0.1:8080}` makes the api
 listen on the container's own loopback. Every container reports healthy, and
