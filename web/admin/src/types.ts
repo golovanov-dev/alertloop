@@ -58,6 +58,8 @@ export interface DeliveryAttempt {
   fallback_of?: AttemptLink;
   /** Set on a dead-lettered alert that was redirected: the attempt on the fallback. */
   fallback_to?: AttemptLink;
+  /** Set on a recovery: the alert attempt it follows; the recovery waits until that alert is sent. */
+  recovery_for?: AttemptLink;
 }
 
 export interface AttemptLink {

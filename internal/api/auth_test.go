@@ -191,6 +191,7 @@ func TestSignInTransport(t *testing.T) {
 		{"private network (Compose gateway), plain HTTP", "172.18.0.1:5000", "", 200, false},
 		{"public address, plain HTTP", "203.0.113.5:5000", "", 403, false},
 		{"trusted proxy, HTTPS", "10.0.0.1:5000", "https", 200, true},
+		{"trusted proxy that does not report HTTPS", "10.0.0.1:5000", "http", 403, false},
 		{"untrusted peer claiming HTTPS", "203.0.113.5:5000", "https", 403, false},
 	}
 	for _, c := range cases {

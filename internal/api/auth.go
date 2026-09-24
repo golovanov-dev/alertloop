@@ -241,8 +241,8 @@ func (s *Server) signInAllowed(w http.ResponseWriter, r *http.Request) bool {
 	}
 	writeError(w, http.StatusForbidden, "https_required",
 		"sign-in over plain HTTP is accepted only from this machine or a private network (an SSH tunnel, "+
-			"the Compose gateway): open the console over HTTPS (a reverse proxy listed in "+
-			"rate_limit.trusted_proxies) or through an SSH tunnel")
+			"the Compose gateway): open the console over HTTPS through a reverse proxy that is listed in "+
+			"rate_limit.trusted_proxies and sends X-Forwarded-Proto: https, or through an SSH tunnel")
 	return false
 }
 

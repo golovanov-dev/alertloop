@@ -171,12 +171,15 @@ On a server, reach the console one of two ways.
 `/admin`, and `/swagger`. Ready-to-adapt configs: `deploy/proxy/nginx.conf` and
 `deploy/proxy/apache.conf`, both forwarding to `127.0.0.1:8080`. Get a
 certificate with `certbot`. Set `rate_limit.trusted_proxies` in the config to
-the proxy's address, or sign-in through the proxy gets 403, and rate limit on
-the proxy too. The proxy must pass the original `Host` header
-(`proxy_set_header Host $host;` in nginx, `ProxyPreserveHost On` in Apache;
-both shipped configs do) or send `X-Forwarded-Host`, or the console's requests
-get 403. Under Compose the proxy arrives from the Compose network
-gateway, not `127.0.0.1`:
+the proxy's address, and rate limit on the proxy too. The proxy must send
+`X-Forwarded-Proto: https` (`proxy_set_header X-Forwarded-Proto $scheme;` in
+nginx, `RequestHeader set X-Forwarded-Proto "https"` in Apache) and pass the
+original `Host` header (`proxy_set_header Host $host;` in nginx,
+`ProxyPreserveHost On` in Apache) or send `X-Forwarded-Host`; both shipped
+configs do. Without `trusted_proxies` or `X-Forwarded-Proto`, sign-in through
+the proxy gets 403 `https_required`; without `Host`, the console's requests get
+403. Under Compose the proxy arrives from the Compose network gateway, not
+`127.0.0.1`:
 
 ```bash
 docker network inspect alertloop_default -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}'

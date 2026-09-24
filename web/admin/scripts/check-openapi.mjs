@@ -20,8 +20,10 @@ const schemaOf = {
   Severity: "Severity",
   EventState: "EventState",
   DeliveryState: "DeliveryState",
+  ChannelType: "ChannelType",
   AlertEvent: "Event",
   DeliveryAttempt: "DeliveryAttempt",
+  AttemptLink: "AttemptLink",
   Stats: "Stats",
   Info: "Info",
 };
@@ -31,9 +33,16 @@ const spec = parse(readFileSync(specPath, "utf8"), { merge: true });
 const schemas = spec.components.schemas;
 const src = ts.createSourceFile(typesPath, readFileSync(typesPath, "utf8"), ts.ScriptTarget.Latest, true);
 const decls = new Map();
+// `const X = [...] as const`, for types written as (typeof X)[number].
+const consts = new Map();
 for (const s of src.statements) {
   if ((ts.isInterfaceDeclaration(s) || ts.isTypeAliasDeclaration(s)) && s.modifiers?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword)) {
     decls.set(s.name.text, s);
+  }
+  if (ts.isVariableStatement(s)) {
+    for (const v of s.declarationList.declarations) {
+      if (ts.isIdentifier(v.name) && v.initializer) consts.set(v.name.text, v.initializer);
+    }
   }
 }
 
@@ -51,6 +60,18 @@ function fromTS(node, bind = {}) {
     }
     if (rest.length !== 1) return { kind: `union ${node.getText()}`, nullable };
     return { ...fromTS(rest[0], bind), nullable };
+  }
+  if (ts.isParenthesizedTypeNode(node)) return fromTS(node.type, bind);
+  // (typeof X)[number] where X is a `[...] as const` array of string literals.
+  if (ts.isIndexedAccessTypeNode(node) && node.indexType.kind === ts.SyntaxKind.NumberKeyword) {
+    let q = node.objectType;
+    while (ts.isParenthesizedTypeNode(q)) q = q.type;
+    let init = ts.isTypeQueryNode(q) ? consts.get(q.exprName.getText()) : undefined;
+    if (init && ts.isAsExpression(init) && init.type.getText() === "const") init = init.expression;
+    if (init && ts.isArrayLiteralExpression(init) && init.elements.length && init.elements.every(ts.isStringLiteral)) {
+      return { kind: "enum", values: init.elements.map((e) => e.text).sort(), nullable: false };
+    }
+    return { kind: `unsupported ${node.getText()}`, nullable: false };
   }
   if (ts.isArrayTypeNode(node)) return { kind: "array", of: fromTS(node.elementType, bind), nullable: false };
   if (ts.isTypeReferenceNode(node)) {
