@@ -12,7 +12,7 @@ name: alertloop
 
 # The release this file belongs to; ALERTLOOP_IMAGE in .env overrides it.
 # Not :latest: `docker compose pull` would upgrade, and migrations are one-way.
-x-image: &image ${ALERTLOOP_IMAGE:-ghcr.io/golovanov-dev/alertloop:0.7.0}
+x-image: &image ${ALERTLOOP_IMAGE:-ghcr.io/golovanov-dev/alertloop:0.8.0}
 
 # Container log rotation: 10 MB x 3 per container.
 x-logging: &logging

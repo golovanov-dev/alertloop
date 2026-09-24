@@ -1,6 +1,28 @@
 # Changelog
 
-## Unreleased
+## 0.8.0 - 2026-09-24
+
+The admin console signs in with user accounts, a broken channel can hand its
+alerts to a fallback channel, the Monit adapter keeps an event it could not
+send, and alerts reach Slack, Mattermost, Rocket.Chat, Microsoft Teams,
+Discord, ntfy and Pushover.
+
+**Before upgrading:** back up the database. Migrations 0006, 0007 and 0008 run
+at startup, and after them 0.7.x does not start on that database: the way back
+is the backup. Behind an HTTPS reverse proxy, list the proxy in
+`rate_limit.trusted_proxies`, and make it send `X-Forwarded-Proto: https` and
+pass the original `Host` header, or console sign-in through it gets 403.
+Webhook and Telegram channels no longer follow any redirect, including the 307
+and 308 that 0.7.x followed: a webhook `url` or a custom Telegram `api_base`
+that redirects must name the final address (the `Location` header of
+`curl -sI <url>`), or every delivery through it ends in `dead_letter`. After
+the upgrade, open `/admin` and create the first administrator with the admin
+token. On a host with the Monit integration, install `flock` (util-linux),
+re-run `sudo ./install.sh` from the new version, then
+`sudo monit -t && sudo monit reload`; add the `--flush` timer, and rewrite
+crontab lines that run `cron-wrapper.sh` as another user. A client that checks
+the `channel` of a delivery attempt against `email`, `telegram` and `webhook`
+must accept the new channel types.
 
 ### Changed
 
@@ -10,19 +32,19 @@
   credentials and no longer open the console. Over plain HTTP, sign-in is
   accepted only from this machine or a private network reached directly (an
   SSH tunnel, the Compose gateway). Behind an HTTPS reverse proxy,
-  `rate_limit.trusted_proxies` must list the proxy, and the proxy must pass the
-  original `Host` header (nginx `proxy_set_header Host $host;`, Apache
-  `ProxyPreserveHost On`, as the shipped configs do) or send
-  `X-Forwarded-Host`; otherwise sign-in through it gets 403, and the message
-  says which of the two is missing.
+  `rate_limit.trusted_proxies` must list the proxy, and the proxy must send
+  `X-Forwarded-Proto: https` and pass the original `Host` header (nginx
+  `proxy_set_header Host $host;`, Apache `ProxyPreserveHost On`, as the
+  shipped configs do) or send `X-Forwarded-Host`; otherwise sign-in through it
+  gets 403.
 - A recovery waits for its own alert, not for every alert of its channel: one
   recovery per alert of the closed incident (cancelled alerts excepted), sent
   only after that alert is `sent`. Before, a direct alert that dead-lettered
-  or was cancelled in a fallback channel held that channel's recoveries
-  forever. `GET /v1/delivery-attempts` gains `recovery_for`
-  (`{id, channel_name, state}` of the alert a recovery waits for). Migration
-  0008 adds the column and links recoveries already queued to the alert of the
-  same event and channel; after it 0.7.x does not start on the database.
+  or was cancelled held that channel's other recoveries forever.
+  `GET /v1/delivery-attempts` gains `recovery_for` (`{id, channel_name,
+  state}` of the alert a recovery waits for). Migration 0008 adds the column
+  and links recoveries already queued to the alert of the same event and
+  channel.
 - Monit examples: `install.sh --with-examples` puts the example rules in
   `/etc/alertloop/monit-examples/`, not in Monit's `conf.d` as
   `*.conf.disabled`: Monit on Debian and Ubuntu includes `conf.d/*` and ran
@@ -31,17 +53,15 @@
   `*.conf.disabled` files from `conf.d` (moves ones you edited to the examples
   directory) and lists them; then `sudo monit -t && sudo monit reload`. To
   enable an example, copy it into `conf.d`.
-- `cron-wrapper.sh` runs as root, the job through `/usr/sbin/runuser -u <user> --`
-  (full path: cron's PATH has no `/usr/sbin`): run
-  as another user it cannot read `monit.env` and reported nothing. Rewrite
+- `cron-wrapper.sh` runs as root and the job through
+  `/usr/sbin/runuser -u <user> --` (full path: cron's PATH has no
+  `/usr/sbin`). Run as another user, it could not read `monit.env` and
+  reported nothing; the wrapper and the adapter now say so in syslog. Rewrite
   crontab lines like `… app /usr/local/bin/cron-wrapper.sh …` as shown in the
-  integration's README, "Cron jobs". The adapter and the wrapper now also log
-  an unreadable config and a failed report to syslog.
-- Webhook and Telegram channels no longer follow HTTP redirects: a redirected
-  POST was repeated as a GET, and a 200 to it marked a message nobody received
-  as `sent`. A 3xx answer now fails the attempt (`redirect to <scheme://host>
-  not followed`) and is retried; point `url` or `api_base` at the final
-  address.
+  integration's README, "Cron jobs". The wrapper reports `resolved` only on
+  the first success after a failure, not after every successful run; its
+  first run after the upgrade still reports one `resolved`, so an incident
+  opened before it closes.
 
 ### Added
 
@@ -51,45 +71,48 @@
   routing, `fallback` and recovery notices like the others. Each shows the
   severity its own way: a colour and an emoji in chat, a priority in ntfy and
   Pushover. `GET /v1/delivery-attempts` returns these values in `channel` and
-  accepts them in the `channel` filter: a client that checks `channel` against
-  `email`, `telegram` and `webhook` must accept the new values.
+  accepts them in the `channel` filter.
 - `public_url`: with it, every notification links to its event in the admin
   console, and the webhook payload gains `event_url`.
 - Console user accounts with one role, `admin`: a Users screen (add, disable,
   enable, reset another user's password), changing your own password, signing
   out everywhere, and `alertloop user add|passwd|disable|enable|list` for the
-  command line and for recovering access. Sessions are kept on the server in an `HttpOnly` cookie,
-  which also authenticates `/v1` (`ConsoleSession` in the OpenAPI spec); the
-  access log names the user as `credential=user:<id>`. Migration 0006 adds the
-  `users` and `sessions` tables.
+  command line and for recovering access. Sessions are kept on the server in
+  an `HttpOnly` cookie, which also authenticates `/v1` (`ConsoleSession` in the
+  OpenAPI spec); the access log names the user as `credential=user:<id>`.
+  Migration 0006 adds the `users` and `sessions` tables.
 - A channel may name a `fallback` channel. An alert that dead-letters on it is
   queued once to the fallback, with the failed channel and its error at the
   top of the text (in a webhook, a `fallback` object); the copy gets its own
-  recovery, sent after it. The fallback channel may get the alert twice:
-  directly, and as the copy that names the broken channel (always so without
-  routing), and then two recoveries. A
-  fallback alert that dead-letters goes nowhere further, and a fallback to the
-  channel itself or to a missing one fails the config check.
+  recovery, sent after it. The copy goes to the fallback even if that channel
+  got the alert directly, so without routing it sees the alert twice, and two
+  recoveries. One hop: a copy that dead-letters goes nowhere further; a
+  fallback to the channel itself or to a missing one stops the start.
   `GET /v1/delivery-attempts` gains `fallback_of` and `fallback_to`, each with
   the linked attempt's `state`, and the console shows whether the redirected
   alert arrived. Migration 0007 adds the link column.
-- The Monit adapter keeps an event it could not send (network, 409, 429, 5xx) in
-  `/var/lib/alertloop-monit/spool` and sends it, oldest first, on the next run
-  or with `alertloop-send --flush`; it then exits with the new code 9. The spool
-  holds at most `ALERTLOOP_SPOOL_MAX` events (1000); both `ALERTLOOP_SPOOL_*`
-  settings are optional. A spooled event refused for the key or the address
-  (401, 403 other than `source_not_allowed`, 404) stays in the spool and the
-  run exits 4; one refused for what it is (400, 413, 422, 403
-  `source_not_allowed`) moves to `rejected/` in the spool directory with a log
-  line, and the events behind it go on; `--flush` exits 4 while `rejected/` is
-  not empty. Re-run `install.sh` to create the
-  directory, and add the `--flush` timer from the integration's README. The
-  adapter now needs `flock` (util-linux); `install.sh` refuses to install
-  without it.
-- `cron-wrapper.sh` reports `resolved` only on the first success after a
-  failure, not after every successful run; the first run of the new wrapper
-  for a job still reports one `resolved`, so an incident opened before the
-  upgrade closes. Re-run `install.sh` to update it.
+- The Monit adapter keeps an event it could not send (network, 409, 429, 5xx)
+  in `/var/lib/alertloop-monit/spool`, exits with the new code 9, and sends it,
+  oldest first, on the next run or with `alertloop-send --flush`. The
+  spool holds at most `ALERTLOOP_SPOOL_MAX` events (1000). A spooled event
+  refused for the key or the address (401, 403 other than
+  `source_not_allowed`, 404) stays and the run exits 4; one refused for what it
+  is (400, 413, 422, 403 `source_not_allowed`) moves to `rejected/` in the
+  spool directory, and `--flush` exits 4 until `rejected/` is empty. Re-run
+  `install.sh` to create the directory and add the `--flush` timer from the
+  integration's README, "Spool". The adapter now needs `flock` (util-linux);
+  `install.sh` refuses to install without it.
+- Compose passes `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY` from `.env` to the
+  containers, for channels that must go through a proxy.
+
+### Fixed
+
+- Webhook and Telegram channels no longer follow HTTP redirects: a POST
+  redirected with 301, 302 or 303 was repeated as a GET, and a 200 to it
+  marked a message nobody received as `sent`. Every 3xx, including the 307 and
+  308 that were followed with the POST, now fails the attempt
+  (`redirect to <scheme://host> not followed`) and is retried; point `url` or
+  `api_base` at the final address.
 
 ## 0.7.0 - 2026-09-23
 

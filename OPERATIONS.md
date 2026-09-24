@@ -837,7 +837,26 @@ first: they name each change that needs an action. Skipping versions is fine.
 a database that has migrations the binary does not know, and name them. The way
 back is to stop, restore the backup taken before the upgrade, and start the old
 version. A version that added no migration (its CHANGELOG entry says when it
-does) goes back without the restore. The old version under systemd:
+does) goes back without the restore.
+
+With PostgreSQL, empty the database before the restore command from
+[Backup and restore](#backup-and-restore). `pg_restore --clean` drops only the
+tables the backup holds, so the tables the newer version added stay (0.8.0
+adds `users` and `sessions`), and the next upgrade finds the old console users,
+their passwords and sessions still there. With AlertLoop stopped (this removes
+everything in the `public` schema: the database must hold AlertLoop alone):
+
+```bash
+docker compose exec -T postgres psql -U alertloop -d alertloop -v ON_ERROR_STOP=1 -c 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;'   # Compose
+sudo sh -c 'set -a; . /etc/alertloop/backup.env;
+  psql -d "$PGDATABASE" -v ON_ERROR_STOP=1 -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"'   # systemd
+```
+
+If it answers `must be owner of schema public`, run it as `postgres` and end
+with `CREATE SCHEMA public AUTHORIZATION <PGUSER>;`, or the restore cannot
+create its tables. SQLite needs nothing: the restore replaces the whole file.
+
+The old version under systemd:
 
 ```bash
 command -v monit >/dev/null && sudo systemctl stop monit
@@ -849,7 +868,7 @@ command -v monit >/dev/null && sudo systemctl start monit
 ```
 
 Under Compose: check out the old tag, write the old version into `.env`
-explicitly (`ALERTLOOP_IMAGE=ghcr.io/golovanov-dev/alertloop:0.6.1`), run
+explicitly (`ALERTLOOP_IMAGE=ghcr.io/golovanov-dev/alertloop:0.7.0`), run
 `docker compose up -d --wait --wait-timeout 120`, and confirm the version with
 `GET /v1/info`. Before 0.7.0 the `.env.example` line was commented out and the
 Compose file fell back to `:latest`, so "setting it back" to what the old

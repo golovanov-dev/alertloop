@@ -27,7 +27,7 @@
 # with Monit and with cron wrappers.
 set -euo pipefail
 
-VERSION="0.4.0"
+VERSION="0.8.0"
 CONFIG="${ALERTLOOP_CONFIG_FILE:-/etc/alertloop/monit.env}"
 
 # --- exit codes ------------------------------------------------------------
