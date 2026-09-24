@@ -41,6 +41,12 @@ x-http-health: &http-health
   retries: 3
   start_period: 30s
 
+# Outbound proxy for the channels, from .env; empty means none.
+x-proxy-env: &proxy-env
+  HTTP_PROXY: ${HTTP_PROXY:-}
+  HTTPS_PROXY: ${HTTPS_PROXY:-}
+  NO_PROXY: ${NO_PROXY:-}
+
 # Shared by api and worker. An empty admin token stops startup (the config file
 # has no fallback); a Compose `:?` here would also block the demo profile.
 x-pg-env: &pg-env
@@ -61,6 +67,7 @@ services:
       # Loopback only: a published Docker port bypasses ufw/firewalld.
       - "127.0.0.1:${ALERTLOOP_PORT:-8080}:8080"
     environment:
+      <<: *proxy-env
       # Fallback for the loopback-only demo; the postgres profile has none.
       ALERTLOOP_ADMIN_TOKEN: ${ALERTLOOP_ADMIN_TOKEN:-change-me-admin}
     volumes:
@@ -95,7 +102,7 @@ services:
     image: *image
     command: ["--config", "/etc/alertloop/alertloop.yaml", "server"]
     environment:
-      <<: *pg-env
+      <<: [*pg-env, *proxy-env]
       ALERTLOOP_LOG_FILE: ${ALERTLOOP_LOG_FILE_API:-}
     depends_on:
       postgres:
@@ -114,7 +121,7 @@ services:
     image: *image
     command: ["--config", "/etc/alertloop/alertloop.yaml", "worker"]
     environment:
-      <<: *pg-env
+      <<: [*pg-env, *proxy-env]
       ALERTLOOP_LOG_FILE: ${ALERTLOOP_LOG_FILE_WORKER:-}
     depends_on:
       postgres:

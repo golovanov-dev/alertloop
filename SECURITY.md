@@ -84,6 +84,19 @@ vulnerability:
   not affected.
 - The published container runs as a non-root user with no capabilities, on a
   read-only root filesystem.
+- The console session cookie is `HttpOnly`, so page JavaScript cannot read
+  it, and the database stores only the SHA-256 of the session token, never the
+  token itself.
+- A state-changing request made with the console session cookie is refused
+  unless it carries `X-AlertLoop-Console: 1` and, when the browser sends an
+  `Origin`, that origin is the host AlertLoop was reached at: another site
+  cannot make a signed-in browser act (CSRF).
+- Console sign-in is not accepted over plain HTTP from a public network: only
+  over HTTPS (directly, or from a proxy in `rate_limit.trusted_proxies`
+  reporting `X-Forwarded-Proto: https`) or straight from a loopback, private or
+  link-local address with no forwarding headers.
+- The first console administrator is created only with the admin token and
+  only while there are no users at all, even when setup requests race.
 - An `ingest` key with `sources` creates, refreshes and resolves only events
   whose `source` is in that list. A request from another source, or one whose
   `dedupe_key` belongs to an event of another source, gets 403

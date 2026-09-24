@@ -18,6 +18,8 @@ func TestListParametersAreValidated(t *testing.T) {
 	}{
 		{"/v1/events?type=incidents", http.StatusBadRequest},
 		{"/v1/delivery-attempts?state=done", http.StatusBadRequest},
+		{"/v1/delivery-attempts?channel=ntfy", http.StatusOK}, // 0.8.0 channel types
+		{"/v1/delivery-attempts?channel=sms", http.StatusBadRequest},
 		{"/v1/events?limit=abc", http.StatusBadRequest},
 		{"/v1/events?limit=1000", http.StatusOK}, // above the maximum: lowered, as before
 		{"/v1/events?q=" + url.QueryEscape(strings.Repeat("я", 200)), http.StatusOK},

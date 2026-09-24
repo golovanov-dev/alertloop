@@ -1,6 +1,7 @@
 // Package channels defines the delivery channel interface and the Email,
-// Telegram, and Webhook implementations shipped with Community Edition. Every
-// channel has explicit timeout, failure, and (for webhooks) signing behavior;
+// Telegram, Webhook, Slack, Teams, Discord, ntfy and Pushover implementations
+// shipped with Community Edition. Every channel has explicit timeout, failure,
+// and (for webhooks) signing behavior;
 // transport errors are returned so the delivery worker can record and retry
 // them.
 //

@@ -10,12 +10,15 @@
 #   - remove Monit
 #   - remove a rule file you edited, without asking
 #   - remove the API key unless you pass --purge
+#   - remove events still waiting in the spool
 #   - reload Monit on a configuration that does not validate
 set -euo pipefail
 
 BIN_DIR="${BIN_DIR:-/usr/local/bin}"
 CONF_DIR="${CONF_DIR:-/etc/alertloop}"
 ENV_FILE="$CONF_DIR/monit.env"
+SPOOL_DIR="/var/lib/alertloop-monit/spool"
+EXAMPLES_DIR="${EXAMPLES_DIR:-$CONF_DIR/monit-examples}"
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 PURGE=0
@@ -51,36 +54,77 @@ if [ -z "$MONIT_CONF_DIR" ]; then
   done
 fi
 
+# remove_rule <file>: remove a rule file this integration installed, if it
+# still matches the shipped example. An edited rule is the operator's work, and
+# deleting somebody's tuned thresholds without asking is not a thing an
+# uninstaller gets to do. 0 when removed.
+remove_rule() {
+  local f="$1" base original
+  base="$(basename "$f")"
+  base="${base#alertloop-}"
+  base="${base%.disabled}"
+  original="$SRC/conf.d/$base"
+  if ! { [ -f "$original" ] && cmp -s "$f" "$original"; }; then
+    echo "    $f differs from the shipped example (you edited it)"
+    if ! confirm "    Remove it anyway?"; then
+      echo "    kept"
+      return 1
+    fi
+  fi
+  rm -f "$f"
+  echo "    removed $f"
+}
+
+# In conf.d: the rules you enabled, and *.conf.disabled copies left by a
+# version before 0.8.0 (Monit on Debian and Ubuntu loads those too).
 removed_rules=0
 if [ -n "$MONIT_CONF_DIR" ] && [ -d "$MONIT_CONF_DIR" ]; then
   echo "==> Looking for this integration's rules in $MONIT_CONF_DIR"
   for f in "$MONIT_CONF_DIR"/alertloop-*.conf "$MONIT_CONF_DIR"/alertloop-*.conf.disabled; do
     [ -e "$f" ] || continue
-
-    # Only the files this integration installed, and only if they still match
-    # what was installed. An edited rule is the operator's work, and deleting
-    # somebody's tuned thresholds without asking is not a thing an uninstaller
-    # gets to do.
-    base="$(basename "$f")"
-    base="${base#alertloop-}"
-    base="${base%.disabled}"
-    original="$SRC/conf.d/$base"
-
-    if [ -f "$original" ] && cmp -s "$f" "$original"; then
-      rm -f "$f"
-      echo "    removed $f"
-      removed_rules=$((removed_rules + 1))
-    else
-      echo "    $f differs from the shipped example (you edited it)"
-      if confirm "    Remove it anyway?"; then
-        rm -f "$f"
-        echo "    removed $f"
-        removed_rules=$((removed_rules + 1))
-      else
-        echo "    kept"
-      fi
-    fi
+    if remove_rule "$f"; then removed_rules=$((removed_rules + 1)); fi
   done
+fi
+
+# The examples directory, which Monit does not read.
+if [ -d "$EXAMPLES_DIR" ]; then
+  echo "==> Removing the example rules in $EXAMPLES_DIR"
+  for f in "$EXAMPLES_DIR"/alertloop-*.conf "$EXAMPLES_DIR"/alertloop-*.conf.disabled; do
+    [ -e "$f" ] || continue
+    remove_rule "$f" || true
+  done
+  rmdir "$EXAMPLES_DIR" 2>/dev/null && echo "    removed empty $EXAMPLES_DIR"
+fi
+
+# --- spool -----------------------------------------------------------------
+if [ -f "$ENV_FILE" ]; then
+  line="$(grep '^ALERTLOOP_SPOOL_DIR=' "$ENV_FILE" | tail -n 1 || true)"
+  line="${line#ALERTLOOP_SPOOL_DIR=}"
+  case "$line" in
+    \"*\"|\'*\') line="${line:1:${#line}-2}" ;;
+  esac
+  SPOOL_DIR="${line:-$SPOOL_DIR}"
+fi
+spooled() { find "$SPOOL_DIR" -maxdepth 1 -name '*.json' 2>/dev/null | wc -l | tr -d ' '; }
+if [ -d "$SPOOL_DIR" ]; then
+  if [ "$(spooled)" -gt 0 ] && [ -x "$BIN_DIR/alertloop-send" ]; then
+    echo "==> Sending the $(spooled) event(s) waiting in $SPOOL_DIR"
+    "$BIN_DIR/alertloop-send" --flush || true
+  fi
+  left="$(spooled)"
+  rejected="$({ find "$SPOOL_DIR/rejected" -maxdepth 1 -name '*.json' 2>/dev/null || true; } | wc -l | tr -d ' ')"
+  if [ "$rejected" -gt 0 ]; then
+    echo "!! $rejected event(s) AlertLoop refused stay in $SPOOL_DIR/rejected." >&2
+  fi
+  if [ "$left" -gt 0 ]; then
+    echo "!! $left event(s) could not be sent and stay in $SPOOL_DIR." >&2
+    echo "!! Each file is the JSON body of POST /v1/events; delete the directory when done with them." >&2
+  else
+    rm -f "$SPOOL_DIR/.lock"
+    rmdir "$SPOOL_DIR/rejected" 2>/dev/null || true
+    rmdir "$SPOOL_DIR" 2>/dev/null && echo "    removed empty $SPOOL_DIR"
+    rmdir "$(dirname "$SPOOL_DIR")" 2>/dev/null || true
+  fi
 fi
 
 # --- scripts ---------------------------------------------------------------

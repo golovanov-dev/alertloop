@@ -72,7 +72,7 @@ export function Sidebar({
   open?: boolean;
   onNavigate?: () => void;
 }) {
-  const { logout } = useApp();
+  const { logout, user } = useApp();
   const rootStyle = mobile
     ? ({
         position: "fixed",
@@ -139,6 +139,9 @@ export function Sidebar({
             </span>
           )}
         </NavLink>
+        <Item to="/users" icon={<IconUsers />} onNavigate={onNavigate}>
+          Users
+        </Item>
         <Item to="/about" icon={<IconInfo />} onNavigate={onNavigate}>
           About
         </Item>
@@ -160,7 +163,7 @@ export function Sidebar({
       <div style={{ flex: 1 }} />
 
       <Button
-        onClick={logout}
+        onClick={() => logout()}
         aria-label="Log out"
         style={{
           borderTop: `1px solid ${c.border}`,
@@ -187,9 +190,11 @@ export function Sidebar({
             color: c.muted,
           }}
         >
-          ##
+          {(user?.login ?? "?").slice(0, 2).toUpperCase()}
         </span>
-        <span style={{ fontSize: 12.5, color: c.muted, flex: 1 }}>Admin session</span>
+        <span style={{ fontSize: 12.5, color: c.muted, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", textAlign: "left" }}>
+          {user?.login}
+        </span>
         <span style={{ fontSize: 12, color: c.accent }}>Log out</span>
       </Button>
     </div>
@@ -222,6 +227,14 @@ function IconArrow() {
   return (
     <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
       <path d="M3 8h7.5M8 4.5 11.5 8 8 11.5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+function IconUsers() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+      <circle cx="8" cy="5.2" r="2.7" stroke="currentColor" strokeWidth="1.4" />
+      <path d="M2.8 14c.6-2.6 2.7-4.1 5.2-4.1s4.6 1.5 5.2 4.1" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
     </svg>
   );
 }

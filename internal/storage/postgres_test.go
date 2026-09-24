@@ -40,8 +40,9 @@ func postgresStore(t *testing.T) Store {
 		t.Fatalf("migrate: %v", err)
 	}
 	// Every test starts from an empty database. CASCADE also clears
-	// delivery_attempts, which references events.
-	if _, err := s.(*sqlStore).db.ExecContext(ctx, `TRUNCATE events, worker_heartbeat CASCADE`); err != nil {
+	// delivery_attempts, which references events, and sessions, which
+	// references users.
+	if _, err := s.(*sqlStore).db.ExecContext(ctx, `TRUNCATE events, worker_heartbeat, users CASCADE`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 	t.Cleanup(func() { s.Close() })
@@ -358,5 +359,45 @@ func TestPostgresCheckReachesTheDatabase(t *testing.T) {
 	postgresStore(t)
 	if err := Check(context.Background(), "postgres", os.Getenv("ALERTLOOP_TEST_POSTGRES_DSN")); err != nil {
 		t.Fatalf("Check: %v", err)
+	}
+}
+
+// Two setups at once must not both create a "first" administrator. Under READ
+// COMMITTED a setup that has inserted but not committed is invisible to
+// another one's NOT EXISTS; the advisory lock makes the second wait for the
+// first and then see its row. Setup A is held in flight here by hand.
+func TestPostgresFirstUserWaitsForASetupInFlight(t *testing.T) {
+	s := postgresStore(t)
+	ctx := context.Background()
+	tx, err := s.(*sqlStore).db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback() //nolint:errcheck // committed below
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, firstUserLock); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO users (id, login, password_hash, created_at) VALUES ('a', 'alice', 'h', $1)`,
+		formatTime(time.Now())); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- s.CreateFirstUser(ctx, &User{ID: "b", Login: "mallory", PasswordHash: "h", CreatedAt: time.Now()})
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("setup B finished while setup A was in flight: err = %v", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; !errors.Is(err, ErrUsersExist) {
+		t.Fatalf("setup B after A committed: err = %v, want ErrUsersExist", err)
+	}
+	if n, err := s.CountUsers(ctx); err != nil || n != 1 {
+		t.Fatalf("CountUsers = %d, %v; want 1", n, err)
 	}
 }

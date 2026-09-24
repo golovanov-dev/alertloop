@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/golovanov-dev/alertloop/internal/api"
+	"github.com/golovanov-dev/alertloop/internal/auth"
 	"github.com/golovanov-dev/alertloop/internal/channels"
 	"github.com/golovanov-dev/alertloop/internal/config"
 	"github.com/golovanov-dev/alertloop/internal/delivery"
@@ -168,17 +170,19 @@ func WeakCredentialWarnings(cfg config.Config, mode string) []string {
 	return out
 }
 
-// The modes of cmd/alertloop. "check-db" is a probe that exits.
+// The modes of cmd/alertloop. "check-db" is a probe that exits; "user" manages
+// console accounts and exits.
 const (
 	ModeServer  = "server"
 	ModeWorker  = "worker"
 	ModeAll     = "all"
 	ModeCheckDB = "check-db"
+	ModeUser    = "user"
 )
 
 // Modes lists every mode cmd/alertloop accepts; anything else is refused before
 // the config is loaded.
-var Modes = []string{ModeServer, ModeWorker, ModeAll, ModeCheckDB}
+var Modes = []string{ModeServer, ModeWorker, ModeAll, ModeCheckDB, ModeUser}
 
 // modeServesHTTP reports whether a mode puts an HTTP listener on the network:
 // "server" and "all" do, "worker" only drains the delivery queue.
@@ -237,7 +241,14 @@ func (a *App) logRoutingTable() {
 		a.log.Warn("routing rules below a catch-all rule can never match; move the catch-all last",
 			"catch_all_rule", catchAll, "unreachable_rules", unreachable)
 	}
-	if unused := a.router.UnusedChannels(); len(unused) > 0 {
+	// A channel only a fallback leads to is not a typo: it is where alerts
+	// go when their channel is down (README, "Fallback channel").
+	isFallback := map[string]bool{}
+	for _, fb := range a.cfg.Channels.Fallbacks() {
+		isFallback[fb] = true
+	}
+	unused := slices.DeleteFunc(a.router.UnusedChannels(), func(name string) bool { return isFallback[name] })
+	if len(unused) > 0 {
 		a.log.Warn("configured channels that no routing rule and no default sends to; check for a typo",
 			"unused_channels", unused)
 	}
@@ -304,6 +315,34 @@ func buildRegistry(c config.Channels) (*channels.Registry, error) {
 	}
 	for _, w := range c.Webhook {
 		chans = append(chans, channels.NewWebhook(w.Name, w.URL, w.Secret, w.Timeout))
+	}
+	for _, s := range c.Slack {
+		chans = append(chans, channels.NewSlack(s.Name, s.URL, s.Timeout))
+	}
+	for _, t := range c.Teams {
+		chans = append(chans, channels.NewTeams(t.Name, t.URL, t.Timeout))
+	}
+	for _, d := range c.Discord {
+		chans = append(chans, channels.NewDiscord(d.Name, d.URL, d.Timeout))
+	}
+	for _, t := range c.Ntfy {
+		chans = append(chans, channels.NewNtfy(channels.NtfyConfig{
+			Name:     t.Name,
+			Server:   t.Server,
+			Topic:    t.Topic,
+			Token:    t.Token,
+			Username: t.Username,
+			Password: t.Password,
+			Timeout:  t.Timeout,
+		}))
+	}
+	for _, p := range c.Pushover {
+		chans = append(chans, channels.NewPushover(channels.PushoverConfig{
+			Name:    p.Name,
+			Token:   p.Token,
+			UserKey: p.UserKey,
+			Timeout: p.Timeout,
+		}))
 	}
 	return channels.NewRegistry(chans...), nil
 }
@@ -378,6 +417,8 @@ func (a *App) RunWorker(ctx context.Context) error {
 		PollInterval: a.cfg.Worker.PollInterval,
 		BaseBackoff:  a.cfg.Worker.BaseBackoff,
 		MaxBackoff:   a.cfg.Worker.MaxBackoff,
+		Fallbacks:    a.cfg.Channels.Fallbacks(),
+		PublicURL:    a.cfg.PublicURL,
 	}, a.log)
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -432,11 +473,8 @@ func (a *App) RunAll(ctx context.Context) error {
 }
 
 // runRetention periodically deletes events (and their delivery attempts) older
-// than the fixed Community retention window.
+// than the fixed Community retention window, and ended console sessions.
 func (a *App) runRetention(ctx context.Context) {
-	if a.cfg.RetentionDays <= 0 {
-		return
-	}
 	ticker := time.NewTicker(6 * time.Hour)
 	defer ticker.Stop()
 	for {
@@ -450,6 +488,13 @@ func (a *App) runRetention(ctx context.Context) {
 }
 
 func (a *App) cleanupOnce(ctx context.Context) {
+	now := time.Now().UTC()
+	if _, err := a.store.DeleteExpiredSessions(ctx, now, now.Add(-auth.IdleTimeout)); err != nil {
+		a.log.Error("retention cleanup (sessions) failed", "error", err)
+	}
+	if a.cfg.RetentionDays <= 0 {
+		return
+	}
 	cutoff := time.Now().UTC().AddDate(0, 0, -a.cfg.RetentionDays)
 	// Deleting events cascades to delivery_attempts via FK. The second sweep
 	// finds orphans only on old databases (see DeleteDeliveryAttemptsBefore).

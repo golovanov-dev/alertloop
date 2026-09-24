@@ -45,7 +45,9 @@ func run() error {
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "AlertLoop %s\n\nUsage: alertloop [flags] [%s]\n\n"+
 			"  check-db  check the config, the log file and the database as a start would, change nothing,\n"+
-			"            exit 0 if all pass (a health check and the pre-flight check of an upgrade)\n\nFlags:\n",
+			"            exit 0 if all pass (a health check and the pre-flight check of an upgrade)\n"+
+			"  user      manage console users: user add|passwd [--password-stdin] <login>,\n"+
+			"            user disable <login>, user list\n\nFlags:\n",
 			version, strings.Join(app.Modes, "|"))
 		fs.PrintDefaults()
 	}
@@ -66,6 +68,13 @@ func run() error {
 	if !slices.Contains(app.Modes, mode) {
 		return fmt.Errorf("unknown mode %q (want %s)", mode, strings.Join(app.Modes, ", "))
 	}
+	var userCmd userCommand
+	if mode == app.ModeUser {
+		var err error
+		if userCmd, err = parseUserArgs(fs.Args()[1:]); err != nil {
+			return err
+		}
+	}
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
@@ -84,6 +93,11 @@ func run() error {
 	// migrations under it.
 	if mode == app.ModeCheckDB {
 		return checkDB(cfg)
+	}
+	// Before the logger, like check-db: an account command run next to the
+	// real process must not write to its log file.
+	if mode == app.ModeUser {
+		return runUser(context.Background(), cfg, userCmd, os.Stdin, os.Stdout)
 	}
 
 	log, logCloser, err := setupLogger(cfg.Log)

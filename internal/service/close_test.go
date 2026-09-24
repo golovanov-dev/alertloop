@@ -61,7 +61,7 @@ func TestMuteCancelsUnsentAlerts(t *testing.T) {
 	sent.State, sent.Attempts = domain.DeliverySent, 1
 	failed.State, failed.Attempts, failed.NextRetryAt = domain.DeliveryFailed, 1, &retry
 	for _, d := range []*domain.DeliveryAttempt{&sent, &failed} {
-		if err := store.MarkResult(ctx, d); err != nil {
+		if err := store.MarkResult(ctx, d, nil); err != nil {
 			t.Fatalf("mark %s: %v", d.ChannelName, err)
 		}
 	}

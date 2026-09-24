@@ -136,8 +136,20 @@ func TestWebhookPayloadCarriesTheKind(t *testing.T) {
 		t.Fatalf("send recovery: %v", err)
 	}
 
-	if len(bodies) != 2 {
-		t.Fatalf("received %d webhook calls, want 2", len(bodies))
+	redirected := domain.Alert(sampleEvent())
+	redirected.Fallback = &domain.FallbackOrigin{Channel: "ops-telegram", Error: "status 502"}
+	if err := wh.Send(context.Background(), redirected); err != nil {
+		t.Fatalf("send redirected alert: %v", err)
+	}
+
+	if len(bodies) != 3 {
+		t.Fatalf("received %d webhook calls, want 3", len(bodies))
+	}
+	if fb, _ := bodies[2]["fallback"].(map[string]any); fb["channel"] != "ops-telegram" || fb["error"] != "status 502" {
+		t.Fatalf("redirected payload fallback = %v", bodies[2]["fallback"])
+	}
+	if _, ok := bodies[0]["fallback"]; ok {
+		t.Fatalf("a plain alert carries fallback: %v", bodies[0])
 	}
 	if bodies[0]["kind"] != "alert" {
 		t.Fatalf("alert payload kind = %v, want \"alert\"", bodies[0]["kind"])
@@ -197,6 +209,28 @@ func TestAlertAndRecoveryHaveDifferentMessageIDs(t *testing.T) {
 	}
 }
 
+// An alert redirected from a failed channel is a message of its own: with the
+// plain alert's Message-ID a mailbox that already holds that alert would drop
+// it as a duplicate. Its retries still share one id.
+func TestRedirectedAlertHasItsOwnMessageID(t *testing.T) {
+	plain := messageID(domain.Alert(sampleEvent()), "alerts@example.com")
+	redirected := func(attempt string) string {
+		n := domain.Alert(sampleEvent())
+		n.Fallback = &domain.FallbackOrigin{Channel: "tg", Error: "status 502", Attempt: attempt}
+		return messageID(n, "alerts@example.com")
+	}
+	first := redirected("att-1")
+	if first == plain || !strings.Contains(first, "att-1") {
+		t.Fatalf("redirected Message-ID %s, plain %s: want one naming the attempt", first, plain)
+	}
+	if again := redirected("att-1"); again != first {
+		t.Fatalf("Message-ID is not stable across retries: %s vs %s", first, again)
+	}
+	if other := redirected("att-2"); other == first {
+		t.Fatalf("two redirects share a Message-ID: %s", first)
+	}
+}
+
 // A subject in a non-Latin script must not be cut through a character: the
 // broken tail gets Q-encoded and the reader sees a replacement glyph in the one
 // line of the message they are most likely to read.
@@ -211,5 +245,18 @@ func TestSubjectTruncationDoesNotBreakCharacters(t *testing.T) {
 	}
 	if !strings.HasPrefix(got, "Проверка") {
 		t.Fatalf("header lost its beginning: %q", got)
+	}
+}
+
+func TestFallbackAlertNamesTheFailedChannelAndItsError(t *testing.T) {
+	e := &domain.Event{ID: "e1", Type: domain.EventIncident, Severity: domain.SeverityCritical, Message: "db down", CreatedAt: time.Now()}
+	n := domain.Notification{Event: e, Kind: domain.KindAlert,
+		Fallback: &domain.FallbackOrigin{Channel: "ops-telegram", Error: "telegram send failed (status 401): Unauthorized"}}
+	body := plainBody(n)
+	if !strings.HasPrefix(body, "Redirected: channel \"ops-telegram\" could not deliver this alert.\nIts error: telegram send failed (status 401)") {
+		t.Fatalf("body does not lead with the redirect:\n%s", body)
+	}
+	if !strings.Contains(plainBody(domain.Alert(e)), "Type:") || strings.Contains(plainBody(domain.Alert(e)), "Redirected") {
+		t.Fatal("a plain alert mentions a redirect")
 	}
 }

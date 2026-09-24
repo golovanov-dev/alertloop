@@ -11,17 +11,21 @@
 #   /usr/local/bin/check-pm2.sh               helper for PM2 checks
 #   /usr/local/bin/cron-wrapper.sh            helper for cron jobs
 #   /etc/alertloop/monit.env                  configuration (0600, root)
-#   /etc/monit/conf.d/alertloop-*.conf        Monit rules, ONLY if you ask
+#   /var/lib/alertloop-monit/spool            events not sent yet (0700, root)
+#   /etc/alertloop/monit-examples/            example Monit rules, ONLY if you ask
 #
 # What it does NOT do: enable any check. Every example names a pidfile, a port,
 # or a threshold that belongs to your machine and not to this repository. An
 # installer that switched them all on would page you about a PostgreSQL you do
-# not run. Copy the ones you want with --with-examples, then edit them.
+# not run. The examples go to a directory Monit does not read; you copy the
+# ones you want into Monit's conf.d and edit them there.
 set -euo pipefail
 
 BIN_DIR="${BIN_DIR:-/usr/local/bin}"
 CONF_DIR="${CONF_DIR:-/etc/alertloop}"
 ENV_FILE="$CONF_DIR/monit.env"
+SPOOL_DIR="${SPOOL_DIR:-/var/lib/alertloop-monit/spool}"
+EXAMPLES_DIR="${EXAMPLES_DIR:-$CONF_DIR/monit-examples}"
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 WITH_EXAMPLES=0
@@ -31,9 +35,10 @@ usage() {
   cat <<'USAGE'
 usage: sudo ./install.sh [--with-examples] [--monit-conf-dir DIR]
 
-  --with-examples       also copy the example Monit rules, disabled, as
-                        alertloop-*.conf.disabled. You rename them after
-                        editing; nothing takes effect until you do.
+  --with-examples       also copy the example Monit rules to
+                        /etc/alertloop/monit-examples, which Monit does not
+                        read; nothing takes effect until you copy one into
+                        Monit's conf.d.
   --monit-conf-dir DIR  where Monit reads its configuration from. Detected
                         automatically (/etc/monit/conf.d on Debian and Ubuntu,
                         /etc/monit.d on the RHEL family).
@@ -55,15 +60,19 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # --- dependencies ----------------------------------------------------------
+# Everything alertloop-send refuses to run without. Checked before anything is
+# installed: an adapter installed without them exits 2 on every event, and
+# Monit's alerts are lost with nothing but a log line to say so.
 missing=""
-for cmd in curl jq; do
+for cmd in curl jq flock; do
   command -v "$cmd" >/dev/null 2>&1 || missing="$missing $cmd"
 done
 if [ -n "$missing" ]; then
-  echo "Missing required commands:$missing" >&2
+  echo "Missing required commands:$missing (flock comes with util-linux)" >&2
+  echo "Nothing was installed." >&2
   echo >&2
-  echo "  Debian/Ubuntu:  apt-get install -y curl jq" >&2
-  echo "  RHEL/Alma/Rocky: dnf install -y curl jq" >&2
+  echo "  Debian/Ubuntu:   apt-get install -y curl jq util-linux" >&2
+  echo "  RHEL/Alma/Rocky: dnf install -y curl jq util-linux" >&2
   exit 1
 fi
 
@@ -89,6 +98,18 @@ if [ -f "$ENV_FILE" ]; then
   # Never overwrite: this file holds the API key, and a re-run of the installer
   # must not be the thing that silently breaks a working install.
   echo "==> Keeping existing $ENV_FILE"
+  # Settings added since that file was written. All optional: without a line
+  # the default applies, so nothing has to change for the upgrade to work.
+  new_keys=""
+  while IFS= read -r key; do
+    grep -q "^$key=" "$ENV_FILE" || new_keys="$new_keys $key"
+  done < <(sed -n 's/^\(ALERTLOOP_[A-Z_]*\)=.*/\1/p' "$SRC/alertloop.env.example")
+  if [ -n "$new_keys" ]; then
+    echo "    Optional settings this version reads that the file does not set:"
+    echo "     $new_keys"
+    echo "    Their defaults apply (see $SRC/alertloop.env.example). To change one,"
+    echo "    add its line once."
+  fi
 else
   echo "==> Creating $ENV_FILE"
   install -m 0600 -o root -g root "$SRC/alertloop.env.example" "$ENV_FILE"
@@ -100,6 +121,13 @@ fi
 chmod 0600 "$ENV_FILE"
 chown root:root "$ENV_FILE" 2>/dev/null || true
 
+# --- spool -----------------------------------------------------------------
+# Owned by root, as Monit runs the adapter as root. A different
+# ALERTLOOP_SPOOL_DIR in monit.env is created by the adapter on its first run.
+echo "==> Creating $SPOOL_DIR"
+install -d -m 0700 -o root -g root "$SPOOL_DIR"
+chmod 0700 "$SPOOL_DIR"
+
 # --- Monit rules -----------------------------------------------------------
 if [ -z "$MONIT_CONF_DIR" ]; then
   for d in /etc/monit/conf.d /etc/monit.d /usr/local/etc/monit.d; do
@@ -107,27 +135,43 @@ if [ -z "$MONIT_CONF_DIR" ]; then
   done
 fi
 
-if [ "$WITH_EXAMPLES" -eq 1 ]; then
-  if [ -z "$MONIT_CONF_DIR" ] || [ ! -d "$MONIT_CONF_DIR" ]; then
-    echo "Could not find Monit's conf.d directory. Pass --monit-conf-dir DIR." >&2
-    exit 1
-  fi
-  echo "==> Copying example rules to $MONIT_CONF_DIR (DISABLED)"
+# Before 0.8.0 the examples were copied into conf.d as *.conf.disabled. Monit
+# on Debian and Ubuntu includes conf.d/* - every file, suffix or not - so those
+# copies were live checks. Take ours out: only the names this integration
+# ships, removed when unchanged, moved to the examples directory otherwise.
+removed_disabled=0
+if [ -n "$MONIT_CONF_DIR" ] && [ -d "$MONIT_CONF_DIR" ]; then
   for f in "$SRC"/conf.d/*.conf; do
-    name="alertloop-$(basename "$f")"
-    target="$MONIT_CONF_DIR/${name}.disabled"
-    if [ -f "$MONIT_CONF_DIR/$name" ] || [ -f "$target" ]; then
-      echo "    skip $name (already present)"
-      continue
+    old="$MONIT_CONF_DIR/alertloop-$(basename "$f").disabled"
+    [ -f "$old" ] || continue
+    if [ "$removed_disabled" -eq 0 ]; then
+      echo "==> Removing example rules an earlier version put in $MONIT_CONF_DIR"
+      echo "    (Monit loads *.conf.disabled there as well; they were active checks)"
     fi
-    install -m 0600 "$f" "$target"
-    echo "    $target"
+    removed_disabled=$((removed_disabled + 1))
+    if cmp -s "$old" "$f"; then
+      rm -f "$old"
+      echo "    removed $old"
+    else
+      install -d -m 0755 "$EXAMPLES_DIR"
+      mv -f "$old" "$EXAMPLES_DIR/"
+      echo "    moved $old to $EXAMPLES_DIR/ (it differs from the shipped example)"
+    fi
   done
-  echo
-  echo "    They are inert until you rename one, so a copy cannot page you about"
-  echo "    a service this machine does not run:"
-  echo "      sudo mv $MONIT_CONF_DIR/alertloop-postgresql.conf.disabled \\"
-  echo "              $MONIT_CONF_DIR/alertloop-postgresql.conf"
+fi
+
+if [ "$WITH_EXAMPLES" -eq 1 ]; then
+  echo "==> Copying example rules to $EXAMPLES_DIR (Monit does not read it)"
+  install -d -m 0755 "$EXAMPLES_DIR"
+  copied=0
+  for f in "$SRC"/conf.d/*.conf; do
+    install -m 0644 "$f" "$EXAMPLES_DIR/alertloop-$(basename "$f")"
+    copied=$((copied + 1))
+  done
+  echo "    $copied rules. None is active. To enable one, copy it into"
+  echo "    Monit's conf.d, edit it there, validate and reload:"
+  echo "      sudo install -m 0600 $EXAMPLES_DIR/alertloop-postgresql.conf \\"
+  echo "              ${MONIT_CONF_DIR:-/etc/monit/conf.d}/"
 fi
 
 # --- validate --------------------------------------------------------------
@@ -141,6 +185,9 @@ if command -v monit >/dev/null 2>&1; then
     echo
     echo "    Nothing was reloaded. Apply it when you are ready:"
     echo "      sudo monit reload"
+    if [ "$removed_disabled" -gt 0 ]; then
+      echo "    Until then Monit keeps running the $removed_disabled example rule(s) removed above."
+    fi
   else
     echo
     echo "!! monit -t failed. NOT reloading Monit." >&2
@@ -181,7 +228,9 @@ Next:
        sudo alertloop-send --status resolved \\
          --dedupe-key "\$(hostname -s):install:test"
 
-  5. Enable the checks you actually want (see README.md), then:
+  5. Enable the checks you actually want: copy them from $EXAMPLES_DIR
+     (install.sh --with-examples) into Monit's conf.d and edit them there
+     (see README.md), then:
 
        sudo monit -t && sudo monit reload
 

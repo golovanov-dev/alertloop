@@ -104,15 +104,26 @@ func (s *sqlStore) insertEvent(ctx context.Context, ex execer, e *domain.Event) 
 }
 
 const insertDeliverySQL = `INSERT INTO delivery_attempts
-	(id, event_id, channel, channel_name, kind, state, attempts, max_attempts, next_retry_at, last_error, created_at, updated_at)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	(id, event_id, channel, channel_name, kind, state, attempts, max_attempts, next_retry_at, last_error, created_at, updated_at, fallback_of, recovery_for)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 func (s *sqlStore) insertDelivery(ctx context.Context, ex execer, d *domain.DeliveryAttempt) error {
-	_, err := ex.ExecContext(ctx, s.d.rebind(insertDeliverySQL),
-		d.ID, d.EventID, d.Channel, d.ChannelName, d.Kind.OrAlert(), d.State, d.Attempts, d.MaxAttempts,
-		nullableTime(d.NextRetryAt), d.LastError, formatTime(d.CreatedAt), formatTime(d.UpdatedAt),
-	)
+	_, err := ex.ExecContext(ctx, s.d.rebind(insertDeliverySQL), deliveryArgs(d)...)
 	return err
+}
+
+func deliveryArgs(d *domain.DeliveryAttempt) []any {
+	var fallbackOf, recoveryFor any
+	if d.FallbackOf != nil {
+		fallbackOf = d.FallbackOf.ID
+	}
+	if d.RecoveryFor != nil {
+		recoveryFor = d.RecoveryFor.ID
+	}
+	return []any{
+		d.ID, d.EventID, d.Channel, d.ChannelName, d.Kind.OrAlert(), d.State, d.Attempts, d.MaxAttempts,
+		nullableTime(d.NextRetryAt), d.LastError, formatTime(d.CreatedAt), formatTime(d.UpdatedAt), fallbackOf, recoveryFor,
+	}
 }
 
 func (s *sqlStore) CreateEvent(ctx context.Context, e *domain.Event) (*domain.Event, bool, error) {
@@ -335,17 +346,12 @@ func (s *sqlStore) TransitionEvent(ctx context.Context, id string, c StateChange
 	}
 
 	if c.RecoveryMaxAttempts > 0 {
-		targets, err := alertedChannels(ctx, tx, s.d, id)
+		alerts, err := alertsToRecover(ctx, tx, s.d, id)
 		if err != nil {
 			return nil, err
 		}
-		for _, t := range targets {
-			d := &domain.DeliveryAttempt{
-				ID: uuid.NewString(), EventID: id, Channel: t.Type, ChannelName: t.Name,
-				Kind: domain.KindRecovery, State: domain.DeliveryPending,
-				MaxAttempts: c.RecoveryMaxAttempts, CreatedAt: c.At, UpdatedAt: c.At,
-			}
-			if err := s.insertDelivery(ctx, tx, d); err != nil {
+		for _, a := range alerts {
+			if err := s.insertDelivery(ctx, tx, recoveryOf(a, c.RecoveryMaxAttempts, c.At)); err != nil {
 				return nil, fmt.Errorf("insert recovery attempt: %w", err)
 			}
 		}
@@ -541,17 +547,23 @@ func (s *sqlStore) deleteBatched(ctx context.Context, table, where string, args 
 
 // --- Delivery attempts ----------------------------------------------------
 
-const deliveryColumns = `id, event_id, channel, channel_name, kind, state, attempts, max_attempts, next_retry_at, last_error, created_at, updated_at`
+const deliveryColumns = `id, event_id, channel, channel_name, kind, state, attempts, max_attempts, next_retry_at, last_error, created_at, updated_at, fallback_of, recovery_for`
 
 func scanDelivery(sc interface{ Scan(...any) error }) (*domain.DeliveryAttempt, error) {
 	var d domain.DeliveryAttempt
-	var nextRetry sql.NullString
+	var nextRetry, fallbackOf, recoveryFor sql.NullString
 	var created, updated string
 	if err := sc.Scan(
 		&d.ID, &d.EventID, &d.Channel, &d.ChannelName, &d.Kind, &d.State, &d.Attempts, &d.MaxAttempts,
-		&nextRetry, &d.LastError, &created, &updated,
+		&nextRetry, &d.LastError, &created, &updated, &fallbackOf, &recoveryFor,
 	); err != nil {
 		return nil, err
+	}
+	if fallbackOf.Valid {
+		d.FallbackOf = &domain.AttemptLink{ID: fallbackOf.String}
+	}
+	if recoveryFor.Valid {
+		d.RecoveryFor = &domain.AttemptLink{ID: recoveryFor.String}
 	}
 	d.Kind = d.Kind.OrAlert()
 	if nextRetry.Valid && nextRetry.String != "" {
@@ -563,28 +575,39 @@ func scanDelivery(sc interface{ Scan(...any) error }) (*domain.DeliveryAttempt, 
 	return &d, nil
 }
 
-// alertedChannels lists the channels an alert for eventID was queued to: the
-// audience of its recovery notice, and nobody else. A cancelled alert was never
-// sent, so its channel is not told the incident is over.
-func alertedChannels(ctx context.Context, tx *sql.Tx, d dialect, eventID string) ([]domain.ChannelTarget, error) {
-	q := d.rebind(`SELECT DISTINCT channel, channel_name FROM delivery_attempts
+// alertsToRecover lists the alert attempts of eventID that closing it owes a
+// recovery notice: every one but a cancelled alert, which was never sent. A
+// dead-lettered alert counts, and so does a fallback copy: each gets its own
+// recovery, which ClaimDue holds until that very alert is sent.
+func alertsToRecover(ctx context.Context, tx *sql.Tx, d dialect, eventID string) ([]domain.DeliveryAttempt, error) {
+	q := d.rebind(`SELECT id, channel, channel_name FROM delivery_attempts
 		WHERE event_id = ? AND kind = ? AND state <> ?
-		ORDER BY channel_name`)
+		ORDER BY created_at, id`)
 	rows, err := tx.QueryContext(ctx, q, eventID, domain.KindAlert, domain.DeliveryCancelled)
 	if err != nil {
-		return nil, fmt.Errorf("list alerted channels: %w", err)
+		return nil, fmt.Errorf("list alerts to recover: %w", err)
 	}
 	defer rows.Close()
 
-	var out []domain.ChannelTarget
+	var out []domain.DeliveryAttempt
 	for rows.Next() {
-		var t domain.ChannelTarget
-		if err := rows.Scan(&t.Type, &t.Name); err != nil {
+		a := domain.DeliveryAttempt{EventID: eventID}
+		if err := rows.Scan(&a.ID, &a.Channel, &a.ChannelName); err != nil {
 			return nil, err
 		}
-		out = append(out, t)
+		out = append(out, a)
 	}
 	return out, rows.Err()
+}
+
+// recoveryOf is the pending recovery notice that follows alert a.
+func recoveryOf(a domain.DeliveryAttempt, maxAttempts int, at time.Time) *domain.DeliveryAttempt {
+	return &domain.DeliveryAttempt{
+		ID: uuid.NewString(), EventID: a.EventID, Channel: a.Channel, ChannelName: a.ChannelName,
+		Kind: domain.KindRecovery, State: domain.DeliveryPending,
+		MaxAttempts: maxAttempts, CreatedAt: at, UpdatedAt: at,
+		RecoveryFor: &domain.AttemptLink{ID: a.ID},
+	}
 }
 
 func (s *sqlStore) CreateDeliveryAttempt(ctx context.Context, d *domain.DeliveryAttempt) error {
@@ -600,7 +623,69 @@ func (s *sqlStore) GetDeliveryAttempt(ctx context.Context, id string) (*domain.D
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, domain.ErrNotFound
 	}
-	return d, err
+	if err != nil {
+		return nil, err
+	}
+	items := []domain.DeliveryAttempt{*d}
+	if err := s.linkAttempts(ctx, items); err != nil {
+		return nil, err
+	}
+	return &items[0], nil
+}
+
+// linkAttempts fills the channel and state of FallbackOf and RecoveryFor, and
+// FallbackTo, of items with one query for the whole page.
+func (s *sqlStore) linkAttempts(ctx context.Context, items []domain.DeliveryAttempt) error {
+	var ids, sources []any
+	for _, d := range items {
+		ids = append(ids, d.ID)
+		if d.FallbackOf != nil {
+			sources = append(sources, d.FallbackOf.ID)
+		}
+		if d.RecoveryFor != nil {
+			sources = append(sources, d.RecoveryFor.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	in := func(n int) string { return "(?" + strings.Repeat(", ?", n-1) + ")" }
+	q := `SELECT id, channel_name, state, fallback_of FROM delivery_attempts WHERE fallback_of IN ` + in(len(ids))
+	args := ids
+	if len(sources) > 0 {
+		q += ` OR id IN ` + in(len(sources))
+		args = append(args, sources...)
+	}
+	rows, err := s.db.QueryContext(ctx, s.d.rebind(q), args...)
+	if err != nil {
+		return fmt.Errorf("link delivery attempts: %w", err)
+	}
+	defer rows.Close()
+	linked := map[string]domain.AttemptLink{}
+	to := map[string]*domain.AttemptLink{}
+	for rows.Next() {
+		var l domain.AttemptLink
+		var of sql.NullString
+		if err := rows.Scan(&l.ID, &l.ChannelName, &l.State, &of); err != nil {
+			return err
+		}
+		linked[l.ID] = l
+		if of.Valid {
+			to[of.String] = &l
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for i := range items {
+		for _, l := range []*domain.AttemptLink{items[i].FallbackOf, items[i].RecoveryFor} {
+			if l != nil {
+				l.ChannelName, l.State = linked[l.ID].ChannelName, linked[l.ID].State
+			}
+		}
+		items[i].FallbackTo = to[items[i].ID]
+	}
+	return nil
 }
 
 func (s *sqlStore) ListDeliveryAttempts(ctx context.Context, f DeliveryFilter, limit int, cursor string) (Page[domain.DeliveryAttempt], error) {
@@ -667,6 +752,9 @@ func (s *sqlStore) ListDeliveryAttempts(ctx context.Context, f DeliveryFilter, l
 		page.Items = items[:limit]
 		page.NextCursor = encodeCursor(formatTime(last.CreatedAt), last.ID)
 	}
+	if err := s.linkAttempts(ctx, page.Items); err != nil {
+		return Page[domain.DeliveryAttempt]{}, err
+	}
 	return page, nil
 }
 
@@ -690,7 +778,10 @@ func (s *sqlStore) ListDeliveryAttempts(ctx context.Context, f DeliveryFilter, l
 // last_error is truncated by runes, not bytes: a cut through a multi-byte
 // character produces text PostgreSQL refuses to store, which is what made the
 // requeue loop above more than theoretical.
-func (s *sqlStore) MarkResult(ctx context.Context, d *domain.DeliveryAttempt) error {
+//
+// fallback, when not nil, is queued in the same transaction if what is stored
+// is `dead_letter` (see queueFallback).
+func (s *sqlStore) MarkResult(ctx context.Context, d *domain.DeliveryAttempt, fallback *domain.DeliveryAttempt) error {
 	at := d.UpdatedAt
 	if at.IsZero() {
 		at = time.Now()
@@ -711,17 +802,88 @@ func (s *sqlStore) MarkResult(ctx context.Context, d *domain.DeliveryAttempt) er
 	args = append(args, nullableTime(d.NextRetryAt), d.Attempts,
 		domain.TruncateRunes(d.LastError, domain.MaxLastErrorRunes),
 		formatTime(at), d.ID, domain.DeliverySending)
+	// One statement on the hot path; a transaction only when a fallback may
+	// have to be queued together with the result.
+	var qr interface {
+		QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+	} = s.db
+	var tx *sql.Tx
+	if fallback != nil {
+		var err error
+		if tx, err = s.db.BeginTx(ctx, nil); err != nil {
+			return fmt.Errorf("mark delivery result: %w", err)
+		}
+		defer tx.Rollback() //nolint:errcheck // no-op after a successful commit
+		qr = tx
+	}
 	var state string
-	err := s.db.QueryRowContext(ctx, q, args...).Scan(&state)
+	err := qr.QueryRowContext(ctx, q, args...).Scan(&state)
 	if errors.Is(err, sql.ErrNoRows) {
 		return domain.ErrNotFound
 	}
 	if err != nil {
 		return fmt.Errorf("mark delivery result: %w", err)
 	}
+	if tx != nil {
+		if domain.DeliveryState(state) == domain.DeliveryDeadLetter {
+			if err := s.queueFallback(ctx, tx, d.ID, fallback); err != nil {
+				return err
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit delivery result: %w", err)
+		}
+	}
 	d.State = domain.DeliveryState(state)
 	if d.State == domain.DeliveryCancelled {
 		d.NextRetryAt = nil
+	}
+	return nil
+}
+
+// queueFallback queues f, the fallback of the dead-lettered alert sourceID,
+// unless one was queued for it already: an alert that is replayed and
+// dead-letters again is not redirected twice (unique index on fallback_of).
+// The fallback channel gets the copy even if it has this alert of its own: the
+// copy is what says which channel is broken. f is queued if and only if
+// f.FallbackOf is set on return.
+//
+// When the incident is already resolved, its recoveries were queued before f
+// existed, and the fallback channel would hear "down" after "back up". So the
+// copy gets its recovery here, if the incident has recoveries at all
+// (notify_on_resolve); like every recovery it follows its own alert, the copy,
+// and ClaimDue holds it until the copy is sent. The event row is share-locked:
+// a resolve either waits and then queues the copy's recovery itself, or
+// committed before and is seen here. Either way the copy gets exactly one.
+func (s *sqlStore) queueFallback(ctx context.Context, tx *sql.Tx, sourceID string, f *domain.DeliveryAttempt) error {
+	f.FallbackOf = &domain.AttemptLink{ID: sourceID}
+	res, err := tx.ExecContext(ctx, s.d.rebind(insertDeliverySQL+` ON CONFLICT (fallback_of) DO NOTHING`), deliveryArgs(f)...)
+	if err != nil {
+		return fmt.Errorf("queue fallback attempt: %w", err)
+	}
+	if n, err := res.RowsAffected(); err != nil || n == 0 {
+		f.FallbackOf = nil // not queued: the caller must not report it
+		return err
+	}
+
+	var state string
+	q := s.d.rebind(`SELECT state FROM events WHERE id = ?` + s.d.shareLock())
+	if err := tx.QueryRowContext(ctx, q, f.EventID).Scan(&state); err != nil {
+		return fmt.Errorf("read event of fallback attempt: %w", err)
+	}
+	if domain.EventState(state) != domain.StateResolved {
+		return nil
+	}
+	var recoveries int
+	q = s.d.rebind(`SELECT COUNT(*) FROM delivery_attempts WHERE event_id = ? AND kind = ?`)
+	if err := tx.QueryRowContext(ctx, q, f.EventID, domain.KindRecovery).Scan(&recoveries); err != nil {
+		return fmt.Errorf("count recoveries of fallback attempt: %w", err)
+	}
+	if recoveries == 0 {
+		return nil
+	}
+	if err := s.insertDelivery(ctx, tx, recoveryOf(*f, f.MaxAttempts, f.CreatedAt)); err != nil {
+		return fmt.Errorf("insert recovery of fallback attempt: %w", err)
 	}
 	return nil
 }

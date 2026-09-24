@@ -5,6 +5,7 @@ import { useApp } from "../context";
 import { useDebounced } from "../hooks";
 import { c } from "../theme";
 import type { DeliveryAttempt } from "../types";
+import { CHANNEL_TYPES } from "../types";
 import { alertStates, Button, Card, DeliveriesTable, ErrorState, focusIfLost, Loading } from "../ui";
 
 export function Deliveries() {
@@ -176,7 +177,7 @@ export function Deliveries() {
         </select>
         <select aria-label="Channel type" value={channel} onChange={(e) => setChannel(e.target.value)} style={{ minWidth: 130 }}>
           <option value="">All channel types</option>
-          {["email", "telegram", "webhook"].map((s) => (
+          {CHANNEL_TYPES.map((s) => (
             <option key={s} value={s}>
               {s}
             </option>

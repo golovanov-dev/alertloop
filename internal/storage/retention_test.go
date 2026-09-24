@@ -196,7 +196,7 @@ func TestMarkResultOnlyWritesToAClaimedAttempt(t *testing.T) {
 
 	// Not claimed yet: a result must not apply.
 	att.State = domain.DeliverySent
-	if err := s.MarkResult(ctx, att); !errors.Is(err, domain.ErrNotFound) {
+	if err := s.MarkResult(ctx, att, nil); !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("MarkResult on a pending attempt: err = %v, want ErrNotFound", err)
 	}
 	stored, _ := s.GetDeliveryAttempt(ctx, "d1")
@@ -209,7 +209,7 @@ func TestMarkResultOnlyWritesToAClaimedAttempt(t *testing.T) {
 		t.Fatalf("claim: %v", err)
 	}
 	att.Attempts = 1
-	if err := s.MarkResult(ctx, att); err != nil {
+	if err := s.MarkResult(ctx, att, nil); err != nil {
 		t.Fatalf("MarkResult on a claimed attempt: %v", err)
 	}
 	stored, _ = s.GetDeliveryAttempt(ctx, "d1")
@@ -218,7 +218,7 @@ func TestMarkResultOnlyWritesToAClaimedAttempt(t *testing.T) {
 	}
 
 	// And a second, late result finds nothing to write to.
-	if err := s.MarkResult(ctx, att); !errors.Is(err, domain.ErrNotFound) {
+	if err := s.MarkResult(ctx, att, nil); !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("a repeated MarkResult: err = %v, want ErrNotFound", err)
 	}
 }
@@ -250,7 +250,7 @@ func TestLastErrorIsTruncatedByRunes(t *testing.T) {
 	att.State = domain.DeliveryFailed
 	att.Attempts = 1
 	att.LastError = "telegram: " + strings.Repeat("Ошибка сервера ", 200)
-	if err := s.MarkResult(ctx, att); err != nil {
+	if err := s.MarkResult(ctx, att, nil); err != nil {
 		t.Fatalf("mark result: %v", err)
 	}
 

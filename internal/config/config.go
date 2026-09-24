@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"net/url"
 	"os"
@@ -27,6 +28,10 @@ type Config struct {
 	Addr string `yaml:"addr"`
 	// AdminToken signs in to the admin console and grants full API access.
 	AdminToken string `yaml:"admin_token"`
+	// PublicURL is the address people open AlertLoop at (scheme://host[/path],
+	// without /admin). With it, every notification links to the event in the
+	// console; empty means no links. Stored without a trailing slash.
+	PublicURL string `yaml:"public_url"`
 	// APIKeys are the accepted service/API keys, each with a scope limiting what
 	// it can do. Configured in the YAML file only.
 	APIKeys []APIKey `yaml:"api_keys"`
@@ -168,6 +173,44 @@ type Channels struct {
 	Email    []EmailChannel    `yaml:"email"`
 	Telegram []TelegramChannel `yaml:"telegram"`
 	Webhook  []WebhookChannel  `yaml:"webhook"`
+	// Slack also serves Mattermost and Rocket.Chat incoming webhooks.
+	Slack    []ChatChannel     `yaml:"slack"`
+	Teams    []ChatChannel     `yaml:"teams"`
+	Discord  []ChatChannel     `yaml:"discord"`
+	Ntfy     []NtfyChannel     `yaml:"ntfy"`
+	Pushover []PushoverChannel `yaml:"pushover"`
+}
+
+// ChatChannel configures one Slack, Teams or Discord incoming webhook. The URL
+// is a secret: whoever has it can post to the channel.
+type ChatChannel struct {
+	Name     string        `yaml:"name"`
+	URL      string        `yaml:"url"`
+	Timeout  time.Duration `yaml:"timeout"`
+	Fallback string        `yaml:"fallback"`
+}
+
+// NtfyChannel configures one ntfy topic. Token, or username and password, is
+// needed only on a server with access control.
+type NtfyChannel struct {
+	Name     string        `yaml:"name"`
+	Server   string        `yaml:"server"`
+	Topic    string        `yaml:"topic"`
+	Token    string        `yaml:"token"`
+	Username string        `yaml:"username"`
+	Password string        `yaml:"password"`
+	Timeout  time.Duration `yaml:"timeout"`
+	Fallback string        `yaml:"fallback"`
+}
+
+// PushoverChannel configures one Pushover recipient: an application token and
+// a user or group key.
+type PushoverChannel struct {
+	Name     string        `yaml:"name"`
+	Token    string        `yaml:"token"`
+	UserKey  string        `yaml:"user_key"`
+	Timeout  time.Duration `yaml:"timeout"`
+	Fallback string        `yaml:"fallback"`
 }
 
 // EmailChannel configures one SMTP delivery target.
@@ -182,6 +225,7 @@ type EmailChannel struct {
 	STARTTLS bool          `yaml:"starttls"` // require STARTTLS upgrade (plaintext port, e.g. 587)
 	TLS      bool          `yaml:"tls"`      // implicit TLS / SMTPS (e.g. port 465)
 	Timeout  time.Duration `yaml:"timeout"`
+	Fallback string        `yaml:"fallback"`
 }
 
 // TelegramChannel configures one Telegram Bot API delivery target.
@@ -196,17 +240,52 @@ type TelegramChannel struct {
 	// the process-wide HTTP_PROXY/HTTPS_PROXY/NO_PROXY behavior. The setting is
 	// per channel on purpose: one instance may need a proxy for Telegram and a
 	// direct route for a webhook into an internal network.
-	Proxy   string        `yaml:"proxy"`
-	Timeout time.Duration `yaml:"timeout"`
+	Proxy    string        `yaml:"proxy"`
+	Timeout  time.Duration `yaml:"timeout"`
+	Fallback string        `yaml:"fallback"`
 }
 
 // WebhookChannel configures one generic outbound webhook target. Deliveries are
 // HMAC-signed over the request body with Secret.
 type WebhookChannel struct {
-	Name    string        `yaml:"name"`
-	URL     string        `yaml:"url"`
-	Secret  string        `yaml:"secret"`
-	Timeout time.Duration `yaml:"timeout"`
+	Name     string        `yaml:"name"`
+	URL      string        `yaml:"url"`
+	Secret   string        `yaml:"secret"`
+	Timeout  time.Duration `yaml:"timeout"`
+	Fallback string        `yaml:"fallback"`
+}
+
+// Fallbacks maps each channel that names a fallback to that fallback. An alert
+// that dead-letters on the channel is queued once to its fallback; an alert
+// that dead-letters on the fallback goes nowhere further.
+func (c Channels) Fallbacks() map[string]string {
+	out := map[string]string{}
+	add := func(name, fallback string) {
+		if fallback != "" {
+			out[name] = fallback
+		}
+	}
+	for _, e := range c.Email {
+		add(e.Name, e.Fallback)
+	}
+	for _, t := range c.Telegram {
+		add(t.Name, t.Fallback)
+	}
+	for _, w := range c.Webhook {
+		add(w.Name, w.Fallback)
+	}
+	for _, list := range [][]ChatChannel{c.Slack, c.Teams, c.Discord} {
+		for _, ch := range list {
+			add(ch.Name, ch.Fallback)
+		}
+	}
+	for _, t := range c.Ntfy {
+		add(t.Name, t.Fallback)
+	}
+	for _, p := range c.Pushover {
+		add(p.Name, p.Fallback)
+	}
+	return out
 }
 
 // Routing decides which channels an event is delivered to. Rules are evaluated
@@ -288,6 +367,7 @@ func (c Config) ShouldNotifyOnResolve() bool {
 const (
 	defaultSMTPPort     = 587
 	defaultTelegramBase = "https://api.telegram.org"
+	defaultNtfyServer   = "https://ntfy.sh"
 )
 
 // proxySchemes are the proxy URL schemes a channel may use. "socks5h" is
@@ -390,6 +470,7 @@ func Load(configPath string) (Config, error) {
 	}
 
 	normalizeChannels(&cfg.Channels)
+	cfg.PublicURL = strings.TrimRight(strings.TrimSpace(cfg.PublicURL), "/")
 	for i := range cfg.APIKeys {
 		if cfg.APIKeys[i].Scope == "" {
 			cfg.APIKeys[i].Scope = ScopeFull
@@ -444,6 +525,56 @@ func normalizeChannels(c *Channels) {
 			c.Webhook[i].Timeout = domain.DefaultChannelTimeout
 		}
 	}
+	for _, list := range [][]ChatChannel{c.Slack, c.Teams, c.Discord} {
+		for i := range list {
+			if list[i].Timeout == 0 {
+				list[i].Timeout = domain.DefaultChannelTimeout
+			}
+		}
+	}
+	for i := range c.Ntfy {
+		if c.Ntfy[i].Server == "" {
+			c.Ntfy[i].Server = defaultNtfyServer
+		}
+		if c.Ntfy[i].Timeout == 0 {
+			c.Ntfy[i].Timeout = domain.DefaultChannelTimeout
+		}
+	}
+	for i := range c.Pushover {
+		if c.Pushover[i].Timeout == 0 {
+			c.Pushover[i].Timeout = domain.DefaultChannelTimeout
+		}
+	}
+}
+
+// checkHTTPURL requires an absolute http or https URL. Its errors never echo
+// the value: a chat webhook URL is a secret.
+func checkHTTPURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return errors.New("url must be an absolute http:// or https:// address")
+	}
+	return nil
+}
+
+// checkPublicURL validates public_url: the address the console links are built
+// on, so a query or fragment would land in the middle of every link.
+func checkPublicURL(raw string) error {
+	if raw == "" {
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("public_url %q must be an absolute http:// or https:// address", raw)
+	}
+	if u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return fmt.Errorf("public_url %q must not have a query or fragment", raw)
+	}
+	// Links add /admin themselves; the console address would double it.
+	if strings.HasSuffix(strings.TrimRight(u.Path, "/"), "/admin") {
+		return fmt.Errorf("public_url %q ends with /admin: set the base address of AlertLoop, without /admin", raw)
+	}
+	return nil
 }
 
 // Validate checks that the configuration is internally consistent enough to
@@ -521,11 +652,61 @@ func (c Config) Validate() error {
 			return fmt.Errorf("webhook channel %q is incomplete (need url)", w.Name)
 		}
 	}
+	for kind, list := range map[string][]ChatChannel{"slack": c.Channels.Slack, "teams": c.Channels.Teams, "discord": c.Channels.Discord} {
+		for _, ch := range list {
+			if err := checkName(kind, ch.Name); err != nil {
+				return err
+			}
+			if ch.URL == "" {
+				return fmt.Errorf("%s channel %q is incomplete (need url)", kind, ch.Name)
+			}
+			if err := checkHTTPURL(ch.URL); err != nil {
+				return fmt.Errorf("%s channel %q: %w", kind, ch.Name, err)
+			}
+		}
+	}
+	for _, t := range c.Channels.Ntfy {
+		if err := checkName("ntfy", t.Name); err != nil {
+			return err
+		}
+		if t.Topic == "" {
+			return fmt.Errorf("ntfy channel %q is incomplete (need topic)", t.Name)
+		}
+		if err := checkHTTPURL(t.Server); err != nil {
+			return fmt.Errorf("ntfy channel %q: server %w", t.Name, err)
+		}
+		if t.Token != "" && t.Username != "" {
+			return fmt.Errorf("ntfy channel %q: set token or username and password, not both", t.Name)
+		}
+		if (t.Username == "") != (t.Password == "") {
+			return fmt.Errorf("ntfy channel %q: username and password go together", t.Name)
+		}
+	}
+	for _, p := range c.Channels.Pushover {
+		if err := checkName("pushover", p.Name); err != nil {
+			return err
+		}
+		if p.Token == "" || p.UserKey == "" {
+			return fmt.Errorf("pushover channel %q is incomplete (need token, user_key)", p.Name)
+		}
+	}
+	fallbacks := c.Channels.Fallbacks()
+	for _, name := range slices.Sorted(maps.Keys(fallbacks)) {
+		switch fb := fallbacks[name]; {
+		case fb == name:
+			return fmt.Errorf("channel %q: fallback names the channel itself", name)
+		case !seen[fb]:
+			return fmt.Errorf("channel %q: fallback %q is not a configured channel", name, fb)
+		}
+	}
 
 	if c.Routing != nil {
 		if err := c.Routing.validate(seen); err != nil {
 			return err
 		}
+	}
+	if err := checkPublicURL(c.PublicURL); err != nil {
+		return err
 	}
 	if _, err := ParseTrustedProxies(c.RateLimit.TrustedProxies); err != nil {
 		return fmt.Errorf("rate_limit.trusted_proxies: %w", err)
@@ -698,6 +879,20 @@ func (c Config) EnabledChannels() []string {
 	}
 	for _, w := range c.Channels.Webhook {
 		out = append(out, "webhook:"+w.Name)
+	}
+	for _, list := range []struct {
+		kind  string
+		chans []ChatChannel
+	}{{"slack", c.Channels.Slack}, {"teams", c.Channels.Teams}, {"discord", c.Channels.Discord}} {
+		for _, ch := range list.chans {
+			out = append(out, list.kind+":"+ch.Name)
+		}
+	}
+	for _, t := range c.Channels.Ntfy {
+		out = append(out, "ntfy:"+t.Name)
+	}
+	for _, p := range c.Channels.Pushover {
+		out = append(out, "pushover:"+p.Name)
 	}
 	return out
 }

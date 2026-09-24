@@ -29,6 +29,7 @@ AlertLoop's container.
 - [dedupe_key: the one thing to get right](#dedupe_key-the-one-thing-to-get-right)
 - [Diagnosing problems](#diagnosing-problems)
 - [Exit codes](#exit-codes)
+- [Spool](#spool)
 - [Limitations](#limitations)
 - [Watching AlertLoop itself](#watching-alertloop-itself)
 - [Rotating the API key](#rotating-the-api-key)
@@ -105,18 +106,22 @@ Not in a container, and not as part of AlertLoop:
 
 ## Requirements
 
-- Linux with `bash`, `curl`, and `jq`
+- Linux with `bash`, `curl`, `jq`, and `flock` (util-linux; installed by default
+  on Debian, Ubuntu, and RHEL-family systems)
 - Monit 5.x
 - an AlertLoop 0.4.0 or later instance this host can reach
 
 ```bash
 # Debian / Ubuntu
-sudo apt-get install -y monit curl jq
+sudo apt-get install -y monit curl jq util-linux
 
 # AlmaLinux / Rocky / RHEL  (monit is in EPEL)
 sudo dnf install -y epel-release
-sudo dnf install -y monit curl jq
+sudo dnf install -y monit curl jq util-linux
 ```
+
+`install.sh` checks for `curl`, `jq`, and `flock` first and installs nothing
+when one is missing: without them the adapter refuses every event.
 
 AlertLoop **0.4.0 is the minimum**. The incident lifecycle this integration
 depends on — `status: firing` / `status: resolved`, and recovery notifications —
@@ -133,7 +138,14 @@ sudo ./install.sh --with-examples
 
 That installs the scripts into `/usr/local/bin`, creates
 `/etc/alertloop/monit.env` (mode 0600, owned by root), and copies the example
-rules into Monit's `conf.d` **disabled**, as `alertloop-*.conf.disabled`.
+rules to `/etc/alertloop/monit-examples/`, a directory Monit does not read.
+
+Upgrading from a version before 0.8.0: those versions put the examples into
+Monit's `conf.d` as `alertloop-*.conf.disabled`, and Monit on Debian and Ubuntu
+(`include /etc/monit/conf.d/*`) loads those files too, suffix or not. The
+installer removes its own `*.conf.disabled` files from `conf.d` (a file you
+edited is moved to `/etc/alertloop/monit-examples/` instead) and lists them;
+run `sudo monit reload` afterwards to stop those checks.
 
 Nothing starts monitoring anything yet. That is on purpose: every example names
 a pidfile, a port, or a threshold that belongs to your machine. An installer
@@ -162,7 +174,8 @@ sudo nano /etc/alertloop/monit.env
 
 `install.sh` has already written every setting into that file, with
 `ALERTLOOP_SOURCE=monit`. Change the values in the existing lines; do not add
-new ones. When a setting appears twice, the last line wins, so an added
+a second line for a key the file already has. When a setting appears twice, the
+last line wins, so an added
 `ALERTLOOP_SOURCE=web-01` above the stock line leaves the source `monit`, and
 every alert from this host gets 403 and is lost; recoveries carry no source
 and can still pass, so the host looks fine. After editing, the three lines read:
@@ -172,6 +185,11 @@ ALERTLOOP_URL=http://127.0.0.1:8080
 ALERTLOOP_API_KEY=the-key-you-just-made
 ALERTLOOP_SOURCE=web-01
 ```
+
+A `monit.env` from an earlier version has no `ALERTLOOP_SPOOL_DIR` and
+`ALERTLOOP_SPOOL_MAX`. They are optional: without the lines the defaults apply
+(`/var/lib/alertloop-monit/spool`, 1000). Add a line only to change a default;
+re-running `install.sh` lists the optional keys the file does not set.
 
 The adapter reads everything after `=` as the value, so keep comments on lines
 of their own. AlertLoop on another host:
@@ -215,16 +233,20 @@ send the recovery. If you get a notification for one and not the other, check
 
 ## Enable the checks you want
 
-Rename the ones that apply to this machine, edit them, validate, reload:
+Copy the ones that apply to this machine into Monit's `conf.d`, edit the copy,
+validate, reload. As root, from any directory:
 
 ```bash
-cd /etc/monit/conf.d          # or /etc/monit.d on the RHEL family
-sudo mv alertloop-postgresql.conf.disabled alertloop-postgresql.conf
-sudo nano alertloop-postgresql.conf        # fix the pidfile path and the port
+# /etc/monit/conf.d on Debian and Ubuntu, /etc/monit.d on the RHEL family
+sudo install -m 0600 /etc/alertloop/monit-examples/alertloop-postgresql.conf /etc/monit/conf.d/
+sudo nano /etc/monit/conf.d/alertloop-postgresql.conf   # fix the pidfile path and the port
 
 sudo monit -t                              # validate BEFORE reloading
 sudo monit reload
 ```
+
+Anything in `conf.d` is live, whatever its name: to switch a check off, delete
+its file there (or move it out of `conf.d`), then `monit -t` and reload.
 
 Always run `monit -t` first. A failed reload can leave monitoring switched off,
 and monitoring that is off is worse than monitoring that is noisy, because
@@ -379,16 +401,34 @@ now rather than after you have learned to ignore it.
 
 A cron job has two failure modes and they need two different checks.
 
-**It ran and failed.** Wrap it:
+**It ran and failed.** Wrap it. In `/etc/cron.d/<file>` the wrapper runs as
+root, and the job itself as its own user through `runuser` (util-linux, the
+same package as `flock`); here the job runs as `app`:
 
 ```cron
-30 3 * * * app /usr/local/bin/cron-wrapper.sh daily-import /opt/app/bin/import.sh
+30 3 * * * root /usr/local/bin/cron-wrapper.sh daily-import /usr/sbin/runuser -u app -- /opt/app/bin/import.sh
 ```
 
+Write `runuser` with its full path: cron runs `/etc/cron.d` jobs with
+`PATH=/usr/bin:/bin`, where it is not, and the job would never start (the
+wrapper would report exit 127 every time). A root shell has `/usr/sbin` in its
+PATH, so trying the line by hand does not show this.
+
+The wrapper must run as root: it reports through `alertloop-send`, which reads
+the API key from `/etc/alertloop/monit.env` (0600, root). Keep that file
+root-only; do not open it to the job's user. Run as any other user, the wrapper
+reports nothing, and both it and the adapter say so on stderr and in syslog
+(`journalctl -t alertloop-send -t cron-wrapper`, or `grep -E
+'alertloop-send|cron-wrapper' /var/log/syslog`).
+
 The wrapper runs your command, reports `firing` with the last lines of its
-output if it fails, reports `resolved` on the next success, touches a freshness
-file, and exits with the job's own exit code so nothing else in your setup
-changes.
+output if it fails, reports `resolved` on the first success after a failure,
+touches a freshness file, and exits with the job's own exit code so nothing
+else in your setup changes. A success after a success reports nothing: the
+wrapper keeps the result of the job's last run in `<job>.last` in
+`/var/lib/alertloop-monit/cron` (`ALERTLOOP_CRON_STATE_DIR`). A job with no
+such file yet reports `resolved` on its first success; where the wrapper
+cannot write there, it reports `resolved` on every success.
 
 **It never ran at all.** Nothing reports that, because nothing ran. Watch the
 freshness file instead — `cron-freshness.conf`. This catches the cron daemon
@@ -499,21 +539,95 @@ wrappers and your own scripts can depend on them.
 | 0 | AlertLoop accepted the event | — |
 | 2 | Bad arguments or unusable configuration | No — fix it |
 | 3 | Could not build the payload | No |
-| 4 | AlertLoop returned 4xx | No — the request is wrong |
-| 5 | AlertLoop returned 5xx after retries | Later |
+| 4 | AlertLoop returned 4xx (not 409, not 429) | No — fix the request, the key, or the URL |
+| 5 | AlertLoop returned 5xx, 409 or 429 after retries | Later |
 | 6 | Could not reach AlertLoop | Later |
 | 7 | Retries exhausted | Later |
 | 8 | A bug in the adapter | Report it |
+| 9 | Not sent now; kept in the spool | No — the next run or `--flush` sends it |
+
+Codes 5, 6 and 7 mean the event was not sent and the spool could not be used
+either (see the `spool_unusable` warning in the log). Code 4 also comes from a
+spool AlertLoop refuses (see [Spool](#spool)): then the event is kept, but
+nothing goes out until the key or the URL is fixed.
+
+## Spool
+
+An event that is still unsent after the retries (network error, 409, 429, 5xx)
+is written to `/var/lib/alertloop-monit/spool` (`ALERTLOOP_SPOOL_DIR` in
+`monit.env`), one file per event, and the adapter exits 9. 409 is AlertLoop's
+`invalid_transition`: the incident was changed by other requests at the same
+moment, and the API asks for a retry. Any other 4xx is not spooled: sent again
+as it is, it would not pass.
+
+Every run first sends what is in the spool, oldest first, under `flock`; while
+older events are still unsent, a new one goes into the spool behind them, so a
+`resolved` never overtakes its `firing`. Past `ALERTLOOP_SPOOL_MAX` files
+(1000) the oldest are dropped, each with an `status=dropped` line on stderr and
+in syslog. `install.sh` creates the directory (0700, root);
+`uninstall.sh` tries to send what is left and tells you if anything stays.
+An event with the same `dedupe_key`, `status` and `severity` as the last
+spooled event for that key is not added again (`status=already_spooled` in the
+log); a `firing` with another severity is added.
+
+A spooled event that AlertLoop answers with 4xx:
+
+- 400, 413, 422, and 403 with error code `source_not_allowed`: AlertLoop
+  refuses the event itself. The file moves to `rejected/` inside the spool
+  directory, with a `status=rejected dedupe_key=... file=... reason=http_status=<code>
+  body=...` line on stderr and in syslog, and sending goes on with the next
+  event. `source_not_allowed` can also mean the key's `sources` list in
+  AlertLoop's config does not include this host's `source`: fix that, and the
+  event passes. To send a rejected event after the fix, move it back as root:
+  `sudo mv /var/lib/alertloop-monit/spool/rejected/<file>.json
+  /var/lib/alertloop-monit/spool/`, then `sudo alertloop-send --flush`. To
+  discard it, delete the file. `rejected/` does not count towards
+  `ALERTLOOP_SPOOL_MAX` and nothing cleans it up.
+- 409, as above, stays in the spool and is sent again on the next run
+  (`--flush` exits 9).
+- 401, 404, any other 403 and any other 4xx: a key or a URL to fix on this
+  host. The file stays, sending stops at it
+  (`status=kept_in_spool ... http_status=<code>`), and the run exits 4. A new
+  event goes into the spool behind it, also with exit 4. Fix the cause, then
+  run `sudo alertloop-send --flush`.
+
+Monit only runs the adapter when something changes, so send the spool on a
+timer as well. As root, in `/etc/cron.d/alertloop-monit`:
+
+```
+* * * * * root /usr/local/bin/alertloop-send --flush >/dev/null 2>&1
+```
+
+Or a systemd timer, as root:
+
+```
+sudo tee /etc/systemd/system/alertloop-monit-flush.service >/dev/null <<'EOF'
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/alertloop-send --flush
+EOF
+sudo tee /etc/systemd/system/alertloop-monit-flush.timer >/dev/null <<'EOF'
+[Timer]
+OnCalendar=minutely
+[Install]
+WantedBy=timers.target
+EOF
+sudo systemctl daemon-reload && sudo systemctl enable --now alertloop-monit-flush.timer
+```
+
+`alertloop-send --flush` exits 0 when the spool is empty afterwards and
+`rejected/` is empty too, 9 when events are still waiting for AlertLoop to come
+back, and 4 when AlertLoop refuses them (above) or when `rejected/` holds
+events waiting for a person (`status=rejected_waiting count=<n>` on stderr and
+in syslog). Under the systemd timer that shows as a failed
+`alertloop-monit-flush.service` until you resend or delete them.
 
 ## Limitations
 
 Read these before you rely on this in production.
 
-**No local queue.** If AlertLoop is unreachable, the adapter retries (twice by
-default, a second apart) and then gives up. The event is **lost** — the log line
-is the only trace. A guaranteed-delivery queue on disk is not part of this
-version. In practice this matters when AlertLoop is down for longer than a few
-seconds, which is exactly when you most want the message.
+**The spool is bounded and local.** Events beyond `ALERTLOOP_SPOOL_MAX`
+are dropped oldest first, and the spool lives and dies with this host.
 
 **A local Monit cannot report that AlertLoop is down**, because the report would
 go through AlertLoop. Nothing on this host can work around that. See

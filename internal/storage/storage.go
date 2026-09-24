@@ -61,9 +61,9 @@ type StateChange struct {
 	To   domain.EventState
 	At   time.Time
 	// RecoveryMaxAttempts, when positive, queues a pending recovery attempt for
-	// every channel an alert of the event was queued to, cancelled alerts
-	// excepted. A dead-lettered alert counts: ClaimDue holds its recovery until
-	// the alert is replayed and sent.
+	// every alert attempt of the event, cancelled alerts excepted, fallback
+	// copies included. A dead-lettered alert counts: ClaimDue holds its
+	// recovery until that alert is replayed and sent.
 	RecoveryMaxAttempts int
 	// CancelAlerts moves the event's pending and failed alert attempts to
 	// cancelled.
@@ -144,7 +144,11 @@ type DeliveryStore interface {
 	// finish. An alert that is not `sent` while its event is `muted` is stored
 	// as `cancelled` instead; d.State then reports what was stored. Returns
 	// domain.ErrNotFound if the attempt is no longer `sending`.
-	MarkResult(ctx context.Context, d *domain.DeliveryAttempt) error
+	//
+	// fallback, when not nil, is an alert to the fallback of d's channel. It is
+	// queued in the same transaction when d is stored as `dead_letter`, at most
+	// once per d, with a recovery when the incident is already resolved.
+	MarkResult(ctx context.Context, d *domain.DeliveryAttempt, fallback *domain.DeliveryAttempt) error
 	// Replay re-queues a dead_letter attempt as pending with attempts reset to
 	// zero, so it gets a full new cycle of retries, and returns the updated
 	// attempt.
@@ -170,6 +174,7 @@ type DeliveryStore interface {
 type Store interface {
 	EventStore
 	DeliveryStore
+	UserStore
 	// Migrate applies pending schema migrations.
 	Migrate(ctx context.Context) error
 	// Monitoring reads the absolute signals GET /v1/stats reports. now decides

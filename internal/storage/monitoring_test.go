@@ -48,8 +48,9 @@ func checkMonitoring(t *testing.T, s Store) {
 		{ID: "due", ChannelName: "a", Kind: domain.KindAlert, State: domain.DeliveryPending, CreatedAt: now.Add(-10 * time.Minute)},
 		// Created earlier, but its retry is not due yet.
 		{ID: "later", ChannelName: "b", Kind: domain.KindAlert, State: domain.DeliveryFailed, NextRetryAt: at(time.Minute), CreatedAt: now.Add(-time.Hour)},
-		// Older still, but held back until the alert on its channel is sent.
-		{ID: "held", ChannelName: "b", Kind: domain.KindRecovery, State: domain.DeliveryPending, CreatedAt: now.Add(-50 * time.Minute)},
+		// Older still, but held back until its alert is sent.
+		{ID: "held", ChannelName: "b", Kind: domain.KindRecovery, State: domain.DeliveryPending, CreatedAt: now.Add(-50 * time.Minute),
+			RecoveryFor: &domain.AttemptLink{ID: "later"}},
 		// Dead-lettered an hour ago counts; 25 hours ago does not.
 		{ID: "dl-recent", ChannelName: "c", Kind: domain.KindAlert, State: domain.DeliveryDeadLetter, CreatedAt: now.Add(-2 * time.Hour), UpdatedAt: now.Add(-time.Hour)},
 		{ID: "dl-old", ChannelName: "d", Kind: domain.KindAlert, State: domain.DeliveryDeadLetter, CreatedAt: now.Add(-26 * time.Hour), UpdatedAt: now.Add(-25 * time.Hour)},

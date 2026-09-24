@@ -122,8 +122,12 @@ ALERTLOOP_RETRY_COUNT=2
 ALERTLOOP_RETRY_DELAY_SECONDS=1
 ALERTLOOP_TIMEOUT_SECONDS=3
 ALERTLOOP_CONNECT_TIMEOUT_SECONDS=1
+ALERTLOOP_SPOOL_DIR=$WORK/not-a-dir/spool
 EOF
 chmod 600 "$CONFIG" 2>/dev/null || true
+# The tests above the spool section check the codes of an adapter whose spool
+# cannot be used: the directory sits under a file, which not even root can fix.
+: > "$WORK/not-a-dir"
 
 reset
 "$PY" "$HERE/mock-alertloop.py" "$PORT" "$REQUESTS" "$CONTROL" &
@@ -350,6 +354,7 @@ assert_eq "HTTP 204 is a success" "$RC" 0
 echo "-- unreachable AlertLoop"
 cat > "$WORK/closed.env" <<EOF
 ALERTLOOP_URL=http://127.0.0.1:1
+ALERTLOOP_SPOOL_DIR=$WORK/not-a-dir/spool
 ALERTLOOP_API_KEY=$API_KEY
 ALERTLOOP_RETRY_COUNT=1
 ALERTLOOP_RETRY_DELAY_SECONDS=1
@@ -428,6 +433,230 @@ reset
 MONIT_EVENT="Connection timed out" MONIT_DATE="Sat, 22 Aug 2026 19:30:00" run_glue firing critical availability
 key2="$(last_body | jq -r '.dedupe_key')"
 assert_eq "the key is stable across cycles" "$key1" "$key2"
+
+echo "-- spool"
+SPOOL="$WORK/spool"
+SPOOL_CONFIG="$WORK/spool.env"
+cat > "$SPOOL_CONFIG" <<EOF
+ALERTLOOP_URL=http://127.0.0.1:$PORT
+ALERTLOOP_API_KEY=$API_KEY
+ALERTLOOP_RETRY_COUNT=0
+ALERTLOOP_TIMEOUT_SECONDS=3
+ALERTLOOP_CONNECT_TIMEOUT_SECONDS=1
+ALERTLOOP_SPOOL_DIR=$SPOOL
+ALERTLOOP_SPOOL_MAX=3
+EOF
+spool_run() {
+  ALERTLOOP_SKIP_PERM_CHECK=1 "$SEND" --config "$SPOOL_CONFIG" "$@" >"$WORK/stdout" 2>"$WORK/stderr"
+  RC=$?
+  ERR="$(cat "$WORK/stderr")"
+}
+fire() { spool_run --status firing --dedupe-key "$1" --title t --message m; }
+spooled() { find "$SPOOL" -maxdepth 1 -name '*.json' 2>/dev/null | wc -l | tr -d ' '; }
+spooled_keys() { for f in "$SPOOL"/*.json; do jq -r .dedupe_key "$f"; done | tr '\n' ' '; }
+sent_keys() { jq -r '.body | fromjson | .dedupe_key' "$REQUESTS" | tr '\n' ' '; }
+
+sed "s#^ALERTLOOP_URL=.*#ALERTLOOP_URL=http://127.0.0.1:1#" "$SPOOL_CONFIG" > "$WORK/spool-closed.env"
+ALERTLOOP_SKIP_PERM_CHECK=1 "$SEND" --config "$WORK/spool-closed.env" --status firing --dedupe-key down:1 --title t --message m 2>/dev/null
+assert_eq "an unreachable AlertLoop spools the event and exits 9" "$?" 9
+assert_eq "the spooled event is on disk" "$(spooled_keys)" "down:1 "
+assert_eq "the spool directory is private" "$(stat -c '%a' "$SPOOL")" "700"
+assert_not_contains "the spool does not hold the API key" "$(cat "$SPOOL"/*.json)" "$API_KEY"
+
+reset
+printf '500\n' > "$CONTROL"
+fire order:2
+: > "$REQUESTS"
+spool_run --status resolved --dedupe-key order:1
+assert_eq "a resolve after an unsent alert is spooled too" "$RC" 9
+assert_eq "an event is not sent past older unsent ones" "$(request_count)" "1"
+printf '200\n' > "$CONTROL"
+: > "$REQUESTS"
+spool_run --flush
+assert_eq "--flush exits 0 once the spool is empty" "$RC" 0
+assert_eq "--flush sends oldest first" "$(sent_keys)" "down:1 order:2 order:1 "
+assert_eq "--flush empties the spool" "$(spooled)" "0"
+
+printf '500\n' > "$CONTROL"
+fire next:1
+printf '200\n' > "$CONTROL"
+: > "$REQUESTS"
+fire next:2
+assert_eq "the next run sends the spool first, then its own event" "$(sent_keys)" "next:1 next:2 "
+assert_eq "and exits 0" "$RC" 0
+
+reset
+printf '400\n' > "$CONTROL"
+fire rejected:1
+assert_eq "a 4xx is not spooled" "$RC$(spooled)" "40"
+
+printf '500\n' > "$CONTROL"
+for k in full:1 full:2 full:3 full:4; do fire "$k"; done
+assert_eq "a full spool drops the oldest" "$(spooled_keys)" "full:2 full:3 full:4 "
+assert_contains "the drop is logged" "$ERR" "status=dropped dedupe_key=full:1"
+rejected_keys() { for f in "$SPOOL"/rejected/*.json; do [ -e "$f" ] && jq -r .dedupe_key "$f"; done | tr '\n' ' '; }
+printf '400\n' > "$CONTROL"
+spool_run --flush
+assert_eq "a spooled event AlertLoop rejects leaves the queue; --flush exits 4 while it waits in rejected/" "$RC$(spooled)" "40"
+assert_eq "and is kept in rejected/, not deleted" "$(rejected_keys)" "full:2 full:3 full:4 "
+assert_contains "the move is logged" "$ERR" "status=rejected dedupe_key=full:2 file=$SPOOL/rejected/"
+assert_eq "rejected/ is private" "$(stat -c '%a' "$SPOOL/rejected")" "700"
+rm -f "$SPOOL"/rejected/*.json
+
+# Only an event refused for what it is moves to rejected/, and the events behind
+# it still go out. A refused key or a wrong URL is this host's to fix: the event
+# stays and --flush says so with 4.
+for code in 413 422 403:source_not_allowed; do
+  printf '500\n' > "$CONTROL"
+  fire "bad-body:$code"
+  fire "behind:$code"
+  printf '%s\n200\n' "$code" > "$CONTROL"
+  : > "$REQUESTS"
+  spool_run --flush
+  assert_eq "a spooled event answered $code moves to rejected/, --flush exits 4 while it waits" "$RC $(spooled) $(rejected_keys)" "4 0 bad-body:$code "
+  assert_eq "the event behind it answered $code is sent" "$(sent_keys)" "bad-body:$code behind:$code "
+  rm -f "$SPOOL"/rejected/*.json
+done
+# A rejected event moved back into the spool goes out on the next run.
+printf '500\n' > "$CONTROL"
+fire back:1
+printf '422\n' > "$CONTROL"
+spool_run --flush
+mv "$SPOOL"/rejected/*.json "$SPOOL"/
+printf '200\n' > "$CONTROL"
+: > "$REQUESTS"
+spool_run --flush
+assert_eq "a rejected event moved back is sent by --flush" "$RC $(sent_keys)$(spooled)" "0 back:1 0"
+
+# 409 is invalid_transition, which the API answers with "retry": it is spooled,
+# not refused, both when sent directly and when sent from the spool.
+printf '409\n' > "$CONTROL"
+fire conflict:1
+assert_eq "a 409 is spooled and exits 9" "$RC $(spooled_keys)" "9 conflict:1 "
+spool_run --flush
+assert_eq "--flush answered 409 keeps the event and exits 9" "$RC $(spooled_keys)$(rejected_keys)" "9 conflict:1 "
+printf '200\n' > "$CONTROL"
+spool_run --flush
+assert_eq "the 409 event goes out once AlertLoop takes it" "$RC $(spooled)" "0 0"
+printf '500\n' > "$CONTROL"
+fire key:1
+for code in 401 403:forbidden 404; do
+  printf '%s\n' "$code" > "$CONTROL"
+  spool_run --flush
+  assert_eq "--flush answered $code keeps the event and exits 4" "$RC $(spooled_keys)" "4 key:1 "
+done
+assert_contains "the kept event is logged" "$ERR" "status=kept_in_spool dedupe_key=key:1 http_status=404"
+fire key:2
+assert_eq "a new event behind a refused spool is kept and exits 4" "$RC $(spooled_keys)" "4 key:1 key:2 "
+printf '200\n' > "$CONTROL"
+: > "$REQUESTS"
+spool_run --flush
+assert_eq "once the key is fixed the kept events go out in order" "$RC $(sent_keys)" "0 key:1 key:2 "
+
+# A repeat of the last spooled event for a key (same status and severity) adds
+# nothing: a stream of identical events must not push older ones out of the
+# bounded spool.
+printf '500\n' > "$CONTROL"
+fire same:1
+fire same:1
+spool_run --status resolved --dedupe-key same:1
+spool_run --status resolved --dedupe-key same:1
+assert_eq "an identical event is not spooled twice" "$RC $(spooled_keys)" "9 same:1 same:1 "
+assert_eq "firing then resolved are both kept" \
+  "$(for f in "$SPOOL"/*.json; do jq -r .status "$f"; done | tr '\n' ' ')" "firing resolved "
+fire same:1
+assert_eq "a firing after the resolved is kept" "$(spooled)" "3"
+printf '200\n' > "$CONTROL"
+spool_run --flush
+printf '500\n' > "$CONTROL"
+spool_run --status firing --severity warning --dedupe-key disk:1 --title t --message m
+spool_run --status firing --severity critical --dedupe-key disk:1 --title t --message m
+assert_eq "a firing with another severity is kept" \
+  "$(for f in "$SPOOL"/*.json; do jq -r .severity "$f"; done | tr '\n' ' ')" "warning critical "
+printf '200\n' > "$CONTROL"
+spool_run --flush
+
+echo "-- cron-wrapper"
+cron_run() {
+  ALERTLOOP_SKIP_PERM_CHECK=1 ALERTLOOP_CONFIG_FILE="$SPOOL_CONFIG" ALERTLOOP_SEND="$SEND" \
+    ALERTLOOP_HEARTBEAT_DIR="$WORK/heartbeats" ALERTLOOP_CRON_STATE_DIR="$WORK/cron-state" \
+    ALERTLOOP_HOST_OVERRIDE=server-01 \
+    "$HERE/../examples/cron-wrapper.sh" nightly "$@" >/dev/null 2>"$WORK/stderr"
+  RC=$?
+}
+statuses() { jq -r '.body | fromjson | .status' "$REQUESTS" | tr '\n' ' '; }
+reset
+cron_run true
+assert_eq "the first run of a job reports resolved once" "$RC $(statuses)" "0 resolved "
+: > "$REQUESTS"
+cron_run true
+assert_eq "a success after a success reports nothing" "$RC $(request_count)" "0 0"
+cron_run false
+assert_eq "a failure reports firing and keeps the job's exit code" "$RC $(statuses)" "1 firing "
+cron_run true
+assert_eq "the success after it reports resolved" "$RC $(statuses)" "0 firing resolved "
+cron_run true
+assert_eq "the next success reports nothing" "$(statuses)" "firing resolved "
+printf '500\n' > "$CONTROL"
+cron_run false
+cron_run true
+cron_run true
+printf '200\n' > "$CONTROL"
+: > "$REQUESTS"
+spool_run --flush
+assert_eq "a spooled recovery is not repeated by the next success" "$(statuses)" "firing resolved "
+
+printf '500\n' > "$CONTROL"
+sed -i 's/^ALERTLOOP_SPOOL_MAX=.*/ALERTLOOP_SPOOL_MAX=10/' "$SPOOL_CONFIG"
+pids=()
+for k in 1 2 3 4 5 6; do
+  ALERTLOOP_SKIP_PERM_CHECK=1 "$SEND" --config "$SPOOL_CONFIG" --status firing --dedupe-key "par:$k" --title t --message m 2>/dev/null &
+  pids+=("$!")
+done
+codes=""
+for p in "${pids[@]}"; do wait "$p"; codes="$codes$?"; done
+assert_eq "parallel runs all spool" "$codes" "999999"
+assert_eq "parallel runs lose no event" "$(spooled_keys | tr ' ' '\n' | sort | tr '\n' ' ')" "par:1 par:2 par:3 par:4 par:5 par:6 "
+printf '200\n' > "$CONTROL"
+: > "$REQUESTS"
+spool_run --flush
+assert_eq "the parallel events are all sent once" "$RC $(request_count)" "0 6"
+
+echo "-- unreadable config"
+# Run as a user who cannot read monit.env (a cron job run as the app user): the
+# error must reach syslog, not only a cron mail nobody gets. A stub logger
+# records what would go to syslog.
+UNREAD="$(mktemp -d)"
+chmod 755 "$UNREAD"
+mkdir "$UNREAD/bin"
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s/syslog"\n' "$UNREAD" > "$UNREAD/bin/logger"
+chmod 755 "$UNREAD/bin/logger"
+: > "$UNREAD/syslog"
+chmod 666 "$UNREAD/syslog"
+cp "$SEND" "$UNREAD/alertloop-send"
+cp "$HERE/../examples/cron-wrapper.sh" "$UNREAD/cron-wrapper.sh"
+cp "$SPOOL_CONFIG" "$UNREAD/monit.env"
+chmod 755 "$UNREAD/alertloop-send" "$UNREAD/cron-wrapper.sh"
+as_user=()
+if [ "$(id -u)" -eq 0 ]; then
+  chmod 600 "$UNREAD/monit.env"
+  as_user=(runuser -u nobody --)
+else
+  chmod 000 "$UNREAD/monit.env"
+fi
+${as_user[@]+"${as_user[@]}"} env PATH="$UNREAD/bin:$PATH" "$UNREAD/alertloop-send" --config "$UNREAD/monit.env" \
+  --status resolved --dedupe-key k 2>"$UNREAD/stderr"
+assert_eq "an unreadable config exits 2" "$?" 2
+assert_contains "the error is on stderr" "$(cat "$UNREAD/stderr")" "config_not_readable:$UNREAD/monit.env"
+assert_contains "and in syslog" "$(cat "$UNREAD/syslog")" "-t alertloop-send -p user.err status=failed error=config_not_readable"
+: > "$UNREAD/syslog"
+${as_user[@]+"${as_user[@]}"} env PATH="$UNREAD/bin:$PATH" ALERTLOOP_SEND="$UNREAD/alertloop-send" \
+  ALERTLOOP_CONFIG_FILE="$UNREAD/monit.env" ALERTLOOP_HEARTBEAT_DIR="$UNREAD/hb" \
+  ALERTLOOP_CRON_STATE_DIR="$UNREAD/state" "$UNREAD/cron-wrapper.sh" nightly false >/dev/null 2>"$UNREAD/stderr"
+assert_eq "the wrapper keeps the job's exit code" "$?" 1
+assert_contains "the wrapper run by that user leaves the adapter's error in syslog" "$(cat "$UNREAD/syslog")" "config_not_readable"
+assert_contains "and its own" "$(cat "$UNREAD/syslog")" "-t cron-wrapper -p user.err could not report the failure of nightly (exit 2)"
+rm -rf "$UNREAD"
 
 echo
 echo "-------------------------------------"

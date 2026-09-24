@@ -57,7 +57,7 @@ func NewTelegram(c TelegramConfig) *Telegram {
 		botToken: c.BotToken,
 		chatID:   c.ChatID,
 		apiBase:  strings.TrimRight(c.APIBase, "/"),
-		client:   &http.Client{Timeout: c.Timeout, Transport: newTransport(c.Proxy)},
+		client:   &http.Client{Timeout: c.Timeout, Transport: newTransport(c.Proxy), CheckRedirect: noRedirect},
 	}
 	if c.BotToken != "" {
 		t.secrets = append(t.secrets, c.BotToken)
@@ -135,6 +135,9 @@ func (t *Telegram) Send(ctx context.Context, n domain.Notification) error {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		return redirectError("telegram", resp)
+	}
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
 	var tr telegramResponse
 	_ = json.Unmarshal(data, &tr)

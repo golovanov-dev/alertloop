@@ -50,7 +50,7 @@ func NewWebhook(name, url, secret string, timeout time.Duration) *Webhook {
 		url:    url,
 		origin: originOf(url),
 		secret: secret,
-		client: &http.Client{Timeout: timeout},
+		client: &http.Client{Timeout: timeout, CheckRedirect: noRedirect},
 	}
 }
 
@@ -83,10 +83,18 @@ func (w *Webhook) Timeout() time.Duration { return w.client.Timeout }
 // `kind` was added in 0.4.0 and is always present. A receiver that ignores it
 // keeps working exactly as before; one that reads it can close its own ticket
 // when an incident recovers instead of opening a second one.
+//
+// `fallback` (0.8.0) is present only on an alert redirected from a channel that
+// could not deliver it: that channel's name and its last error.
+//
+// `event_url` (0.8.0) is the event's page in the admin console, present only
+// when public_url is configured.
 type webhookPayload struct {
-	Event     *domain.Event       `json:"event"`
-	Kind      domain.DeliveryKind `json:"kind"`
-	Timestamp string              `json:"timestamp"`
+	Event     *domain.Event          `json:"event"`
+	Kind      domain.DeliveryKind    `json:"kind"`
+	Fallback  *domain.FallbackOrigin `json:"fallback,omitempty"`
+	EventURL  string                 `json:"event_url,omitempty"`
+	Timestamp string                 `json:"timestamp"`
 }
 
 func (w *Webhook) Type() domain.ChannelType { return domain.ChannelWebhook }
@@ -96,6 +104,8 @@ func (w *Webhook) Send(ctx context.Context, n domain.Notification) error {
 	body, err := json.Marshal(webhookPayload{
 		Event:     n.Event,
 		Kind:      kind,
+		Fallback:  n.Fallback,
+		EventURL:  n.EventURL,
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 	})
 	if err != nil {
@@ -121,6 +131,9 @@ func (w *Webhook) Send(ctx context.Context, n domain.Notification) error {
 	// Drain a small amount so the connection can be reused.
 	_, _ = io.CopyN(io.Discard, resp.Body, 4096)
 
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		return redirectError("webhook", resp)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("webhook returned status %d", resp.StatusCode)
 	}

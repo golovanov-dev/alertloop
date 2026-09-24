@@ -11,15 +11,18 @@ import (
 
 // deliverableCond selects the attempts, aliased c, that ClaimDue may take: it
 // is also what "due" means in Monitoring. Its one placeholder is now.
+//
+// A recovery is deliverable only once the alert it follows (recovery_for) is
+// `sent`. A recovery with no alert on record (written before 0.8.0 for a
+// channel whose alert was never stored) waits for nothing, as it did then.
 var deliverableCond = fmt.Sprintf(`c.state IN ('%[1]s', '%[2]s')
 			  AND (c.next_retry_at IS NULL OR c.next_retry_at <= ?)
-			  AND (c.kind <> '%[3]s' OR NOT EXISTS (
+			  AND (c.kind <> '%[3]s' OR c.recovery_for IS NULL OR EXISTS (
 				SELECT 1 FROM delivery_attempts a
-				WHERE a.event_id = c.event_id AND a.kind = '%[4]s'
-				  AND a.channel_name = c.channel_name AND a.state <> '%[5]s'
+				WHERE a.id = c.recovery_for AND a.state = '%[4]s'
 			  ))`,
 	domain.DeliveryPending, domain.DeliveryFailed,
-	domain.KindRecovery, domain.KindAlert, domain.DeliverySent)
+	domain.KindRecovery, domain.DeliverySent)
 
 // ClaimDue atomically transitions up to limit deliverable attempts to
 // `sending` and returns them. "Deliverable" means state pending or failed with
@@ -27,12 +30,13 @@ var deliverableCond = fmt.Sprintf(`c.state IN ('%[1]s', '%[2]s')
 // FOR UPDATE SKIP LOCKED so multiple workers never grab the same row; on SQLite
 // the single-writer connection provides the same guarantee.
 //
-// A recovery is not deliverable while the alert of the same event to the same
-// channel is anything but `sent`: otherwise an alert waiting for a retry
-// arrives after its own "resolved". Each occurrence of an incident is its own
-// event, so a recovery only ever waits for the alert of its own occurrence.
-// A dead-lettered alert keeps its recovery waiting until the alert is replayed
-// and sent, so no channel receives a recovery without the alert.
+// A recovery is not deliverable until its own alert (recovery_for) is `sent`:
+// otherwise an alert waiting for a retry arrives after its own "resolved".
+// Only that alert counts, not other alerts to the same channel: a direct alert
+// that dead-lettered or was cancelled does not hold the recovery of a fallback
+// copy that got through. A dead-lettered alert keeps its own recovery waiting
+// until the alert is replayed and sent, so no recovery goes out ahead of its
+// alert.
 //
 // Attempts to the channels named in skipChannels are left in the queue: the
 // worker passes the channels whose share of its slots is used up.

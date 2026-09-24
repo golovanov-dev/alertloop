@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"github.com/golovanov-dev/alertloop/internal/adminui"
+	"github.com/golovanov-dev/alertloop/internal/auth"
 	"github.com/golovanov-dev/alertloop/internal/config"
 	"github.com/golovanov-dev/alertloop/internal/routing"
 	"github.com/golovanov-dev/alertloop/internal/service"
@@ -29,6 +30,12 @@ type Server struct {
 	// Rate limiters (nil when disabled).
 	ipLimiter     *keyedLimiter
 	ingestLimiter *tokenBucket
+	// loginLimiter bounds console sign-in attempts per client address; it is
+	// on even when rate_limit is off. throttle backs off per login and
+	// address. passwordChecks bounds the argon2id checks running at once.
+	loginLimiter   *keyedLimiter
+	throttle       *auth.Throttle
+	passwordChecks chan struct{}
 }
 
 // Config wires a Server.
@@ -53,6 +60,13 @@ type Config struct {
 	TrustedProxies *TrustedProxies
 }
 
+// Console sign-in attempts per client address: a burst of 10, then one every
+// 6 seconds.
+const (
+	loginPerSecond = 1.0 / 6
+	loginBurst     = 10
+)
+
 // NewServer builds a Server from its dependencies.
 func NewServer(c Config) *Server {
 	log := c.Logger
@@ -75,6 +89,9 @@ func NewServer(c Config) *Server {
 		version:        c.Version,
 		trustedProxies: c.TrustedProxies,
 		log:            log,
+		loginLimiter:   newKeyedLimiter(loginPerSecond, loginBurst),
+		throttle:       auth.NewThrottle(nil),
+		passwordChecks: make(chan struct{}, maxPasswordChecks),
 	}
 	if c.RateLimit.Enabled {
 		s.ipLimiter = newKeyedLimiter(c.RateLimit.PerIPPerSecond, c.RateLimit.PerIPBurst)
@@ -104,11 +121,12 @@ func (s *Server) Handler() http.Handler {
 	api.HandleFunc("POST /v1/routing/preview", requireScope(config.ScopeFull, s.handleRoutingPreview))
 	api.HandleFunc("GET /v1/stats", requireScope(config.ScopeRead, s.handleStats))
 	api.HandleFunc("GET /v1/info", requireScope(config.ScopeRead, s.handleInfo))
-	mux.Handle("/v1/", apiKeyAuth(s.apiKeys, s.apiKeySources, s.adminToken, api))
+	mux.Handle("/v1/", s.sessionOrKey(apiKeyAuth(s.apiKeys, s.apiKeySources, s.adminToken, api), api))
 
-	// Admin console SPA (static, unguarded assets — the app authenticates via
-	// the API using the admin token).
+	// Admin console SPA (static, unguarded assets) and its sign-in endpoints:
+	// the console authenticates with a session cookie (auth.go).
 	adminui.Register(mux)
+	s.registerAuth(mux)
 
 	// Health/readiness (unguarded).
 	mux.HandleFunc("GET /health", s.handleHealth)

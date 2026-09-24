@@ -20,11 +20,14 @@ delivers them by email, Telegram, and webhooks.
   `acknowledged`, `resolved`, `muted`, `escalated`.
 - Deduplication by `dedupe_key`, and an [incident lifecycle](#incident-lifecycle)
   with automatic recovery notifications.
-- Email (SMTP), Telegram (optionally through a proxy), and HMAC-signed webhooks,
-  several of each.
+- Email (SMTP), Telegram (optionally through a proxy), HMAC-signed webhooks,
+  Slack (also Mattermost and Rocket.Chat), Microsoft Teams, Discord, ntfy, and
+  Pushover, several of each; with `public_url` set, every notification links
+  to its event in the console.
 - [Routing rules](#routing-rules) by type, severity, source, and category.
-- Retries with backoff, dead-letter, and replay; retention cleanup (30 days).
-- Admin console at `/admin`, embedded in the binary.
+- Retries with backoff, dead-letter, and replay; a [fallback channel](#fallback-channel)
+  for alerts a channel could not deliver; retention cleanup (30 days).
+- Admin console at `/admin`, embedded in the binary, with user accounts.
 - SQLite (embedded) or PostgreSQL 12+.
 - [Monit integration](integrations/monit/) for Linux server monitoring.
 
@@ -138,8 +141,9 @@ cp -n .env.example .env   # COMPOSE_PROFILES=demo is preset
 docker compose up -d --wait --wait-timeout 120
 ```
 
-One container on SQLite. Open <http://localhost:8080/admin> and sign in with
-`change-me-admin`. The demo takes no channels: it stores events and delivers
+One container on SQLite. Open <http://localhost:8080/admin> and create the first
+administrator: `change-me-admin` as the admin token, then a login and a password
+of at least 12 characters. The demo takes no channels: it stores events and delivers
 nothing. This public token works only from loopback or a private network: from a
 public address, or through a reverse proxy that sends `X-Forwarded-For` or
 `X-Real-IP` (the examples in `deploy/proxy/` do), it gets 403. Beyond a local
@@ -148,23 +152,41 @@ try, set `ALERTLOOP_ADMIN_TOKEN` in `.env` to the output of
 
 ## Admin console and HTTPS
 
-The admin console is at `/admin`, served by the same process as the API; sign
-in with the admin token or an API key with scope `full`. A `read` or `ingest`
-key is refused. On a server, reach it through an HTTPS reverse proxy:
-the binary and the Compose `postgres` profile are reachable on `127.0.0.1` only.
-The demo token does not work through a proxy (see above).
+The admin console is at `/admin`, served by the same process as the API. Sign
+in with a login and password; every user is an administrator.
 
-AlertLoop speaks plain HTTP. Put an HTTPS reverse proxy in front; one rule
-covers the API, `/admin`, and `/swagger`. Ready-to-adapt configs:
-`deploy/proxy/nginx.conf` and `deploy/proxy/apache.conf`, both forwarding to
-`127.0.0.1:8080`. Get a certificate with `certbot`.
+The first time, the console asks you to create the first administrator: the
+admin token (`ALERTLOOP_ADMIN_TOKEN` in `.env`, or in
+`/etc/alertloop/alertloop.env` under systemd), a login, and a password of at
+least 12 characters. The admin token does not open the console after that. Add
+more users on the console's Users screen or with `alertloop user`:
+[Console users](OPERATIONS.md#console-users).
 
-Behind the proxy, set `rate_limit.trusted_proxies` in the config, and rate limit
-on the proxy too. Under Compose the proxy arrives from the Compose network
+The binary and the Compose `postgres` profile listen on `127.0.0.1` and speak
+plain HTTP, and sign-in over plain HTTP is accepted only from this machine or
+its private network reached directly (an SSH tunnel, the Compose gateway).
+On a server, reach the console one of two ways.
+
+**With a domain**, through an HTTPS reverse proxy; one rule covers the API,
+`/admin`, and `/swagger`. Ready-to-adapt configs: `deploy/proxy/nginx.conf` and
+`deploy/proxy/apache.conf`, both forwarding to `127.0.0.1:8080`. Get a
+certificate with `certbot`. Set `rate_limit.trusted_proxies` in the config to
+the proxy's address, or sign-in through the proxy gets 403, and rate limit on
+the proxy too. The proxy must pass the original `Host` header
+(`proxy_set_header Host $host;` in nginx, `ProxyPreserveHost On` in Apache;
+both shipped configs do) or send `X-Forwarded-Host`, or the console's requests
+get 403. Under Compose the proxy arrives from the Compose network
 gateway, not `127.0.0.1`:
 
 ```bash
 docker network inspect alertloop_default -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}'
+```
+
+**Without a domain**, through an SSH tunnel from your workstation (a changed
+port goes after `127.0.0.1:`), then open <http://localhost:8080/admin>:
+
+```bash
+ssh -N -L 8080:127.0.0.1:8080 user@server
 ```
 
 ## Sending events
@@ -257,9 +279,57 @@ either they do not start, and without a config file they do not start either.
 ### Channels
 
 No channels is a valid setup: events are stored and delivered nowhere. A channel
-with a missing required field stops the start. Email, Telegram, and webhook
-entries are shown in `alertloop.example.yaml`. SMTP needs `starttls: true`
-(port 587) or `tls: true` (port 465).
+with a missing required field stops the start. Each type is a list of named
+channels; every entry of every type is shown in `alertloop.example.yaml`, and
+each takes `timeout` (default 10s) and `fallback`.
+
+| Type | Where to get what it needs | Required keys |
+|---|---|---|
+| `email` | Your SMTP provider. Port 587 needs `starttls: true`, port 465 `tls: true`. | `host`, `from`, `to` |
+| `telegram` | A bot from @BotFather, and the id of the chat it is in. | `bot_token`, `chat_id` |
+| `webhook` | Your own receiver. | `url` |
+| `slack` | Slack: api.slack.com/apps → Create New App → From scratch → Incoming Webhooks: On → Add New Webhook → pick the channel → copy the Webhook URL. Mattermost: Integrations → Incoming Webhooks. Rocket.Chat: Administration → Integrations → New → Incoming. | `url` |
+| `teams` | In the Teams channel: ⋯ → Workflows → "Send webhook alerts to a channel"; copy the URL the workflow shows. | `url` |
+| `discord` | Channel settings → Integrations → Webhooks → New Webhook → Copy Webhook URL (needs the Manage Webhooks permission). | `url` |
+| `ntfy` | A topic on ntfy.sh or on your server (`server`); subscribe to it in the ntfy app (Android, iOS or web), or nobody sees the messages. With access control: `token` (ntfy.sh: Account → Access tokens; your server: `ntfy token add <user>`), or `username` and `password`. | `topic` |
+| `pushover` | pushover.net: the user key on your dashboard, and a token from "Create an Application/API Token". | `token`, `user_key` |
+
+```yaml
+channels:
+  slack:
+    - name: ops-chat          # the same type for Mattermost and Rocket.Chat
+      url: "https://hooks.slack.com/services/T000/B000/XXXX"
+      fallback: ops-phone
+  ntfy:
+    - name: ops-phone
+      topic: "alertloop-ops-4f9c2e"   # on ntfy.sh, whoever knows the topic reads it
+  pushover:
+    - name: ops-pager
+      token: "APP_TOKEN"
+      user_key: "USER_KEY"
+```
+
+The `url` of a `slack`, `teams` or `discord` channel lets anyone post to that
+channel, and an ntfy `topic` without access control lets anyone read it: keep
+them like passwords. Delivery errors show only the scheme and host, and never a
+topic, token or key.
+
+Each channel shows the severity its own way; a recovery starts with
+`[RESOLVED]` and is green or quiet:
+
+| | critical | error | warning | info, success | recovery |
+|---|---|---|---|---|---|
+| Slack, Teams, Discord | red | orange | yellow | blue, green | green |
+| ntfy priority | 5 | 4 | 3 | 2 | 2 |
+| Pushover priority | 1 | 0 | 0 | −1 | −1 |
+
+Text past a service's length limit is cut and ends with `… [truncated]`.
+
+With `public_url` set to the address people open AlertLoop at
+(`public_url: "https://alerts.example.com"`, without `/admin`), every
+notification links to its event in the console: a `Link:` line in email and
+Telegram, a link in Slack, Teams and Discord, the click action in ntfy and
+Pushover, and `event_url` in the webhook payload.
 
 A host that cannot reach `api.telegram.org` can use, per Telegram channel,
 either a `proxy` (`http`, `https`, `socks5`, `socks5h`) or an `api_base` Bot API
@@ -273,15 +343,77 @@ mirror:
       # or: api_base: "https://tg-mirror.example.com"
 ```
 
-MTProto proxies do not work for the Bot API. Without `proxy`, the standard
-`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` variables apply.
+MTProto proxies do not work for the Bot API. Without `proxy`, and for every
+other channel type, the standard `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`
+variables apply; under Docker Compose, set them in `.env`.
+
+A receiver on the same host as a Compose install (your ntfy, Mattermost,
+Rocket.Chat or webhook) is not at `127.0.0.1`: inside a container that is the
+container itself. Create `docker-compose.override.yml` next to
+`docker-compose.yml`:
+
+```yaml
+services:
+  alertloop:   # demo profile
+    extra_hosts: ["host.docker.internal:host-gateway"]
+  worker:      # postgres profile
+    extra_hosts: ["host.docker.internal:host-gateway"]
+```
+
+and put `http://host.docker.internal:<port>` in the channel; the receiver must
+listen on an address other than `127.0.0.1`. Without the override file, use the
+gateway address of the Compose network instead:
+`docker network inspect alertloop_default --format '{{(index .IPAM.Config 0).Gateway}}'`.
 
 A webhook channel POSTs JSON `{"event": {...}, "kind": "alert"|"recovery",
-"timestamp": "<RFC 3339>"}`. With `secret` set, each request carries
+"timestamp": "<RFC 3339>"}`, plus `"event_url"` when `public_url` is set. With `secret` set, each request carries
 `X-AlertLoop-Signature-Version: v1` and `X-AlertLoop-Signature`: the lowercase
 hex HMAC-SHA256 of the raw request body, keyed by the secret, with no prefix.
 The receiver computes the same over the bytes it received and compares in
 constant time.
+
+### Fallback channel
+
+A channel can name another channel as its `fallback`. When an alert to it
+exhausts its retries (`dead_letter`), the same alert is queued once to the
+fallback, opening with the channel that failed and its error:
+
+```yaml
+  telegram:
+    - name: alerts
+      bot_token: "123456:ABC-DEF"
+      chat_id: "-1001234567890"
+      fallback: ops-mail          # the name of another channel, of any type
+  email:
+    - name: ops-mail
+      # ...
+```
+
+- One hop: an alert that reached the fallback and dead-letters there goes no
+  further. A fallback to the channel itself or to a name that does not exist
+  stops the start.
+- Alerts only. Every alert, the copy included, gets its own recovery, sent
+  only after that alert went out: the fallback hears "resolved" after the
+  copy, even if the incident was already resolved when the copy was queued,
+  and the broken channel's recovery waits until its alert is replayed. A
+  recovery that dead-letters is not redirected.
+- Nothing is redirected for a muted incident.
+- The copy goes to the fallback even if it got the alert directly. Without
+  routing every channel gets every alert, so the fallback channel may see the
+  same alert twice: directly, and as the copy that names the broken channel.
+  It then gets two recoveries as well, one for each.
+- Whoever reads the fallback channel sees the name of the channel that failed
+  and its error. Pick a fallback whose readers may see that. The error is the
+  one AlertLoop stores, with channel secrets already removed. A webhook
+  fallback gets it as a `fallback` object:
+  `{"channel": "<name>", "error": "<text>"}`.
+- The dead-lettered alert stays in Deliveries, marked with where it was
+  redirected and the state of the copy there (`sent` means it got through);
+  replaying it does not redirect it a second time.
+
+A fallback on a different transport (Telegram to email, for example) is what
+tells you a channel is broken; without one, only `/v1/stats` and the console
+show it.
 
 ### Routing rules
 
@@ -371,7 +503,9 @@ rotation: [Reading AlertLoop's own logs](OPERATIONS.md#reading-alertloops-own-lo
 - `worker` — delivery and retention cleanup;
 - `check-db` — check what `server` and `all` check at startup (config,
   credential, database reachable and not newer than the binary, log file
-  writable), exit 0 if all pass. It changes nothing.
+  writable), exit 0 if all pass. It changes nothing;
+- `user` — console users: `user add|passwd [--password-stdin] <login>`,
+  `user disable|enable <login>`, `user list`.
 
 With `server` and `worker` separate, both must load the same config file and run
 the same version. The Compose postgres profile mounts one `alertloop.yaml` into
@@ -385,12 +519,15 @@ sudo ./install.sh --with-examples
 ```
 
 Monit watches processes, ports, filesystems, load, workers, and cron jobs; each
-finding becomes an incident that opens and closes by itself. Details:
+finding becomes an incident that opens and closes by itself. When AlertLoop
+cannot be reached, the adapter keeps the event in a local spool and sends it
+later, oldest first. Details:
 [integrations/monit/README.md](integrations/monit/README.md).
 
 ## Production notes
 
-- Serve it over HTTPS: the admin token travels with each request.
+- Serve it over HTTPS (or reach the console through an SSH tunnel): API keys
+  and console passwords travel with requests.
 - Alert on `worker_last_tick_at`, `oldest_due_delivery_age_seconds` and
   `dead_letter_last_24h` from `/v1/stats`, and check `/health/ready` from
   another host: see [OPERATIONS.md](OPERATIONS.md).

@@ -8,22 +8,20 @@ import type {
 } from "./types";
 
 // The console is served by the AlertLoop binary, so the API is on the same
-// origin and every path below is absolute.
+// origin and every path below is absolute. The server keeps the sign-in in an
+// HttpOnly cookie the browser sends by itself; this code never sees it.
 
-const TOKEN_KEY = "alertloop.adminToken";
-
-export function getToken(): string {
-  return sessionStorage.getItem(TOKEN_KEY) ?? "";
-}
-export function setToken(token: string): void {
-  sessionStorage.setItem(TOKEN_KEY, token);
-}
-export function clearToken(): void {
-  sessionStorage.removeItem(TOKEN_KEY);
+/** A console user as /admin/auth/* returns it. */
+export interface User {
+  id: string;
+  login: string;
+  created_at: string;
+  disabled_at: string | null;
+  last_login_at: string | null;
 }
 
-// onUnauthorized runs when the server rejects the session token (401) in the
-// middle of a session: the token was changed or the key removed.
+// onUnauthorized runs when the server answers 401 in the middle of a session:
+// it expired, was ended on another device, or the user was disabled.
 let onUnauthorized: (() => void) | null = null;
 export function setUnauthorizedHandler(fn: (() => void) | null): void {
   onUnauthorized = fn;
@@ -31,20 +29,22 @@ export function setUnauthorizedHandler(fn: (() => void) | null): void {
 
 export class ApiError extends Error {
   status: number;
-  constructor(status: number, message: string) {
+  code: string;
+  constructor(status: number, message: string, code = "") {
     super(message);
     this.status = status;
+    this.code = code;
   }
 }
 
 async function request<T>(
   method: string,
   path: string,
-  opts: { token?: string; body?: unknown } = {},
+  opts: { body?: unknown; signedOut?: boolean } = {},
 ): Promise<T> {
-  const token = opts.token ?? getToken();
-  const headers: Record<string, string> = {};
-  if (token) headers["X-API-Key"] = token;
+  // The server refuses a state change made with the session cookie unless
+  // this header is present: another site cannot set it.
+  const headers: Record<string, string> = { "X-AlertLoop-Console": "1" };
   if (opts.body !== undefined) headers["Content-Type"] = "application/json";
 
   let resp: Response;
@@ -52,6 +52,7 @@ async function request<T>(
     resp = await fetch(path, {
       method,
       headers,
+      credentials: "same-origin",
       body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
     });
   } catch {
@@ -62,11 +63,9 @@ async function request<T>(
   const text = await resp.text();
   const data = text ? safeJSON(text) : undefined;
   if (!resp.ok) {
-    if (resp.status === 401 && opts.token === undefined) onUnauthorized?.();
-    const msg =
-      (data && (data as any).error?.message) ||
-      `Request failed (${resp.status})`;
-    throw new ApiError(resp.status, msg);
+    if (resp.status === 401 && !opts.signedOut) onUnauthorized?.();
+    const err = (data as any)?.error;
+    throw new ApiError(resp.status, err?.message || `Request failed (${resp.status})`, err?.code ?? "");
   }
   return data as T;
 }
@@ -95,12 +94,36 @@ function query(params: Record<string, string | number | undefined>): string {
 }
 
 export const api = {
-  // verify checks that a token opens the whole console. /v1/info needs scope
-  // read; /v1/routing needs full, which the console's actions need, and has no
-  // side effects. A read or ingest key gets 403 from one of the two.
-  async verify(token: string): Promise<void> {
-    await request<Info>("GET", "/v1/info", { token });
-    await request<unknown>("GET", "/v1/routing", { token });
+  /** The signed-in user; ApiError 401 with code "setup_required" before the first one exists. */
+  me(): Promise<User> {
+    return request<User>("GET", "/admin/auth/me", { signedOut: true });
+  },
+  setup(body: { admin_token: string; login: string; password: string }): Promise<User> {
+    return request<User>("POST", "/admin/auth/setup", { body, signedOut: true });
+  },
+  login(body: { login: string; password: string }): Promise<User> {
+    return request<User>("POST", "/admin/auth/login", { body, signedOut: true });
+  },
+  logout(everywhere = false): Promise<void> {
+    return request<void>("POST", "/admin/auth/logout", { body: { everywhere }, signedOut: true });
+  },
+  changePassword(current_password: string, new_password: string): Promise<void> {
+    return request<void>("POST", "/admin/auth/password", { body: { current_password, new_password } });
+  },
+  async listUsers(): Promise<User[]> {
+    return (await request<Page<User>>("GET", "/admin/auth/users")).items ?? [];
+  },
+  createUser(login: string, password: string): Promise<User> {
+    return request<User>("POST", "/admin/auth/users", { body: { login, password } });
+  },
+  disableUser(id: string): Promise<User> {
+    return request<User>("POST", `/admin/auth/users/${encodeURIComponent(id)}/disable`);
+  },
+  enableUser(id: string): Promise<User> {
+    return request<User>("POST", `/admin/auth/users/${encodeURIComponent(id)}/enable`);
+  },
+  resetPassword(id: string, password: string): Promise<void> {
+    return request<void>("POST", `/admin/auth/users/${encodeURIComponent(id)}/password`, { body: { password } });
   },
   info(): Promise<Info> {
     return request<Info>("GET", "/v1/info");

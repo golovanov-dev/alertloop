@@ -36,10 +36,14 @@ export interface AlertEvent {
   resolved_at?: string | null;
 }
 
+/** Delivery channel types; `slack` also covers Mattermost and Rocket.Chat. */
+export const CHANNEL_TYPES = ["email", "telegram", "webhook", "slack", "teams", "discord", "ntfy", "pushover"] as const;
+export type ChannelType = (typeof CHANNEL_TYPES)[number];
+
 export interface DeliveryAttempt {
   id: string;
   event_id: string;
-  channel: "email" | "telegram" | "webhook";
+  channel: ChannelType;
   channel_name: string;
   /** "alert" announces the incident; "recovery" announces that it is over. */
   kind: "alert" | "recovery";
@@ -50,6 +54,17 @@ export interface DeliveryAttempt {
   last_error?: string;
   created_at: string;
   updated_at: string;
+  /** Set on an alert redirected to a channel's fallback: the dead-lettered attempt. */
+  fallback_of?: AttemptLink;
+  /** Set on a dead-lettered alert that was redirected: the attempt on the fallback. */
+  fallback_to?: AttemptLink;
+}
+
+export interface AttemptLink {
+  id: string;
+  channel_name?: string;
+  /** State of the linked attempt: on fallback_to, whether the redirect got through. */
+  state?: DeliveryState;
 }
 
 export interface Page<T> {

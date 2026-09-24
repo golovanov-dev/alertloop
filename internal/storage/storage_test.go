@@ -130,7 +130,7 @@ func TestClaimAndMarkResult(t *testing.T) {
 	// Mark sent.
 	d.State = domain.DeliverySent
 	d.Attempts = 1
-	if err := s.MarkResult(ctx, d); err != nil {
+	if err := s.MarkResult(ctx, d, nil); err != nil {
 		t.Fatalf("mark result: %v", err)
 	}
 	got, _ := s.GetDeliveryAttempt(ctx, "d1")

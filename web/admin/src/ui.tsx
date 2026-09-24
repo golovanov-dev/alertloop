@@ -384,6 +384,20 @@ export function DeliveriesTable({
         <td style={{ ...td, color: c.text2, whiteSpace: "nowrap" }}>
           {d.channel} <span style={{ color: c.muted }}>/</span>{" "}
           <code style={{ fontFamily: mono, fontSize: 12.5 }}>{d.channel_name}</code>
+          {d.fallback_of && (
+            <div style={{ marginTop: 4, fontSize: 12, color: c.warn }}>fallback for {d.fallback_of.channel_name}</div>
+          )}
+          {d.fallback_to && (
+            <div style={{ marginTop: 4, fontSize: 12, color: c.text2 }}>
+              redirected to {d.fallback_to.channel_name}
+              {d.fallback_to.state && (
+                <>
+                  {" — "}
+                  <span style={{ color: delState(d.fallback_to.state).color, fontWeight: 600 }}>{d.fallback_to.state}</span>
+                </>
+              )}
+            </div>
+          )}
         </td>
       ),
     },

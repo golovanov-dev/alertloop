@@ -30,6 +30,8 @@ type fakeChannel struct {
 
 	mu          sync.Mutex
 	kinds       []domain.DeliveryKind
+	origins     []*domain.FallbackOrigin
+	eventURLs   []string
 	deadline    time.Time
 	inFlight    int
 	maxInFlight int
@@ -41,6 +43,8 @@ func (f *fakeChannel) Timeout() time.Duration   { return f.timeout }
 func (f *fakeChannel) Send(ctx context.Context, n domain.Notification) error {
 	f.mu.Lock()
 	f.kinds = append(f.kinds, n.Kind)
+	f.origins = append(f.origins, n.Fallback)
+	f.eventURLs = append(f.eventURLs, n.EventURL)
 	f.deadline, _ = ctx.Deadline()
 	f.inFlight++
 	f.maxInFlight = max(f.maxInFlight, f.inFlight)
@@ -188,6 +192,17 @@ func TestWorkerDeliversSuccessfully(t *testing.T) {
 
 // Replay starts a new cycle of retries: a failure right after it schedules a
 // retry instead of dead-lettering again.
+// public_url becomes a link to the event in the admin console.
+func TestWorkerLinksToTheEventWhenPublicURLIsSet(t *testing.T) {
+	ch := &fakeChannel{typ: domain.ChannelSlack, name: "ops"}
+	s, _ := setup(t, ch, 3)
+	w := NewWorker(s, channels.NewRegistry(ch), Options{Concurrency: 1, PublicURL: "https://alerts.example.com/al"}, quietLogger())
+	step(t, w)
+	if want := "https://alerts.example.com/al/admin/#/events/e1"; len(ch.eventURLs) != 1 || ch.eventURLs[0] != want {
+		t.Fatalf("event URLs = %q, want [%q]", ch.eventURLs, want)
+	}
+}
+
 func TestWorkerRetryDeadLetterAndReplayStartsANewCycle(t *testing.T) {
 	ch := &fakeChannel{typ: domain.ChannelWebhook, err: errors.New("connection refused")}
 	// max 2 attempts: first failure schedules retry, second dead-letters.
@@ -254,7 +269,7 @@ func TestWorkerUnknownChannelFails(t *testing.T) {
 // a problem at all.
 func TestWorkerCarriesTheDeliveryKindToTheChannel(t *testing.T) {
 	ch := &fakeChannel{typ: domain.ChannelWebhook, name: "wh"}
-	s, _ := setup(t, ch, 5)
+	s, alertID := setup(t, ch, 5)
 	ctx := context.Background()
 
 	// Close the incident, exactly as a recovery does, and queue the notice.
@@ -267,6 +282,9 @@ func TestWorkerCarriesTheDeliveryKindToTheChannel(t *testing.T) {
 		ID: "d-recovery", EventID: "e1", Channel: ch.typ, ChannelName: ch.name,
 		Kind: domain.KindRecovery, State: domain.DeliveryPending,
 		MaxAttempts: 5, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+		// Linked to its alert, as resolve queues it: an unlinked recovery is a
+		// pre-0.8.0 row and waits for nothing.
+		RecoveryFor: &domain.AttemptLink{ID: alertID},
 	}
 	if err := s.CreateDeliveryAttempt(ctx, rec); err != nil {
 		t.Fatalf("queue recovery: %v", err)
@@ -752,5 +770,38 @@ func TestWorkerShutdownCountsAChannelErrorAsAFailure(t *testing.T) {
 	got := attempt(t, s, id)
 	if got.State != domain.DeliveryFailed || got.Attempts != 1 || got.LastError == "" {
 		t.Fatalf("expected failed/1 with an error, got %s/%d %q", got.State, got.Attempts, got.LastError)
+	}
+}
+
+// A dead-lettered alert goes once to its channel's fallback, which is told what
+// failed; the fallback's own dead letter goes nowhere, even when the fallback
+// names the first channel back.
+func TestWorkerRedirectsADeadLetteredAlertOnce(t *testing.T) {
+	tg := &fakeChannel{typ: domain.ChannelTelegram, name: "tg", err: errors.New("telegram send failed (status 502)")}
+	mail := &fakeChannel{typ: domain.ChannelEmail, name: "mail", err: errors.New("smtp send: refused")}
+	s, id := setup(t, tg, 1)
+	w := NewWorker(s, channels.NewRegistry(tg, mail), Options{
+		Fallbacks: map[string]string{"tg": "mail", "mail": "tg"},
+	}, quietLogger())
+
+	step(t, w) // tg dead-letters, the fallback to mail is queued
+	src := attempt(t, s, id)
+	if src.State != domain.DeliveryDeadLetter || src.FallbackTo == nil || src.FallbackTo.ChannelName != "mail" {
+		t.Fatalf("source = %+v, fallback_to = %+v", src, src.FallbackTo)
+	}
+	step(t, w) // mail gets it, fails, dead-letters: no hop back to tg
+	if got := mail.origins; len(got) != 1 || got[0] == nil || got[0].Channel != "tg" || got[0].Error != src.LastError {
+		t.Fatalf("mail was sent %v, want one alert redirected from tg with its error", got)
+	}
+	if n := step(t, w); n != 0 || tg.calls.Load() != 1 {
+		t.Fatalf("after the fallback dead-lettered: %d more sends, tg called %d times", n, tg.calls.Load())
+	}
+	page, err := s.ListDeliveryAttempts(context.Background(), storage.DeliveryFilter{EventID: "e1"}, 10, "")
+	if err != nil || len(page.Items) != 2 {
+		t.Fatalf("attempts of the event = %d (%v), want 2", len(page.Items), err)
+	}
+	// A recovery is never redirected: it follows its alert (F3).
+	if fb := w.fallbackFor(domain.DeliveryAttempt{Kind: domain.KindRecovery, ChannelName: "tg"}); fb != nil {
+		t.Fatalf("recovery redirected to %s", fb.ChannelName)
 	}
 }

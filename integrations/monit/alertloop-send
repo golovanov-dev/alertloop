@@ -15,6 +15,11 @@
 #
 #   alertloop-send --status resolved --dedupe-key server-01:postgresql:availability
 #
+#   alertloop-send --flush      # send what an earlier run kept in the spool
+#
+# An event that cannot be sent now (network, 409, 429, 5xx) is kept in a spool
+# directory and sent, oldest first, by the next run or by --flush.
+#
 # The API key is read from /etc/alertloop/monit.env and is never passed as an
 # argument: process arguments are world-readable in /proc.
 #
@@ -34,6 +39,7 @@ EX_HTTP5XX=5   # AlertLoop failed (retried, still failing)
 EX_NETWORK=6   # could not reach AlertLoop
 EX_RETRIES=7   # retries exhausted
 EX_INTERNAL=8  # a bug in this script
+EX_SPOOLED=9   # not sent now; kept in the spool for the next run
 
 # --- defaults, overridable from the config file ----------------------------
 ALERTLOOP_URL=""
@@ -44,6 +50,11 @@ ALERTLOOP_CONNECT_TIMEOUT_SECONDS=2
 ALERTLOOP_RETRY_COUNT=2
 ALERTLOOP_RETRY_DELAY_SECONDS=1
 ALERTLOOP_SOURCE="monit"
+ALERTLOOP_SPOOL_DIR="/var/lib/alertloop-monit/spool"
+ALERTLOOP_SPOOL_MAX=1000
+
+# How long a run waits for another one that holds the spool (sending it).
+LOCK_WAIT_SECONDS=30
 
 # --- limits ----------------------------------------------------------------
 # Monit hands us whatever a check produced, including the entire output of a
@@ -59,6 +70,14 @@ MAX_METADATA_VALUE=1000
 log() { printf 'level=%s integration=monit %s\n' "$1" "$2" >&2; }
 info() { log info "$1"; }
 err() { log error "$1"; }
+# alarm: an error that must not depend on someone reading stderr (cron mail is
+# rarely read, often not even delivered): also to syslog, when logger is there.
+alarm() {
+  err "$1"
+  if command -v logger >/dev/null 2>&1; then
+    logger -t alertloop-send -p user.err "$1" || true
+  fi
+}
 
 die() {
   local code="$1"; shift
@@ -75,7 +94,7 @@ usage() {
 # --- argument parsing ------------------------------------------------------
 status="" severity="" event_type="" source="" host="" service=""
 dedupe_key="" title="" message="" occurred_at=""
-dry_run=0
+dry_run=0 flush_only=0
 labels=() metadata=()
 
 while [ $# -gt 0 ]; do
@@ -95,6 +114,7 @@ while [ $# -gt 0 ]; do
     --config)       CONFIG="${2-}"; shift 2 ;;
     --timeout)      ALERTLOOP_TIMEOUT_SECONDS="${2-}"; shift 2 ;;
     --dry-run)      dry_run=1; shift ;;
+    --flush)        flush_only=1; shift ;;
     --version)      echo "alertloop-send $VERSION"; exit 0 ;;
     -h|--help)      usage; exit 0 ;;
     --api-key|--api-key=*)
@@ -108,13 +128,18 @@ done
 # --- dependencies ----------------------------------------------------------
 command -v curl >/dev/null 2>&1 || die "$EX_USAGE" "missing_dependency:curl"
 command -v jq   >/dev/null 2>&1 || die "$EX_USAGE" "missing_dependency:jq"
+command -v flock >/dev/null 2>&1 || die "$EX_USAGE" "missing_dependency:flock"
 
 # --- configuration ---------------------------------------------------------
+# Both to syslog as well: run from a cron job as the wrong user, this is the one
+# failure that would otherwise leave no trace outside a cron mail.
 if [ ! -f "$CONFIG" ]; then
-  die "$EX_USAGE" "config_not_found:$CONFIG"
+  alarm "status=failed error=config_not_found:$CONFIG"
+  exit "$EX_USAGE"
 fi
 if [ ! -r "$CONFIG" ]; then
-  die "$EX_USAGE" "config_not_readable:$CONFIG (this script runs as the user Monit runs as)"
+  alarm "status=failed error=config_not_readable:$CONFIG (run as root, as Monit does; a cron job runs the wrapper as root and the job itself with runuser)"
+  exit "$EX_USAGE"
 fi
 
 # Warn, do not fail, on loose permissions: refusing to send an incident because
@@ -147,7 +172,8 @@ while IFS= read -r line || [ -n "$line" ]; do
   case "$key" in
     ALERTLOOP_URL|ALERTLOOP_API_KEY|ALERTLOOP_HOST|ALERTLOOP_SOURCE|\
     ALERTLOOP_TIMEOUT_SECONDS|ALERTLOOP_CONNECT_TIMEOUT_SECONDS|\
-    ALERTLOOP_RETRY_COUNT|ALERTLOOP_RETRY_DELAY_SECONDS)
+    ALERTLOOP_RETRY_COUNT|ALERTLOOP_RETRY_DELAY_SECONDS|\
+    ALERTLOOP_SPOOL_DIR|ALERTLOOP_SPOOL_MAX)
       printf -v "$key" '%s' "$value" ;;
     *) ;;                                    # unknown keys ignored on purpose
   esac
@@ -171,11 +197,13 @@ case "$ALERTLOOP_URL" in
   *) die "$EX_USAGE" "bad_url:$ALERTLOOP_URL (expected http:// or https://)" ;;
 esac
 
-for n in ALERTLOOP_TIMEOUT_SECONDS ALERTLOOP_CONNECT_TIMEOUT_SECONDS ALERTLOOP_RETRY_COUNT ALERTLOOP_RETRY_DELAY_SECONDS; do
+for n in ALERTLOOP_TIMEOUT_SECONDS ALERTLOOP_CONNECT_TIMEOUT_SECONDS ALERTLOOP_RETRY_COUNT ALERTLOOP_RETRY_DELAY_SECONDS ALERTLOOP_SPOOL_MAX; do
   case "${!n}" in
     ''|*[!0-9]*) die "$EX_USAGE" "config_not_a_number:$n=${!n}" ;;
   esac
 done
+[ "$ALERTLOOP_SPOOL_MAX" -ge 1 ] || die "$EX_USAGE" "config_spool_max_below_1"
+[ -n "$ALERTLOOP_SPOOL_DIR" ] || die "$EX_USAGE" "config_missing:ALERTLOOP_SPOOL_DIR"
 
 # --- normalisation and validation -----------------------------------------
 # Everything this script emits is ASCII on purpose. A shell tool runs under
@@ -205,6 +233,230 @@ sanitize_text() {
   printf '%s' "$1" | tr -d '\000-\010\013\014\016-\037'
 }
 
+# --- send ------------------------------------------------------------------
+# post <payload> <retries> <dedupe_key>: 0 accepted, 4 rejected (4xx, final),
+# 1 not sent now (network, 409, 429, 5xx: worth trying later). Sets attempt,
+# http_code, last_reason, reject_body and reject_code (AlertLoop's error.code).
+post() {
+  local payload="$1" retries="$2" key="$3" response curl_rc body
+  attempt=0
+  while :; do
+    attempt=$((attempt + 1))
+
+    # The key goes in via @- on stdin rather than as an argument, so it never
+    # appears in /proc/<pid>/cmdline. Response body and status code are captured
+    # together; the body is only used for diagnostics and is truncated.
+    set +e
+    response="$(printf 'X-API-Key: %s' "$ALERTLOOP_API_KEY" | curl \
+      --silent --show-error \
+      --connect-timeout "$ALERTLOOP_CONNECT_TIMEOUT_SECONDS" \
+      --max-time "$ALERTLOOP_TIMEOUT_SECONDS" \
+      --header @- \
+      --header 'Content-Type: application/json' \
+      --header "User-Agent: alertloop-send/$VERSION" \
+      --data-binary "$payload" \
+      --write-out '\n%{http_code}' \
+      --output - \
+      "${ALERTLOOP_URL%/}/v1/events" 2>&1)"
+    curl_rc=$?
+    set -e
+
+    http_code="${response##*$'\n'}"
+    body="${response%$'\n'*}"
+
+    if [ "$curl_rc" -ne 0 ]; then
+      last_reason="network_error:rc=$curl_rc"
+      case "$curl_rc" in
+        28) last_reason="timeout" ;;
+        7)  last_reason="connection_refused" ;;
+        6)  last_reason="dns_failure" ;;
+        35|60) last_reason="tls_error" ;;
+      esac
+    else
+      case "$http_code" in
+        2*) return 0 ;;
+        # 409 is invalid_transition: AlertLoop found the incident changed by
+        # other requests several times in a row and asks for a retry.
+        409|429|5*) last_reason="http_$http_code" ;;
+        4*)
+          # A 4xx is this script's fault, or the key's. Retrying cannot fix it,
+          # now or later, so it is neither retried nor spooled.
+          last_reason="http_$http_code"
+          reject_body="$(truncate_to "$(sanitize_text "$body")" 300)"
+          reject_code="$(printf '%s' "$body" | jq -r '.error.code // ""' 2>/dev/null || true)"
+          return 4
+          ;;
+        *) last_reason="unexpected_http_$http_code" ;;
+      esac
+    fi
+
+    if [ "$attempt" -gt "$retries" ]; then
+      return 1
+    fi
+    err "status=retrying dedupe_key=$key attempt=$attempt error=$last_reason"
+    sleep "$ALERTLOOP_RETRY_DELAY_SECONDS"
+  done
+}
+
+# failure_code: the exit code for an event that was neither sent nor spooled.
+failure_code() {
+  case "$last_reason" in
+    http_5*|http_409|http_429|unexpected_http_*) echo "$EX_HTTP5XX" ;;
+    timeout|connection_refused|dns_failure|tls_error|network_error:*)
+      # Distinguish "never reached it once" from "reached it and it kept
+      # failing": the first is a network problem on this host, the second is
+      # AlertLoop's.
+      if [ "$attempt" -gt 1 ]; then echo "$EX_RETRIES"; else echo "$EX_NETWORK"; fi
+      ;;
+    http_4*) echo "$EX_HTTP4XX" ;;
+    *) echo "$EX_INTERNAL" ;;
+  esac
+}
+
+# --- spool -----------------------------------------------------------------
+# One file per event, named by the time it was spooled, so the name order is
+# the order to send in. Files hold the payload only, never the API key.
+spool_files() {
+  local f
+  for f in "$ALERTLOOP_SPOOL_DIR"/*.json; do
+    if [ -e "$f" ]; then printf '%s\n' "$f"; fi
+  done
+}
+
+# drop <file> <reason>: an event pushed out of the full spool.
+drop() {
+  local key
+  key="$(jq -r '.dedupe_key // ""' "$1" 2>/dev/null || true)"
+  rm -f "$1"
+  alarm "status=dropped dedupe_key=$key reason=$2"
+}
+
+# reject <file> <reason>: an event AlertLoop refused for what it is. It moves to
+# rejected/ in the spool directory: out of the queue, so it holds back nothing,
+# and kept, so it is not lost. To send it after a fix, move it back into the
+# spool directory; otherwise delete it. 1, leaving it where it is, when it
+# cannot be moved.
+reject() {
+  local key dest="$ALERTLOOP_SPOOL_DIR/rejected/${1##*/}"
+  key="$(jq -r '.dedupe_key // ""' "$1" 2>/dev/null || true)"
+  if ! (umask 077 && mkdir -p "${dest%/*}" && mv -f "$1" "$dest") 2>/dev/null; then
+    alarm "status=kept_in_spool dedupe_key=$key error=cannot_move_to_rejected reason=$2"
+    return 1
+  fi
+  alarm "status=rejected dedupe_key=$key file=$dest reason=$2"
+}
+
+# spool <payload>: 0 once the event is on disk, or when the last spooled event
+# with its dedupe_key has the same status and severity already: a stream of
+# identical events would otherwise fill the bounded spool and push out older
+# ones. A firing with another severity is kept: it is news. Written to a
+# temporary file and renamed, so a reader never sees half an event.
+spool() {
+  local name tmp n f key status last
+  local files=()
+  mapfile -t files < <(spool_files)
+  if [ "${#files[@]}" -gt 0 ]; then
+    key="$(printf '%s' "$1" | jq -r '.dedupe_key // ""' 2>/dev/null || true)"
+    status="$(printf '%s' "$1" | jq -r '"\(.status // "")/\(.severity // "")"' 2>/dev/null || true)"
+    last="$(jq -rs --arg k "$key" 'map(select(.dedupe_key == $k)) | last | "\(.status // "")/\(.severity // "")"' "${files[@]}" 2>/dev/null || true)"
+    if [ -n "$key" ] && [ "${status%/*}" != "" ] && [ "$last" = "$status" ]; then
+      info "status=already_spooled dedupe_key=$key event_status=$status"
+      return 0
+    fi
+  fi
+  name="$(date -u +%Y%m%dT%H%M%S.%N)"
+  case "$name" in *N) name="${name%.*}.000000000" ;; esac   # date without %N
+  name="$ALERTLOOP_SPOOL_DIR/$name-$(printf '%07d' "$$").json"
+  tmp="$ALERTLOOP_SPOOL_DIR/.tmp.$$"
+  if ! (umask 077 && printf '%s\n' "$1" > "$tmp" && mv -f "$tmp" "$name") 2>/dev/null; then
+    rm -f "$tmp"
+    return 1
+  fi
+  # Bounded: past the limit the oldest events go, each with a log line.
+  mapfile -t files < <(spool_files)
+  n=$(( ${#files[@]} - ALERTLOOP_SPOOL_MAX ))
+  if [ "$n" -gt 0 ]; then
+    for f in "${files[@]:0:$n}"; do
+      drop "$f" "spool_full(max=$ALERTLOOP_SPOOL_MAX)"
+    done
+  fi
+  return 0
+}
+
+# lock: 0 holding the spool, 1 the spool directory is unusable, 2 another run
+# held it for LOCK_WAIT_SECONDS.
+lock() {
+  (umask 077 && mkdir -p "$ALERTLOOP_SPOOL_DIR") 2>/dev/null || return 1
+  if ! { exec 9>>"$ALERTLOOP_SPOOL_DIR/.lock"; } 2>/dev/null; then
+    return 1
+  fi
+  flock -w "$LOCK_WAIT_SECONDS" 9 || return 2
+}
+
+# flush: send the spooled events oldest first, one try each, and stop at the
+# first that cannot be sent now. 0 when the spool is empty afterwards, 4 when
+# AlertLoop refuses this host (401, 403, 404 and any 4xx that a fixed key or
+# URL can cure: the event stays), 1 otherwise (409 included: it asks for a
+# retry). An event refused for what it is (400, 413, 422, 403
+# source_not_allowed) moves to rejected/: resent as it is, it would never pass,
+# and kept in the queue it would hold back every event behind it.
+flush() {
+  local f payload key rc
+  while IFS= read -r f; do
+    payload="$(cat "$f")" || return 1
+    key="$(printf '%s' "$payload" | jq -r '.dedupe_key // ""' 2>/dev/null || true)"
+    rc=0
+    post "$payload" 0 "$key" || rc=$?
+    case "$rc" in
+      0) rm -f "$f"; info "status=sent from=spool dedupe_key=$key http_status=$http_code" ;;
+      4)
+        case "$http_code:$reject_code" in
+          400:*|413:*|422:*|403:source_not_allowed)
+            reject "$f" "http_status=$http_code body=$reject_body" || return 1
+            ;;
+          *)
+            err "status=kept_in_spool dedupe_key=$key http_status=$http_code error=client_error body=$reject_body (fix the API key or the URL; the spool goes out on the next run)"
+            return 4
+            ;;
+        esac
+        ;;
+      *) err "status=kept_in_spool dedupe_key=$key error=$last_reason"; return 1 ;;
+    esac
+  done < <(spool_files)
+  return 0
+}
+
+attempt=0 http_code="" last_reason="unknown" reject_body="" reject_code=""
+
+if [ "$flush_only" -eq 1 ]; then
+  rc=0
+  lock || rc=$?
+  case "$rc" in
+    1) die "$EX_USAGE" "spool_unusable:$ALERTLOOP_SPOOL_DIR" ;;
+    2) err "status=busy (another run holds the spool)"; exit "$EX_SPOOLED" ;;
+  esac
+  rc=0
+  flush || rc=$?
+  case "$rc" in
+    0)
+      # Events in rejected/ wait for a person: a timer that runs --flush must
+      # not look healthy while they sit there.
+      n=0
+      if [ -d "$ALERTLOOP_SPOOL_DIR/rejected" ]; then
+        n="$(find "$ALERTLOOP_SPOOL_DIR/rejected" -maxdepth 1 -name '*.json' | wc -l | tr -d ' ')" || n=0
+      fi
+      if [ "${n:-0}" -gt 0 ]; then
+        alarm "status=rejected_waiting count=$n dir=$ALERTLOOP_SPOOL_DIR/rejected (resend after a fix or delete; see the README, Spool)"
+        exit "$EX_HTTP4XX"
+      fi
+      exit "$EX_OK"
+      ;;
+    4) exit "$EX_HTTP4XX" ;;
+    *) exit "$EX_SPOOLED" ;;
+  esac
+fi
+
+# --- event ------------------------------------------------------------------
 [ -n "$status" ] || die "$EX_USAGE" "missing_argument:--status"
 case "$status" in
   firing|resolved) ;;
@@ -343,78 +595,55 @@ if [ "$dry_run" -eq 1 ]; then
 fi
 
 # --- send ------------------------------------------------------------------
-url="${ALERTLOOP_URL%/}/v1/events"
-attempt=0
-last_reason="unknown"
-
-while :; do
-  attempt=$((attempt + 1))
-
-  # The key goes in via @- on stdin rather than as an argument, so it never
-  # appears in /proc/<pid>/cmdline. Response body and status code are captured
-  # together; the body is only used for diagnostics and is truncated.
-  set +e
-  response="$(printf 'X-API-Key: %s' "$ALERTLOOP_API_KEY" | curl \
-    --silent --show-error \
-    --connect-timeout "$ALERTLOOP_CONNECT_TIMEOUT_SECONDS" \
-    --max-time "$ALERTLOOP_TIMEOUT_SECONDS" \
-    --header @- \
-    --header 'Content-Type: application/json' \
-    --header "User-Agent: alertloop-send/$VERSION" \
-    --data-binary "$payload" \
-    --write-out '\n%{http_code}' \
-    --output - \
-    "$url" 2>&1)"
-  curl_rc=$?
-  set -e
-
-  http_code="${response##*$'\n'}"
-  body="${response%$'\n'*}"
-
-  if [ "$curl_rc" -ne 0 ]; then
-    last_reason="network_error:rc=$curl_rc"
-    case "$curl_rc" in
-      28) last_reason="timeout" ;;
-      7)  last_reason="connection_refused" ;;
-      6)  last_reason="dns_failure" ;;
-      35|60) last_reason="tls_error" ;;
-    esac
-  else
-    case "$http_code" in
-      2*)
-        info "status=sent dedupe_key=$dedupe_key event_status=$status http_status=$http_code attempt=$attempt"
-        exit "$EX_OK"
-        ;;
-      429|5*)
-        last_reason="http_$http_code"
-        ;;
-      4*)
-        # A 4xx is this script's fault, or the key's. Retrying cannot fix it and
-        # only multiplies the noise.
-        err "status=failed dedupe_key=$dedupe_key http_status=$http_code error=client_error body=$(truncate_to "$(sanitize_text "$body")" 300)"
-        exit "$EX_HTTP4XX"
-        ;;
-      *)
-        last_reason="unexpected_http_$http_code"
-        ;;
-    esac
+rc=0
+lock || rc=$?
+if [ "$rc" -eq 2 ]; then
+  # Another run is sending the spool: queue behind it rather than overtake it.
+  if spool "$payload"; then
+    err "status=spooled dedupe_key=$dedupe_key event_status=$status reason=spool_busy"
+    exit "$EX_SPOOLED"
   fi
-
-  if [ "$attempt" -gt "$ALERTLOOP_RETRY_COUNT" ]; then
-    break
+  rc=1
+fi
+spool_ok=1 flush_rc=0
+if [ "$rc" -eq 1 ]; then
+  spool_ok=0
+  err "status=warning spool_unusable=$ALERTLOOP_SPOOL_DIR (an event that cannot be sent now is lost)"
+else
+  flush || flush_rc=$?
+fi
+if [ "$flush_rc" -ne 0 ]; then
+  # Older events are still waiting: this one goes after them, not before.
+  if spool "$payload"; then
+    if [ "$flush_rc" -eq 4 ]; then
+      # Kept, but nothing goes out until someone fixes the key or the URL:
+      # exit 4, not 9, which would say the next run sends it.
+      err "status=spooled dedupe_key=$dedupe_key event_status=$status reason=older_events_rejected:$last_reason"
+      exit "$EX_HTTP4XX"
+    fi
+    err "status=spooled dedupe_key=$dedupe_key event_status=$status reason=older_events_unsent"
+    exit "$EX_SPOOLED"
   fi
-  err "status=retrying dedupe_key=$dedupe_key attempt=$attempt error=$last_reason"
-  sleep "$ALERTLOOP_RETRY_DELAY_SECONDS"
-done
+  err "status=failed dedupe_key=$dedupe_key event_status=$status error=spool_write_failed"
+  exit "$(failure_code)"
+fi
 
-err "status=failed dedupe_key=$dedupe_key event_status=$status attempts=$attempt error=$last_reason"
-case "$last_reason" in
-  http_5*|http_429|unexpected_http_*) exit "$EX_HTTP5XX" ;;
-  timeout|connection_refused|dns_failure|tls_error|network_error:*)
-    # Distinguish "never reached it once" from "reached it and it kept failing":
-    # the first is a network problem on this host, the second is AlertLoop's.
-    [ "$attempt" -gt 1 ] && exit "$EX_RETRIES"
-    exit "$EX_NETWORK"
+rc=0
+post "$payload" "$ALERTLOOP_RETRY_COUNT" "$dedupe_key" || rc=$?
+case "$rc" in
+  0)
+    info "status=sent dedupe_key=$dedupe_key event_status=$status http_status=$http_code attempt=$attempt"
+    exit "$EX_OK"
     ;;
-  *) exit "$EX_INTERNAL" ;;
+  4)
+    err "status=failed dedupe_key=$dedupe_key http_status=$http_code error=client_error body=$reject_body"
+    exit "$EX_HTTP4XX"
+    ;;
 esac
+
+if [ "$spool_ok" -eq 1 ] && spool "$payload"; then
+  err "status=spooled dedupe_key=$dedupe_key event_status=$status attempts=$attempt error=$last_reason"
+  exit "$EX_SPOOLED"
+fi
+err "status=failed dedupe_key=$dedupe_key event_status=$status attempts=$attempt error=$last_reason"
+exit "$(failure_code)"

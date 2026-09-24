@@ -123,7 +123,10 @@ func buildMessage(from string, to []string, subject, body, msgID string, sentAt 
 // the same incident and must not share an id, or a client threading by
 // Message-ID would treat the second as a duplicate of the first and hide it.
 // Retries of the SAME notification deliberately reuse the id, so a delivery
-// that succeeds on the second attempt does not arrive twice.
+// that succeeds on the second attempt does not arrive twice. An alert
+// redirected from a failed channel carries the failed attempt's id too: it is
+// a message of its own, and a mailbox that already holds this event's alert
+// (another route, or a replay) must not drop it as a duplicate.
 func messageID(n domain.Notification, from string) string {
 	domainPart := "alertloop.local"
 	if at := strings.LastIndex(from, "@"); at >= 0 && at+1 < len(from) {
@@ -133,6 +136,9 @@ func messageID(n domain.Notification, from string) string {
 	id := "unknown"
 	if n.Event != nil && n.Event.ID != "" {
 		id = n.Event.ID
+	}
+	if f := n.Fallback; f != nil && f.Attempt != "" {
+		return fmt.Sprintf("<%s.%s.fallback-%s@%s>", id, kind, f.Attempt, domainPart)
 	}
 	return fmt.Sprintf("<%s.%s@%s>", id, kind, domainPart)
 }

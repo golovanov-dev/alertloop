@@ -7,11 +7,15 @@ package delivery
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math"
 	"math/rand/v2"
+	"net/url"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/golovanov-dev/alertloop/internal/channels"
 	"github.com/golovanov-dev/alertloop/internal/domain"
@@ -31,6 +35,12 @@ type Options struct {
 	// ShutdownGrace is how long sends in flight may finish after the worker is
 	// told to stop. Sends still running then are cancelled and requeued.
 	ShutdownGrace time.Duration
+	// Fallbacks maps a channel name to the channel that gets its alerts once
+	// they dead-letter (config.Channels.Fallbacks).
+	Fallbacks map[string]string
+	// PublicURL is config public_url; with it every notification carries a
+	// link to its event in the admin console.
+	PublicURL string
 }
 
 func (o *Options) applyDefaults() {
@@ -352,7 +362,7 @@ func (w *Worker) process(ctx context.Context, att domain.DeliveryAttempt) {
 	// channel returned on its own is a failed attempt, even during shutdown.
 	if sendErr != nil && ctx.Err() != nil && errors.Is(sendErr, context.Canceled) {
 		claimed.State = domain.DeliveryPending
-		w.save(ctx, &claimed)
+		w.save(ctx, &claimed, nil)
 		if !w.logCancelled(claimed) {
 			w.log.Info("delivery returned to the queue at shutdown",
 				"id", att.ID, "channel", att.Channel, "channel_name", att.ChannelName)
@@ -363,7 +373,7 @@ func (w *Worker) process(ctx context.Context, att domain.DeliveryAttempt) {
 		att.State = domain.DeliverySent
 		att.NextRetryAt = nil
 		att.LastError = ""
-		w.save(ctx, &att)
+		w.save(ctx, &att, nil)
 		w.log.Info("delivery sent",
 			"id", att.ID, "channel", att.Channel, "channel_name", att.ChannelName, "attempts", att.Attempts)
 		return
@@ -373,27 +383,53 @@ func (w *Worker) process(ctx context.Context, att domain.DeliveryAttempt) {
 	// PostgreSQL refuses to store, which used to leave the attempt stuck in
 	// `sending` and requeued by the reaper every five minutes, forever.
 	att.LastError = domain.TruncateRunes(sendErr.Error(), domain.MaxLastErrorRunes)
+	var fallback *domain.DeliveryAttempt
 	if att.Attempts >= att.MaxAttempts {
 		att.State = domain.DeliveryDeadLetter
 		att.NextRetryAt = nil
+		fallback = w.fallbackFor(att)
 	} else {
 		next := w.now().UTC().Add(w.backoff(att.Attempts))
 		att.State = domain.DeliveryFailed
 		att.NextRetryAt = &next
 	}
-	w.save(ctx, &att)
+	w.save(ctx, &att, fallback)
 	if w.logCancelled(att) {
 		return
 	}
 	if att.State == domain.DeliveryDeadLetter {
+		fb := ""
+		if fallback != nil && fallback.FallbackOf != nil {
+			fb = fallback.ChannelName
+		}
 		w.log.Warn("delivery dead-lettered",
 			"id", att.ID, "channel", att.Channel, "channel_name", att.ChannelName,
-			"attempts", att.Attempts, "error", sendErr)
+			"attempts", att.Attempts, "fallback", fb, "error", sendErr)
 		return
 	}
 	w.log.Warn("delivery failed, will retry",
 		"id", att.ID, "channel", att.Channel, "channel_name", att.ChannelName, "attempts", att.Attempts,
 		"next_retry_at", att.NextRetryAt.Format(time.RFC3339), "error", sendErr)
+}
+
+// fallbackFor builds the alert to queue on the fallback of att's channel when
+// att dead-letters, or returns nil. Only an alert is redirected, and only once:
+// a recovery follows its alert on its own (storage.MarkResult), and an alert
+// that is itself a fallback goes nowhere further.
+func (w *Worker) fallbackFor(att domain.DeliveryAttempt) *domain.DeliveryAttempt {
+	if att.Kind.OrAlert() != domain.KindAlert || att.IsFallback() {
+		return nil
+	}
+	ch, ok := w.registry.Get(w.opts.Fallbacks[att.ChannelName])
+	if !ok {
+		return nil
+	}
+	now := w.now().UTC()
+	return &domain.DeliveryAttempt{
+		ID: uuid.NewString(), EventID: att.EventID, Channel: ch.Type(), ChannelName: ch.Name(),
+		Kind: domain.KindAlert, State: domain.DeliveryPending, MaxAttempts: att.MaxAttempts,
+		CreatedAt: now, UpdatedAt: now,
+	}
 }
 
 // logCancelled logs an attempt the store cancelled instead of recording the
@@ -421,15 +457,27 @@ func (w *Worker) deliver(ctx context.Context, att domain.DeliveryAttempt) error 
 		return err
 	}
 
+	n := domain.Notification{Event: event, Kind: att.Kind.OrAlert()}
+	if w.opts.PublicURL != "" {
+		n.EventURL = w.opts.PublicURL + "/admin/#/events/" + url.PathEscape(event.ID)
+	}
+	if att.FallbackOf != nil {
+		src, err := w.store.GetDeliveryAttempt(ctx, att.FallbackOf.ID)
+		if err != nil {
+			return fmt.Errorf("read the attempt this fallback redirects: %w", err)
+		}
+		n.Fallback = &domain.FallbackOrigin{Channel: src.ChannelName, Error: src.LastError, Attempt: src.ID}
+	}
+
 	sendCtx, cancel := context.WithTimeout(ctx, w.attemptTimeout(ch))
 	defer cancel()
-	return ch.Send(sendCtx, domain.Notification{Event: event, Kind: att.Kind.OrAlert()})
+	return ch.Send(sendCtx, n)
 }
 
 // save records the outcome. When it is stored att holds what the store actually
 // wrote, which differs from what the worker asked for when the store cancelled
 // the alert of a muted incident.
-func (w *Worker) save(ctx context.Context, att *domain.DeliveryAttempt) {
+func (w *Worker) save(ctx context.Context, att *domain.DeliveryAttempt, fallback *domain.DeliveryAttempt) {
 	// Use a background-derived context so a cancelled worker still records the
 	// outcome it just produced.
 	// 3 s: with the 5 s ShutdownGrace a stop stays inside the 10 s that
@@ -437,7 +485,7 @@ func (w *Worker) save(ctx context.Context, att *domain.DeliveryAttempt) {
 	saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
 	defer cancel()
 	att.UpdatedAt = w.now().UTC()
-	err := w.store.MarkResult(saveCtx, att)
+	err := w.store.MarkResult(saveCtx, att, fallback)
 	switch {
 	case err == nil:
 	case errors.Is(err, domain.ErrNotFound):

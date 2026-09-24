@@ -89,6 +89,22 @@ func TestStartupWarnsAboutUnreachableRulesAndUnusedChannels(t *testing.T) {
 	}
 }
 
+// A channel only a fallback leads to is where alerts go when their channel is
+// down, not a typo: the startup warning must not send an operator who followed
+// README looking for one.
+func TestStartupDoesNotCallAFallbackChannelUnused(t *testing.T) {
+	cfg := newTestConfig()
+	cfg.Channels.Telegram[0].Fallback = "customer-telegram"
+	cfg.Routing = &config.Routing{Default: []string{"dev-telegram"}}
+	logged, err := startApp(t, cfg)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if strings.Contains(logged, "unused_channels") {
+		t.Errorf("the fallback channel is reported as unused:\n%s", logged)
+	}
+}
+
 // Without a routing section the log says so, and the App keeps delivering to
 // every channel.
 func TestStartupLogsUnconfiguredRouting(t *testing.T) {

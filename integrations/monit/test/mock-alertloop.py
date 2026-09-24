@@ -13,6 +13,7 @@ The control file holds one response instruction per line, consumed in order:
   500            answer 500
   429            answer 429
   hang           accept the connection and never answer (tests the timeout)
+  403:<code>     answer 403 (any status) with AlertLoop's error body, error.code <code>
 
 When the instructions run out, the last one repeats. Each request is appended to
 the requests file as one JSON object per line: method, path, headers, body.
@@ -71,12 +72,15 @@ class Handler(BaseHTTPRequestHandler):
             time.sleep(60)
             return
 
+        instruction, _, error_code = instruction.partition(":")
         try:
             code = int(instruction)
         except ValueError:
             code = 200
 
         payload = b'{"id":"test-event-id"}'
+        if error_code:
+            payload = json.dumps({"error": {"code": error_code, "message": "refused"}}).encode()
         if code == 204:
             payload = b""
         self.send_response(code)

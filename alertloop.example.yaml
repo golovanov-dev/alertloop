@@ -18,6 +18,10 @@ addr: ${ALERTLOOP_ADDR:-127.0.0.1:8080}
 # stops startup. Generate one with: openssl rand -hex 32
 admin_token: ${ALERTLOOP_ADMIN_TOKEN}
 
+# The address people open AlertLoop at, without /admin. With it, every
+# notification links to its event in the console; omitted, there are no links.
+# public_url: "https://alerts.example.com"
+
 # API keys with a scope: ingest (POST /v1/events), read (queries), full
 # (everything; the default). Optional — put in keys of your own.
 # api_keys:
@@ -86,6 +90,7 @@ channels:
   #     starttls: true   # require STARTTLS on a plaintext port (e.g. 587)
   #     tls: false       # implicit TLS / SMTPS (e.g. port 465)
   #     timeout: 10s     # per-delivery timeout
+  #     fallback: dev-telegram   # gets this channel's alerts that dead-letter, once
   #
   # telegram:
   #   - name: dev-telegram
@@ -96,6 +101,7 @@ channels:
   #     # Or a trusted Bot API mirror instead of a proxy.
   #     # api_base: "https://tg-mirror.example.com"
   #     timeout: 10s     # per-delivery timeout
+  #     fallback: dev-email      # another channel's name, not this one
   #
   #   - name: customer-telegram
   #     bot_token: "123456:ABC-DEF"
@@ -106,6 +112,43 @@ channels:
   #     url: "https://example.com/alertloop-hook"
   #     secret: "shared-webhook-secret"   # HMAC-SHA256 key for X-AlertLoop-Signature
   #     timeout: 10s     # per-delivery timeout
+  #     fallback: dev-email
+  #
+  # # The url of slack, teams and discord channels is a secret: it lets anyone post.
+  # slack:             # also Mattermost and Rocket.Chat incoming webhooks
+  #   - name: ops-slack
+  #     url: "https://hooks.slack.com/services/T000/B000/XXXX"
+  #     timeout: 10s
+  #     fallback: dev-email
+  #
+  # teams:             # Workflows: "Send webhook alerts to a channel"
+  #   - name: ops-teams
+  #     url: "https://prod-00.westeurope.logic.azure.com/workflows/ID/triggers/manual/paths/invoke?sig=SIG"
+  #     timeout: 10s
+  #     fallback: dev-email
+  #
+  # discord:
+  #   - name: ops-discord
+  #     url: "https://discord.com/api/webhooks/ID/TOKEN"
+  #     timeout: 10s
+  #     fallback: dev-email
+  #
+  # ntfy:
+  #   - name: ops-phone
+  #     server: "https://ntfy.sh"     # the default; or your own server
+  #     topic: "alertloop-ops-4f9c2e"  # on ntfy.sh the topic name is the password
+  #     token: "tk_XXXX"               # optional access token...
+  #     # username: "alertloop"        # ...or a login, not both
+  #     # password: "secret"
+  #     timeout: 10s
+  #     fallback: dev-email
+  #
+  # pushover:
+  #   - name: ops-pager
+  #     token: "APP_TOKEN"     # application API token
+  #     user_key: "USER_KEY"   # user or group key
+  #     timeout: 10s
+  #     fallback: dev-email
 
 # Routing is optional; without it every event goes to every channel. With it,
 # an event goes to the channels of the FIRST matching rule.

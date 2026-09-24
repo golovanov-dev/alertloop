@@ -71,7 +71,7 @@ func checkMuteCancelsAlertsHandedBackAfterMute(t *testing.T, s Store) {
 		for _, prefix := range []string{"", "open-"} {
 			d := out
 			d.ID, d.UpdatedAt = prefix+id, now
-			if err := s.MarkResult(ctx, &d); err != nil {
+			if err := s.MarkResult(ctx, &d, nil); err != nil {
 				t.Fatalf("mark %s: %v", d.ID, err)
 			}
 			want := out.State
@@ -184,7 +184,7 @@ func checkMuteRacingAFailureCancelsTheAlert(t *testing.T, s Store) {
 			markErr = s.MarkResult(ctx, &domain.DeliveryAttempt{
 				ID: d.ID, State: domain.DeliveryFailed, Attempts: 1, NextRetryAt: &retry,
 				LastError: "503", UpdatedAt: now,
-			})
+			}, nil)
 		}()
 		wg.Wait()
 		if muteErr != nil || markErr != nil {

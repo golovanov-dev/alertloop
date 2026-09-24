@@ -74,6 +74,7 @@ paths:
       security:
         - ApiKeyAuth: []
         - BearerAuth: []
+        - ConsoleSession: []
       requestBody:
         required: true
         content:
@@ -185,6 +186,7 @@ paths:
       security:
         - ApiKeyAuth: []
         - BearerAuth: []
+        - ConsoleSession: []
       parameters:
         - { name: type, in: query, schema: { $ref: '#/components/schemas/EventType' } }
         - { name: severity, in: query, schema: { $ref: '#/components/schemas/Severity' } }
@@ -222,6 +224,7 @@ paths:
       security:
         - ApiKeyAuth: []
         - BearerAuth: []
+        - ConsoleSession: []
       parameters:
         - $ref: '#/components/parameters/Id'
       responses:
@@ -259,6 +262,7 @@ paths:
       security:
         - ApiKeyAuth: []
         - BearerAuth: []
+        - ConsoleSession: []
       parameters:
         - { name: state, in: query, schema: { $ref: '#/components/schemas/DeliveryState' } }
         - { name: channel, in: query, schema: { $ref: '#/components/schemas/ChannelType' } }
@@ -292,6 +296,7 @@ paths:
       security:
         - ApiKeyAuth: []
         - BearerAuth: []
+        - ConsoleSession: []
       parameters:
         - $ref: '#/components/parameters/Id'
       responses:
@@ -328,6 +333,7 @@ paths:
       security:
         - ApiKeyAuth: []
         - BearerAuth: []
+        - ConsoleSession: []
       responses:
         "200":
           description: The routing table.
@@ -368,6 +374,7 @@ paths:
       security:
         - ApiKeyAuth: []
         - BearerAuth: []
+        - ConsoleSession: []
       requestBody:
         required: true
         content:
@@ -421,6 +428,7 @@ paths:
       security:
         - ApiKeyAuth: []
         - BearerAuth: []
+        - ConsoleSession: []
       responses:
         "200":
           description: Counts by state.
@@ -453,6 +461,7 @@ paths:
       security:
         - ApiKeyAuth: []
         - BearerAuth: []
+        - ConsoleSession: []
       responses:
         "200":
           description: Build and edition metadata.
@@ -529,6 +538,16 @@ components:
       description: >
         Same credential as ApiKeyAuth, sent as an `Authorization: Bearer <key>`
         header.
+    ConsoleSession:
+      type: apiKey
+      in: cookie
+      name: alertloop_session
+      description: >
+        The admin console's sign-in, set by the server as an HttpOnly cookie
+        when a console user signs in. It has full access. A state-changing
+        request made with it must also send `X-AlertLoop-Console: 1` and,
+        when the browser sends `Origin`, come from the same host; otherwise
+        HTTP 403. For scripts and integrations use an API key.
   parameters:
     Id:
       name: id
@@ -593,6 +612,7 @@ components:
       security:
         - ApiKeyAuth: []
         - BearerAuth: []
+        - ConsoleSession: []
       parameters:
         - $ref: '#/components/parameters/Id'
       responses:
@@ -688,7 +708,9 @@ components:
         nothing to close.
     ChannelType:
       type: string
-      enum: [email, telegram, webhook]
+      enum: [email, telegram, webhook, slack, teams, discord, ntfy, pushover]
+      description: >
+        `slack` also covers Mattermost and Rocket.Chat incoming webhooks.
     DeliveryState:
       type: string
       enum: [pending, sending, sent, failed, dead_letter, cancelled]
@@ -867,6 +889,44 @@ components:
         last_error: { type: string }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
+        fallback_of:
+          allOf:
+            - $ref: '#/components/schemas/AttemptLink'
+          description: >
+            Present on an alert queued to a channel's `fallback` because the
+            alert to that channel dead-lettered: the dead-lettered attempt.
+        fallback_to:
+          allOf:
+            - $ref: '#/components/schemas/AttemptLink'
+          description: >
+            Present on a dead-lettered alert that was redirected to its
+            channel's `fallback`: the attempt queued there. An alert is
+            redirected at most once, however often it is replayed.
+        recovery_for:
+          allOf:
+            - $ref: '#/components/schemas/AttemptLink'
+          description: >
+            Present on a recovery (0.8.0): the alert attempt it follows. A
+            recovery is not sent until that alert is `sent`; while it is
+            `dead_letter`, the recovery waits for the alert to be replayed.
+            Every alert of a closed incident has its own recovery, cancelled
+            alerts excepted, so a channel that got both a direct alert and a
+            fallback copy gets two. Absent on alerts, and on a recovery queued
+            before 0.8.0 whose channel had no alert on record.
+    AttemptLink:
+      type: object
+      description: Another delivery attempt of the same event.
+      properties:
+        id: { type: string }
+        channel_name: { type: string }
+        state:
+          type: string
+          enum: [pending, sending, sent, failed, dead_letter, cancelled]
+          description: >
+            State of the linked attempt (0.8.0). On `fallback_to` it tells
+            whether the redirected alert got through: a dead-lettered alert
+            whose `fallback_to` is `sent` was delivered on the fallback. On
+            `recovery_for` it tells what a pending recovery is waiting for.
     EventList:
       type: object
       properties:

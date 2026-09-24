@@ -125,7 +125,7 @@ func TestRecoveryForDeadLetteredAlertWaitsForReplay(t *testing.T) {
 	mark := func(d domain.DeliveryAttempt, state domain.DeliveryState) {
 		t.Helper()
 		d.State, d.NextRetryAt = state, nil
-		if err := store.MarkResult(ctx, &d); err != nil {
+		if err := store.MarkResult(ctx, &d, nil); err != nil {
 			t.Fatalf("mark %s %s: %v", d.ChannelName, state, err)
 		}
 	}

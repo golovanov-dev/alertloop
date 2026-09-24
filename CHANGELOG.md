@@ -1,5 +1,96 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- The admin console signs in with a login and password instead of the admin
+  token. After upgrading, open `/admin`: it asks for the admin token once, to
+  create the first administrator. The admin token and `full` API keys stay API
+  credentials and no longer open the console. Over plain HTTP, sign-in is
+  accepted only from this machine or a private network reached directly (an
+  SSH tunnel, the Compose gateway). Behind an HTTPS reverse proxy,
+  `rate_limit.trusted_proxies` must list the proxy, and the proxy must pass the
+  original `Host` header (nginx `proxy_set_header Host $host;`, Apache
+  `ProxyPreserveHost On`, as the shipped configs do) or send
+  `X-Forwarded-Host`; otherwise sign-in through it gets 403, and the message
+  says which of the two is missing.
+- A recovery waits for its own alert, not for every alert of its channel: one
+  recovery per alert of the closed incident (cancelled alerts excepted), sent
+  only after that alert is `sent`. Before, a direct alert that dead-lettered
+  or was cancelled in a fallback channel held that channel's recoveries
+  forever. `GET /v1/delivery-attempts` gains `recovery_for`
+  (`{id, channel_name, state}` of the alert a recovery waits for). Migration
+  0008 adds the column and links recoveries already queued to the alert of the
+  same event and channel; after it 0.7.x does not start on the database.
+- Monit examples: `install.sh --with-examples` puts the example rules in
+  `/etc/alertloop/monit-examples/`, not in Monit's `conf.d` as
+  `*.conf.disabled`: Monit on Debian and Ubuntu includes `conf.d/*` and ran
+  those files as live checks, paging about services the host does not run.
+  Re-run `sudo ./install.sh` from the new version: it removes its own
+  `*.conf.disabled` files from `conf.d` (moves ones you edited to the examples
+  directory) and lists them; then `sudo monit -t && sudo monit reload`. To
+  enable an example, copy it into `conf.d`.
+- `cron-wrapper.sh` runs as root, the job through `/usr/sbin/runuser -u <user> --`
+  (full path: cron's PATH has no `/usr/sbin`): run
+  as another user it cannot read `monit.env` and reported nothing. Rewrite
+  crontab lines like `… app /usr/local/bin/cron-wrapper.sh …` as shown in the
+  integration's README, "Cron jobs". The adapter and the wrapper now also log
+  an unreadable config and a failed report to syslog.
+- Webhook and Telegram channels no longer follow HTTP redirects: a redirected
+  POST was repeated as a GET, and a 200 to it marked a message nobody received
+  as `sent`. A 3xx answer now fails the attempt (`redirect to <scheme://host>
+  not followed`) and is retried; point `url` or `api_base` at the final
+  address.
+
+### Added
+
+- Channel types `slack` (also for Mattermost and Rocket.Chat incoming
+  webhooks), `teams` (a Workflows webhook), `discord`, `ntfy` (ntfy.sh or your
+  own server, optional token or login) and `pushover`, several of each, with
+  routing, `fallback` and recovery notices like the others. Each shows the
+  severity its own way: a colour and an emoji in chat, a priority in ntfy and
+  Pushover. `GET /v1/delivery-attempts` returns these values in `channel` and
+  accepts them in the `channel` filter: a client that checks `channel` against
+  `email`, `telegram` and `webhook` must accept the new values.
+- `public_url`: with it, every notification links to its event in the admin
+  console, and the webhook payload gains `event_url`.
+- Console user accounts with one role, `admin`: a Users screen (add, disable,
+  enable, reset another user's password), changing your own password, signing
+  out everywhere, and `alertloop user add|passwd|disable|enable|list` for the
+  command line and for recovering access. Sessions are kept on the server in an `HttpOnly` cookie,
+  which also authenticates `/v1` (`ConsoleSession` in the OpenAPI spec); the
+  access log names the user as `credential=user:<id>`. Migration 0006 adds the
+  `users` and `sessions` tables.
+- A channel may name a `fallback` channel. An alert that dead-letters on it is
+  queued once to the fallback, with the failed channel and its error at the
+  top of the text (in a webhook, a `fallback` object); the copy gets its own
+  recovery, sent after it. The fallback channel may get the alert twice:
+  directly, and as the copy that names the broken channel (always so without
+  routing), and then two recoveries. A
+  fallback alert that dead-letters goes nowhere further, and a fallback to the
+  channel itself or to a missing one fails the config check.
+  `GET /v1/delivery-attempts` gains `fallback_of` and `fallback_to`, each with
+  the linked attempt's `state`, and the console shows whether the redirected
+  alert arrived. Migration 0007 adds the link column.
+- The Monit adapter keeps an event it could not send (network, 409, 429, 5xx) in
+  `/var/lib/alertloop-monit/spool` and sends it, oldest first, on the next run
+  or with `alertloop-send --flush`; it then exits with the new code 9. The spool
+  holds at most `ALERTLOOP_SPOOL_MAX` events (1000); both `ALERTLOOP_SPOOL_*`
+  settings are optional. A spooled event refused for the key or the address
+  (401, 403 other than `source_not_allowed`, 404) stays in the spool and the
+  run exits 4; one refused for what it is (400, 413, 422, 403
+  `source_not_allowed`) moves to `rejected/` in the spool directory with a log
+  line, and the events behind it go on; `--flush` exits 4 while `rejected/` is
+  not empty. Re-run `install.sh` to create the
+  directory, and add the `--flush` timer from the integration's README. The
+  adapter now needs `flock` (util-linux); `install.sh` refuses to install
+  without it.
+- `cron-wrapper.sh` reports `resolved` only on the first success after a
+  failure, not after every successful run; the first run of the new wrapper
+  for a job still reports one `resolved`, so an incident opened before the
+  upgrade closes. Re-run `install.sh` to update it.
+
 ## 0.7.0 - 2026-09-23
 
 ### Added

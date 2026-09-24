@@ -262,6 +262,8 @@ func TestHTTPChannelsReportCancellation(t *testing.T) {
 	chans := map[string]Channel{
 		"telegram": NewTelegram(TelegramConfig{Name: "tg", BotToken: "SECRET", ChatID: "c", APIBase: srv.URL, Timeout: time.Minute}),
 		"webhook":  NewWebhook("wh", srv.URL+"/hook", "", time.Minute),
+		// Slack, Teams, Discord, ntfy and Pushover share one sender.
+		"slack": NewSlack("sl", srv.URL+"/SECRET", time.Minute),
 	}
 	for name, ch := range chans {
 		ctx, cancel := context.WithCancel(context.Background())

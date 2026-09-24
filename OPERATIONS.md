@@ -101,7 +101,7 @@ curl -s -H "X-API-Key: $KEY" http://127.0.0.1:8080/v1/stats
 |---|---|
 | `worker_last_tick_at` is `null` or more than 120 s old | No worker is polling the queue. A running worker writes it at most every 15 s, so it is at most 15 s plus `worker.poll_interval` old. `null` until a 0.7.0 worker has run against the database. |
 | `oldest_due_delivery_age_seconds` above 300 | Deliveries are due and nobody takes them: no worker, or one channel that hangs keeps all the slots it may use busy. `null` means nothing is due. |
-| `dead_letter_last_24h` above 0 | Deliveries exhausted their retries in the last 24 hours. Each one is a notification nobody saw. List them with `/v1/delivery-attempts?state=dead_letter`. |
+| `dead_letter_last_24h` above 0 | Deliveries exhausted their retries in the last 24 hours. Each one is a notification nobody saw, except one whose `fallback_to` is `sent`: that alert got through on the channel's fallback (the channel itself is still broken). List them with `/v1/delivery-attempts?state=dead_letter`. |
 
 If you raised `worker.poll_interval` (default 2 s), keep both thresholds well
 above it: a healthy tick is up to 15 s plus one `poll_interval` old, and a due
@@ -238,13 +238,14 @@ So:
 - **Right after upgrading from 0.6.x** the check can be red at once: attempts
   that the old version dead-lettered in the last 24 hours count too.
 
-Not every `pending` row waits for the worker: a recovery waits for its alert,
-and one whose alert dead-lettered (or whose channel was removed from the
-config) stays `pending` until that alert is replayed and sent, or until
-retention removes the incident. Such a recovery is not due, so it does not
-raise `oldest_due_delivery_age_seconds`. List them with
-`/v1/delivery-attempts?kind=recovery&state=pending` and check the alert of the
-same `event_id` and `channel_name` (`?kind=alert&event_id=<id>`).
+Not every `pending` row waits for the worker: a recovery waits for its own
+alert, the attempt named in its `recovery_for`. One whose alert dead-lettered
+(or whose channel was removed from the config) stays `pending` until that
+alert is replayed and sent, or until retention removes the incident. Such a
+recovery is not due, so it does not raise `oldest_due_delivery_age_seconds`.
+List them with `/v1/delivery-attempts?kind=recovery&state=pending`:
+`recovery_for.state` is the state of the alert each one waits for, and
+`recovery_for.id` is the alert to replay.
 
 `open_incidents` counts incidents that are not resolved. It is a signal about
 your team, not about AlertLoop: it grows when nobody resolves anything.
@@ -472,6 +473,7 @@ nothing about it, so check which format your config has first.
 | Requests from one client | `grep -w "client_ip=203.0.113.7" logs/api.log` | `grep '"client_ip":"203.0.113.7"' logs/api.log` |
 | Requests made with one API key | `grep "credential=<key id>" logs/api.log` | `grep '"credential":"<key id>"' logs/api.log` |
 | Requests made with the admin token | `grep "credential=admin" logs/api.log` | `grep '"credential":"admin"' logs/api.log` |
+| Console requests of one user (`alertloop user list` shows the id) | `grep "credential=user:<id>" logs/api.log` | `grep '"credential":"user:<id>"' logs/api.log` |
 
 `logs/api.log` and `logs/worker.log` are the Compose files from the section
 above. In other layouts, feed the same pattern from where the lines are:
@@ -499,6 +501,60 @@ Use `printf %s`, not `echo`: `echo` adds a newline, and the id comes out wrong.
 
 Set `format: json` when a collector reads the file, and keep `level: info`
 unless you are chasing something specific — `debug` logs every routed event.
+
+---
+
+## Console users
+
+Every console user is an administrator. Manage users on the console's Users
+screen or with `alertloop user`, which reads the same config file as the
+server. Without `--password-stdin`, `add` and `passwd` print a generated
+password once; with it they read the first line of stdin. `passwd` and
+`disable` end that user's sessions at once; `enable` lets a disabled user
+sign in again with their password. An administrator resets another user's
+password on the Users screen; their own password changes under "Your
+account", which asks for the current one.
+
+Docker Compose, from the clone directory (demo profile: service `alertloop`):
+
+```bash
+docker compose exec api alertloop user list
+docker compose exec api alertloop user add alice
+docker compose exec api alertloop user passwd alice
+docker compose exec api alertloop user disable alice
+docker compose exec api alertloop user enable alice
+```
+
+systemd, as a user with `sudo` (put the other commands in place of `user list`):
+
+```bash
+sudo -u alertloop sh -c 'cd /var/lib/alertloop && set -a &&
+  . /etc/alertloop/alertloop.env &&
+  exec /usr/local/bin/alertloop --config /etc/alertloop/alertloop.yaml user list'
+```
+
+Recovering access, with the commands above:
+
+- **Password forgotten:** `user passwd <login>`, then sign in with the
+  printed password. If the user is also disabled, `passwd` says so.
+- **User disabled:** `user enable <login>`; the password stays as it was
+  (`user list` shows who is `disabled`). A disabled user signing in gets the
+  same "wrong login or password" as a wrong password.
+- **No working account at all:** `user add <login>` creates a new one.
+
+Failed sign-ins slow down: after 5 in a row for one login from one address,
+that address waits before its next try, twice as long each time, up to 5
+minutes; the right password from another address is not held up. An IPv6
+address counts by its /64, as in the rate limiter above. The count is
+kept in the memory of the `server` process: restarting it (`all` under
+systemd and in the demo profile, `api` under the Compose postgres profile)
+clears it. Separately, each address gets 10 sign-in attempts at once and then
+one every 6 seconds. Behind a proxy that `rate_limit.trusted_proxies` does not
+list, every browser arrives from the proxy's address and shares both limits.
+
+A session ends after 7 days without use and 30 days after sign-in; the
+worker's retention sweep deletes ended sessions. Console requests are in the
+access log as `credential=user:<id>`.
 
 ---
 
@@ -858,8 +914,14 @@ before the `up`, and check with
 screen shows failures on one channel.
 
 **What you have lost:** every notification routed only to that channel since it
-broke. The *events* are all still there — AlertLoop stores the event and the
-delivery separately for exactly this reason.
+broke — unless the channel has a `fallback` (README, "Fallback channel"): then
+each of its dead-lettered alerts was queued once to the fallback, and the
+Deliveries screen shows where it went and whether it arrived there. The copy
+in the fallback gets its own recovery, sent after the copy. A recovery that
+itself dead-letters is not redirected, and waits for a replay like any other.
+The
+*events* are all still there — AlertLoop stores the event and the delivery
+separately for exactly this reason.
 
 1. **Find them.**
 
@@ -885,7 +947,8 @@ delivery separately for exactly this reason.
    ```
 
    A replayed attempt starts over with `attempts` at 0 and gets the full
-   `max_attempts` retries again.
+   `max_attempts` retries again. An alert that was already redirected to its
+   fallback is not redirected again if it dead-letters a second time.
 
    The Deliveries screen in `/admin` has a Replay button. Replay one first and confirm it
    arrives before replaying a hundred.
@@ -894,8 +957,10 @@ delivery separately for exactly this reason.
    deleted along with their delivery attempts. A channel that has been broken
    for longer than that has lost the oldest ones permanently.
 
-**Prevent the repeat:** alert on `dead_letter_last_24h` (see above). A day is
-far too long to find out by looking.
+**Prevent the repeat:** give every channel a `fallback` on a different
+transport (Telegram to email, email to a webhook), and alert on
+`dead_letter_last_24h` (see above). A day is far too long to find out by
+looking.
 
 ### The disk filled up
 
@@ -1037,10 +1102,11 @@ This is a configuration problem, not a failure, and the log said so at startup.
    incident closes and at no other time. A monitoring source that only ever
    sends `status: firing` leaves it open forever. In Monit that is a rule
    missing its `else if succeeded` line.
-3. **Did the alert dead-letter?** A channel never receives a recovery before
-   its alert: the recovery is queued when the incident closes, whatever state
-   the alert is in, and stays `pending` until the alert of the same incident to
-   that channel is `sent`. Fix the channel and replay the alert; the recovery
+3. **Did the alert dead-letter?** A recovery never goes out before its alert:
+   one is queued for each alert of the incident when it closes, whatever state
+   the alert is in, and stays `pending` until that alert (its `recovery_for`)
+   is `sent`. `recovery_for.state` in the listing below shows what it waits
+   for. Fix the channel and replay the alert `recovery_for.id`; the recovery
    follows it.
 4. **Look for the row.** Recovery notices are ordinary delivery attempts with
    `kind=recovery`:

@@ -3,16 +3,17 @@ package storage
 import (
 	"context"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/golovanov-dev/alertloop/internal/domain"
 )
 
-// A recovery waits for the alert of its own occurrence on its own channel:
-// not delivered while that alert is failed or dead-lettered, delivered once it
-// is sent. Another occurrence of the same incident, and another channel of the
-// same one, do not hold it back.
+// A recovery waits for its own alert (recovery_for): not delivered while that
+// alert is failed or dead-lettered, delivered once it is sent. Another
+// occurrence of the same incident, and another channel of the same one, do
+// not hold it back.
 func TestClaimHoldsRecoveryUntilItsAlertIsSent(t *testing.T) {
 	checkRecoveryWaitsForAlert(t, newTestStore(t))
 }
@@ -44,6 +45,9 @@ func checkRecoveryWaitsForAlert(t *testing.T, s Store) {
 			ID: id, EventID: eventID, Channel: domain.ChannelTelegram, ChannelName: channel,
 			Kind: kind, State: state, MaxAttempts: 5, NextRetryAt: retry,
 			CreatedAt: now, UpdatedAt: now,
+		}
+		if kind == domain.KindRecovery {
+			d.RecoveryFor = &domain.AttemptLink{ID: "alert-" + strings.TrimPrefix(id, "recovery-")}
 		}
 		if err := s.CreateDeliveryAttempt(ctx, d); err != nil {
 			t.Fatalf("create attempt %s: %v", id, err)
@@ -84,7 +88,7 @@ func checkRecoveryWaitsForAlert(t *testing.T, s Store) {
 			t.Fatalf("get %s: %v", id, err)
 		}
 		d.State, d.NextRetryAt = state, nil
-		if err := s.MarkResult(ctx, d); err != nil {
+		if err := s.MarkResult(ctx, d, nil); err != nil {
 			t.Fatalf("mark %s: %v", id, err)
 		}
 	}

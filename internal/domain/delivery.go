@@ -9,12 +9,20 @@ const (
 	ChannelEmail    ChannelType = "email"
 	ChannelTelegram ChannelType = "telegram"
 	ChannelWebhook  ChannelType = "webhook"
+	// ChannelSlack is a Slack incoming webhook; Mattermost and Rocket.Chat
+	// accept the same message format.
+	ChannelSlack    ChannelType = "slack"
+	ChannelTeams    ChannelType = "teams"
+	ChannelDiscord  ChannelType = "discord"
+	ChannelNtfy     ChannelType = "ntfy"
+	ChannelPushover ChannelType = "pushover"
 )
 
 // ValidChannelType reports whether t is a known channel type.
 func ValidChannelType(t ChannelType) bool {
 	switch t {
-	case ChannelEmail, ChannelTelegram, ChannelWebhook:
+	case ChannelEmail, ChannelTelegram, ChannelWebhook,
+		ChannelSlack, ChannelTeams, ChannelDiscord, ChannelNtfy, ChannelPushover:
 		return true
 	default:
 		return false
@@ -107,7 +115,30 @@ type DeliveryAttempt struct {
 	LastError   string        `json:"last_error,omitempty"`
 	CreatedAt   time.Time     `json:"created_at"`
 	UpdatedAt   time.Time     `json:"updated_at"`
+	// FallbackOf is the dead-lettered alert this attempt redirects to a
+	// channel's fallback; nil for every other attempt.
+	FallbackOf *AttemptLink `json:"fallback_of,omitempty"`
+	// FallbackTo is the attempt this dead-lettered alert was redirected to.
+	// Filled when attempts are read for the API; nil otherwise.
+	FallbackTo *AttemptLink `json:"fallback_to,omitempty"`
+	// RecoveryFor is the alert attempt a recovery follows: the recovery is
+	// not sent until that alert is. Nil on alerts, and on a recovery written
+	// before 0.8.0 whose channel had no alert of the event on record.
+	RecoveryFor *AttemptLink `json:"recovery_for,omitempty"`
 }
+
+// AttemptLink names another delivery attempt of the same event.
+type AttemptLink struct {
+	ID          string `json:"id"`
+	ChannelName string `json:"channel_name,omitempty"`
+	// State is the linked attempt's state: whether an alert redirected to a
+	// fallback got through is what tells a lost notification from a delivered
+	// one.
+	State DeliveryState `json:"state,omitempty"`
+}
+
+// IsFallback reports whether d redirects another channel's dead-lettered alert.
+func (d *DeliveryAttempt) IsFallback() bool { return d.FallbackOf != nil }
 
 // ChannelTarget identifies one configured channel instance an event should be
 // delivered to. In Community every event fans out to every configured target.
@@ -126,6 +157,22 @@ const DefaultMaxAttempts = 5
 type Notification struct {
 	Event *Event
 	Kind  DeliveryKind
+	// Fallback is set when this alert is redirected from a channel that could
+	// not deliver it.
+	Fallback *FallbackOrigin
+	// EventURL is the event's page in the admin console, built from
+	// public_url; empty when public_url is not configured.
+	EventURL string
+}
+
+// FallbackOrigin is the channel a redirected alert failed on, and its last
+// error as stored (channels redact their secrets before storing it).
+type FallbackOrigin struct {
+	Channel string `json:"channel"`
+	Error   string `json:"error,omitempty"`
+	// Attempt is the id of the dead-lettered attempt. Not in the webhook
+	// payload; it makes the redirected email's Message-ID its own.
+	Attempt string `json:"-"`
 }
 
 // Alert builds a Notification announcing an event.
