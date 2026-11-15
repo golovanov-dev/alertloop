@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- A payload too long for the message is no longer cut mid-document in
+  Telegram, Slack, Mattermost, Rocket.Chat, Discord, Teams, ntfy and Pushover.
+  Arrays keep their first items and end with a `"… N more"` element, then long
+  strings are shortened to the room left, so the payload stays valid JSON.
+  Before, the text was cut at the service's limit, leaving an unclosed array
+  or string. Email and the webhook send the payload whole, as before.
+
 ## 0.8.0 - 2026-09-24
 
 The admin console signs in with user accounts, a broken channel can hand its

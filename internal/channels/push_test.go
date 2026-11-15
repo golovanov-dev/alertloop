@@ -53,9 +53,10 @@ func TestNtfyPublish(t *testing.T) {
 	if !strings.HasPrefix(m.Title, "[CRITICAL/incident] Сбой оплаты") || !strings.HasPrefix(m.Message, "Redirected:") {
 		t.Fatalf("title %q, message %.60q", m.Title, m.Message)
 	}
-	if len(m.Message) > ntfyMessageMax || !utf8.ValidString(m.Message) || !strings.HasSuffix(m.Message, truncatedMark) {
-		t.Fatalf("message is %d bytes, valid UTF-8 %v, ends %q", len(m.Message), utf8.ValidString(m.Message), m.Message[len(m.Message)-20:])
+	if len(m.Message) > ntfyMessageMax || !utf8.ValidString(m.Message) || len(m.Message) < ntfyMessageMax-200 {
+		t.Fatalf("message is %d bytes (max %d, and the payload should fill it), valid UTF-8 %v", len(m.Message), ntfyMessageMax, utf8.ValidString(m.Message))
 	}
+	assertFittedPayload(t, m.Message)
 	if strings.Contains(m.Message, "Link:") {
 		t.Fatal("the message repeats the link the click action already carries")
 	}
@@ -92,9 +93,10 @@ func TestPushoverMessage(t *testing.T) {
 		t.Fatalf("alert form = %v", a)
 	}
 	msg := a.Get("message")
-	if n := utf8.RuneCountInString(msg); n > pushoverMessageMax || !strings.HasSuffix(msg, truncatedMark) || !strings.HasPrefix(msg, "Redirected:") {
+	if n := utf8.RuneCountInString(msg); n > pushoverMessageMax || !strings.HasPrefix(msg, "Redirected:") {
 		t.Fatalf("message: %d runes, %.60q", n, msg)
 	}
+	assertFittedPayload(t, msg)
 	if !strings.Contains(a.Get("title"), "Сбой оплаты") {
 		t.Fatalf("title = %q", a.Get("title"))
 	}
@@ -123,7 +125,8 @@ func TestNtfyBodyFitsTheLimit(t *testing.T) {
 	if err := json.Unmarshal(body, &m); err != nil {
 		t.Fatalf("body: %v", err)
 	}
-	if len(body) > ntfyBodyMax || !strings.Contains(string(body), "<b>&</b>") || !strings.HasSuffix(m.Message, truncatedMark) {
+	if len(body) > ntfyBodyMax || !strings.Contains(string(body), "<b>&</b>") {
 		t.Fatalf("body is %d bytes (max %d), starts %.80q", len(body), ntfyBodyMax, body)
 	}
+	assertFittedPayload(t, m.Message)
 }

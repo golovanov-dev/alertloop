@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/golovanov-dev/alertloop/internal/domain"
 )
@@ -106,7 +107,10 @@ type telegramResponse struct {
 const telegramMaxText = 4096
 
 func (t *Telegram) Send(ctx context.Context, n domain.Notification) error {
-	text := truncateRunes(subjectLine(n)+"\n\n"+plainBody(n), telegramMaxText)
+	// The payload shrinks to the room the details leave, staying valid JSON;
+	// truncateRunes only guards against a subject that alone is over the limit.
+	head := subjectLine(n) + "\n\n"
+	text := truncateRunes(head+textBodyFit(n, true, telegramMaxText-utf8.RuneCountInString(head)), telegramMaxText)
 	body, err := json.Marshal(telegramRequest{ChatID: t.chatID, Text: text})
 	if err != nil {
 		return fmt.Errorf("marshal telegram request: %w", err)

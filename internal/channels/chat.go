@@ -28,11 +28,10 @@ const (
 
 // chatPayload is the payload as a fenced code block, or "".
 func chatPayload(n domain.Notification) string {
-	p := payloadText(n)
-	if p == "" {
+	if !hasPayload(n) {
 		return ""
 	}
-	return "```\n" + clip(p, chatPayloadMax) + "\n```"
+	return "```\n" + fitPayload(n.Event.Payload, chatPayloadMax) + "\n```"
 }
 
 // joinNonEmpty joins the non-empty parts with a blank line.
@@ -151,9 +150,9 @@ func (t *Teams) Send(ctx context.Context, n domain.Notification) error {
 		fs = append(fs, map[string]string{"title": f.label, "value": clip(f.value, chatFactMax)})
 	}
 	body = append(body, map[string]any{"type": "FactSet", "facts": fs})
-	if p := compactPayload(n); p != "" {
+	if hasPayload(n) {
 		// One line: a TextBlock does not keep the indentation of pretty JSON.
-		pb := textBlock(clip(p, chatPayloadMax))
+		pb := textBlock(fitPayloadCompact(n.Event.Payload, chatPayloadMax))
 		pb["fontType"] = "Monospace"
 		body = append(body, pb)
 	}
@@ -176,15 +175,11 @@ func (t *Teams) Send(ctx context.Context, n domain.Notification) error {
 	}, "")
 }
 
-// compactPayload is the payload on one line, or "".
-func compactPayload(n domain.Notification) string {
-	p := n.Event.Payload
-	if len(p) == 0 || string(p) == "{}" {
-		return ""
-	}
+// compactJSON is raw on one line, or raw as it is when it is not JSON.
+func compactJSON(raw json.RawMessage) string {
 	var out bytes.Buffer
-	if err := json.Compact(&out, p); err != nil {
-		return string(p)
+	if err := json.Compact(&out, raw); err != nil {
+		return string(raw)
 	}
 	return out.String()
 }

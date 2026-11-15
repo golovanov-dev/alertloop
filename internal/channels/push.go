@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/golovanov-dev/alertloop/internal/domain"
 )
@@ -102,17 +103,39 @@ func (t *Ntfy) Send(ctx context.Context, n domain.Notification) error {
 	msg := ntfyMessage{
 		Topic:    t.topic,
 		Title:    clip(subjectLine(n), 250),
-		Message:  clipBytes(textBody(n, false), ntfyMessageMax),
 		Priority: prio,
 		Tags:     tags,
 		Click:    n.EventURL,
 	}
+	// textBodyFit counts runes, while ntfy limits bytes, and quotes, backslashes
+	// and newlines take two bytes once encoded. So the rune budget shrinks by
+	// the excess, in runes, until the message and the body are within limits.
+	frame, err := t.encodeJSON(msg) // the body around an empty message
+	if err != nil {
+		return err
+	}
+	budget := ntfyMessageMax
+	for range 8 {
+		msg.Message = textBodyFit(n, false, budget)
+		body, err := t.encodeJSON(msg)
+		if err != nil {
+			return err
+		}
+		encoded := len(body) - len(frame)
+		over := max(len(msg.Message)-ntfyMessageMax, len(body)-ntfyBodyMax)
+		if over <= 0 || budget == 0 || encoded <= 0 {
+			break
+		}
+		runes := utf8.RuneCountInString(msg.Message)
+		budget = max(min(budget, runes)-(over*runes+encoded-1)/encoded, 0)
+	}
+	// A last resort that the loop above leaves next to nothing to do; it cuts
+	// as text. A cut part never encodes shorter.
+	msg.Message = clipBytes(msg.Message, ntfyMessageMax)
 	body, err := t.encodeJSON(msg)
 	if err != nil {
 		return err
 	}
-	// Quotes, backslashes and newlines take two bytes once encoded. Cutting the
-	// excess from the message is enough: a cut part never encodes shorter.
 	if over := len(body) - ntfyBodyMax; over > 0 {
 		msg.Message = clipBytes(msg.Message, max(len(msg.Message)-over, 0))
 		if body, err = t.encodeJSON(msg); err != nil {
@@ -184,7 +207,7 @@ func (p *Pushover) Send(ctx context.Context, n domain.Notification) error {
 		"token":    {p.token},
 		"user":     {p.userKey},
 		"title":    {clip(subjectLine(n), pushoverTitleMax)},
-		"message":  {clip(textBody(n, false), pushoverMessageMax)},
+		"message":  {textBodyFit(n, false, pushoverMessageMax)},
 		"priority": {strconv.Itoa(pushoverPriority(n))},
 	}
 	if n.EventURL != "" && len(n.EventURL) <= pushoverURLMax {

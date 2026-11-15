@@ -126,11 +126,18 @@ func facts(n domain.Notification) []fact {
 
 // payloadText is the event payload, indented, or "" when there is none.
 func payloadText(n domain.Notification) string {
-	p := n.Event.Payload
-	if len(p) == 0 || string(p) == "{}" {
+	if !hasPayload(n) {
 		return ""
 	}
-	return prettyJSON(p)
+	return prettyJSON(n.Event.Payload)
+}
+
+// hasPayload reports whether the event carries a payload to show. It is
+// payloadText != "" without indenting the payload, which a channel that fits it
+// to a limit does once anyway.
+func hasPayload(n domain.Notification) bool {
+	p := n.Event.Payload
+	return len(p) != 0 && string(p) != "{}"
 }
 
 // plainBody renders a human-readable multi-line description of an event for
@@ -146,6 +153,35 @@ func plainBody(n domain.Notification) string {
 // textBody is plainBody, with or without the console link line: a channel that
 // has a native link (a push notification's click action) leaves it out.
 func textBody(n domain.Notification, withLink bool) string {
+	head := textHead(n, withLink)
+	if p := payloadText(n); p != "" {
+		return head + payloadLabel + p + "\n"
+	}
+	return head
+}
+
+// payloadLabel opens the payload part of a text body.
+const payloadLabel = "\nPayload:\n"
+
+// textBodyFit is textBody in at most limit runes. The payload comes last and
+// gets the room the details leave; fitPayload shrinks it there and keeps it
+// valid JSON, where cutting the whole text would break it mid-document.
+func textBodyFit(n domain.Notification, withLink bool, limit int) string {
+	head := textHead(n, withLink)
+	if !hasPayload(n) {
+		return clip(head, max(limit, 0))
+	}
+	room := limit - utf8.RuneCountInString(head) - utf8.RuneCountInString(payloadLabel) - 1
+	p := fitPayload(n.Event.Payload, room)
+	if p == "" {
+		// Not even the truncation mark fits: the details take the whole room.
+		return clip(head, max(limit, 0))
+	}
+	return head + payloadLabel + p + "\n"
+}
+
+// textHead is a text body up to the payload: preamble, facts and link.
+func textHead(n domain.Notification, withLink bool) string {
 	var b strings.Builder
 	if p := preamble(n); p != "" {
 		b.WriteString(p)
@@ -157,9 +193,6 @@ func textBody(n domain.Notification, withLink bool) string {
 	if withLink && n.EventURL != "" {
 		// Before the payload, so a length limit cuts the payload, not the link.
 		fmt.Fprintf(&b, "%-9s %s\n", "Link:", n.EventURL)
-	}
-	if p := payloadText(n); p != "" {
-		fmt.Fprintf(&b, "\nPayload:\n%s\n", p)
 	}
 	return b.String()
 }

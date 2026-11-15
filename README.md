@@ -326,7 +326,10 @@ Each channel shows the severity its own way; a recovery starts with
 | ntfy priority | 5 | 4 | 3 | 2 | 2 |
 | Pushover priority | 1 | 0 | 0 | −1 | −1 |
 
-Text past a service's length limit is cut and ends with `… [truncated]`.
+Text past a service's length limit is cut and ends with `… [truncated]`. A
+JSON payload is shortened instead of cut, so it stays valid JSON: long arrays
+keep their first items and end with `"… N more"`, then long strings are cut
+with the same mark. Email and the webhook carry the payload whole.
 
 With `public_url` set to the address people open AlertLoop at
 (`public_url: "https://alerts.example.com"`, without `/admin`), every
