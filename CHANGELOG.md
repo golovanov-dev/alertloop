@@ -10,6 +10,9 @@
   strings are shortened to the room left, so the payload stays valid JSON.
   Before, the text was cut at the service's limit, leaving an unclosed array
   or string. Email and the webhook send the payload whole, as before.
+- `golang.org/x/text` updated to v0.41.0 (GO-2026-6629, a panic on crafted
+  input in `precis`, reachable through the database driver when it opens the
+  DSN from the config).
 
 ## 0.8.0 - 2026-09-24
 
