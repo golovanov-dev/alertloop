@@ -80,13 +80,14 @@ jobs:
           # `latest` it lands in CI on whatever day upstream ships it - which is
           # as likely as not the day you are trying to cut a release. Bump this
           # deliberately, in its own commit.
-          version: v2.13.1
-          # Built here with the Go of this job, not downloaded. A release binary
-          # is built with the Go of its day (v2.13.1 with go1.27.0) and cannot
-          # read the packages of a later Go whose export data format moved:
-          # go1.27.4 failed every run with "export data version 5 is greater
-          # than maximum supported version 4", whatever the code.
-          install-mode: goinstall
+          #
+          # The linter reads packages through its own golang.org/x/tools, so a
+          # Go release can outrun it: go1.27.4 writes export data version 5,
+          # which x/tools reads only from v0.50.0. v2.13.1 (x/tools v0.49.0)
+          # failed every run with "export data version 5 is greater than
+          # maximum supported version 4", whatever the code; v2.15.0 carries
+          # x/tools v0.52.0. On that error, bump the linter, not the Go.
+          version: v2.15.0
           # No --timeout here: run.timeout lives in .golangci.yml, and one
           # place to set it is enough.
 
