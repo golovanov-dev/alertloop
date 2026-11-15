@@ -39,7 +39,7 @@ func fitJSON(raw json.RawMessage, budget int, format func(json.RawMessage) strin
 	if budget < utf8.RuneCountInString(truncatedMark) {
 		return ""
 	}
-	if !json.Valid(raw) || jsonDepth(raw) > shrinkDepthMax {
+	if !json.Valid(raw) || jsonDepth(raw) > nestDepthMax {
 		return clip(text, budget)
 	}
 	fits := func(s string) bool { return utf8.RuneCountInString(s) <= budget }
@@ -64,15 +64,15 @@ func fitJSON(raw json.RawMessage, budget int, format func(json.RawMessage) strin
 	return clip(text, budget)
 }
 
-// shrinkDepthMax is the deepest payload fitJSON shrinks; a deeper one is cut as
-// text. shrinkJSON decodes each value again on every level above it, and the
-// indented text grows with the square of the depth, so a payload nested
-// thousands of levels deep would cost seconds of CPU on every send. Real
-// payloads are a few levels deep.
-const shrinkDepthMax = 32
+// nestDepthMax is the deepest payload that fitJSON shrinks and prettyJSON
+// indents; a deeper one is cut as text and shown on one line. shrinkJSON
+// decodes each value again on every level above it, and the indented text grows
+// with the square of the depth, so a payload nested thousands of levels deep
+// would cost seconds of CPU on every send. Real payloads are a few levels deep.
+const nestDepthMax = 32
 
-// jsonDepth is how deeply arrays and objects nest in raw, which must be valid
-// JSON.
+// jsonDepth is how deeply arrays and objects nest in raw. For text that is not
+// valid JSON the count is only an estimate.
 func jsonDepth(raw json.RawMessage) int {
 	depth, deepest := 0, 0
 	inString, escaped := false, false

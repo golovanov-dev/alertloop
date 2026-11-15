@@ -242,7 +242,13 @@ func humanDuration(d time.Duration) string {
 	}
 }
 
+// prettyJSON is raw indented, or on one line when it nests deeper than
+// nestDepthMax: indentation grows with the square of the depth, and a payload
+// nested thousands of levels deep would indent to tens of megabytes.
 func prettyJSON(raw json.RawMessage) string {
+	if jsonDepth(raw) > nestDepthMax {
+		return compactJSON(raw)
+	}
 	var out bytes.Buffer
 	if err := json.Indent(&out, raw, "", "  "); err != nil {
 		return string(raw)

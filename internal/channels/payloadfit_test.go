@@ -149,13 +149,13 @@ func TestFitPayloadTooSmallBudgetIsEmpty(t *testing.T) {
 }
 
 // A payload nested thousands of levels deep must not cost seconds per send:
-// shrinking stops at shrinkDepthMax and the rest is cut as text.
+// a payload deeper than nestDepthMax is shown on one line and cut as text.
 func TestFitPayloadDeepNestingIsBounded(t *testing.T) {
 	const depth = 9000
 	raw := json.RawMessage(`{"a":` + strings.Repeat("[", depth) + strings.Repeat("]", depth) + `,"s":"` + strings.Repeat("x", 200*1024) + `"}`)
 	start := time.Now()
 	got := fitPayload(raw, 3500)
-	if d := time.Since(start); d > 5*time.Second {
+	if d := time.Since(start); d > time.Second {
 		t.Fatalf("fitting took %v", d)
 	}
 	if utf8.RuneCountInString(got) > 3500 {
